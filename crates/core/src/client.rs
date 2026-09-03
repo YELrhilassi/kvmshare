@@ -29,7 +29,9 @@ pub trait Injector: Send {
     fn move_cursor(&mut self, x: i32, y: i32);
     fn button(&mut self, button: u8, pressed: bool);
     fn wheel(&mut self, dx: i32, dy: i32);
-    fn key(&mut self, kind: KeyKind, key: u32, scan: u32);
+    /// Press/release/repeat a key, addressed by its canonical USB HID
+    /// usage id (the platform backend maps it to the local key identity).
+    fn key(&mut self, kind: KeyKind, key: u32);
     /// Control has entered this machine: hide the local cursor so the
     /// server's stream is the only visible one.
     fn enter(&mut self);
@@ -153,7 +155,7 @@ impl Client {
             Message::MouseMoveAbs { x, y } => injector.move_cursor(x, y),
             Message::MouseButton { button, pressed } => injector.button(button, pressed),
             Message::MouseWheel { dx, dy } => injector.wheel(dx, dy),
-            Message::Key { kind, key, scan } => injector.key(kind, key, scan),
+            Message::Key { kind, key } => injector.key(kind, key),
             Message::Clipboard { mime, data } => injector.clipboard(&mime, &data),
             Message::Layout { layout } => self.layout = layout,
             Message::KeepAlive => {}
@@ -237,8 +239,8 @@ mod tests {
         fn wheel(&mut self, dx: i32, dy: i32) {
             self.calls.lock().unwrap().push(format!("wheel {dx},{dy}"));
         }
-        fn key(&mut self, kind: KeyKind, key: u32, scan: u32) {
-            self.calls.lock().unwrap().push(format!("key {kind:?} {key} {scan}"));
+        fn key(&mut self, kind: KeyKind, key: u32) {
+            self.calls.lock().unwrap().push(format!("key {kind:?} {key}"));
         }
         fn enter(&mut self) {
             self.calls.lock().unwrap().push("enter".into());

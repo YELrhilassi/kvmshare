@@ -136,16 +136,16 @@ impl InputCapture {
                 }
                 XEvent::XinputRawButtonPress(e) => self.on_button(e.detail, true),
                 XEvent::XinputRawButtonRelease(e) => self.on_button(e.detail, false),
-                XEvent::XinputRawKeyPress(e) => self.send(Message::Key {
-                    kind: KeyKind::Down,
-                    key: 0, // canonical mapping is future work; scan carries the keycode
-                    scan: e.detail,
-                }),
-                XEvent::XinputRawKeyRelease(e) => self.send(Message::Key {
-                    kind: KeyKind::Up,
-                    key: 0,
-                    scan: e.detail,
-                }),
+                XEvent::XinputRawKeyPress(e) => {
+                    if let Some(key) = self.canonical_key(e.detail) {
+                        self.send(Message::Key { kind: KeyKind::Down, key });
+                    }
+                }
+                XEvent::XinputRawKeyRelease(e) => {
+                    if let Some(key) = self.canonical_key(e.detail) {
+                        self.send(Message::Key { kind: KeyKind::Up, key });
+                    }
+                }
                 _ => {}
             }
         }
@@ -157,6 +157,15 @@ impl InputCapture {
             XButton::Wheel(dx, dy) => self.send(Message::MouseWheel { dx, dy }),
             XButton::Ignore => {}
         }
+    }
+
+    /// XI2 raw key events carry X keycodes. The standard X11 evdev
+    /// mapping is `keycode = evdev + 8`, so the canonical HID usage is
+    /// looked up from `keycode - 8`. Unknown keys are dropped (with a
+    /// debug log at the caller) rather than sent with a wrong identity.
+    fn canonical_key(&self, keycode: u32) -> Option<u32> {
+        let evdev = keycode.checked_sub(8)? as u16;
+        crate::keys::hid_from_evdev(evdev)
     }
 
     fn send(&self, msg: Message) {

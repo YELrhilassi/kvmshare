@@ -198,9 +198,12 @@ pub enum Message {
     MouseMoveRel { dx: i32, dy: i32 },
     MouseButton { button: u8, pressed: bool },
     MouseWheel { dx: i32, dy: i32 },
-    /// Keyboard event. `key` is a canonical key id (see platform docs);
-    /// `scan` is the source OS scan code, useful for exotic layouts.
-    Key { kind: KeyKind, key: u32, scan: u32 },
+    /// Keyboard event. `key` is a **canonical USB HID usage id**, which is
+    /// what makes a Windows machine talk to a Unix machine: every platform
+    /// backend converts its native key identity (X11 keycode / Wayland
+    /// evdev code / Windows scan code) to and from this id, so the wire is
+    /// identical no matter which pair of OSes is connected.
+    Key { kind: KeyKind, key: u32 },
     /// Clipboard content; `mime` describes the format ("text/plain", ...).
     Clipboard { mime: String, data: Vec<u8> },
     KeepAlive,
@@ -266,10 +269,9 @@ impl Message {
                 w.put_i32(*dx);
                 w.put_i32(*dy);
             }
-            Message::Key { kind, key, scan } => {
+            Message::Key { kind, key } => {
                 w.put_u8(kind.to_id());
                 w.put_u32(*key);
-                w.put_u32(*scan);
             }
             Message::Clipboard { mime, data } => {
                 w.put_str(mime);
@@ -317,7 +319,6 @@ impl Message {
             types::KEY => Message::Key {
                 kind: KeyKind::from_id(r.get_u8()?).ok_or(WireError { what: "bad key kind" })?,
                 key: r.get_u32()?,
-                scan: r.get_u32()?,
             },
             types::CLIPBOARD => {
                 let mime = r.get_str()?.to_owned();
@@ -403,7 +404,7 @@ mod tests {
 
     #[test]
     fn key_and_clipboard_roundtrip() {
-        roundtrip(Message::Key { kind: KeyKind::Repeat, key: 42, scan: 39 });
+        roundtrip(Message::Key { kind: KeyKind::Repeat, key: 0x14 }); // HID usage: Q
         roundtrip(Message::Clipboard { mime: "text/plain".into(), data: b"hello".to_vec() });
     }
 

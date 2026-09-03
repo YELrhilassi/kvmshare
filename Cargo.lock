@@ -234,6 +234,7 @@ dependencies = [
  "arboard",
  "kvmshare-core",
  "kvmshare-protocol",
+ "windows-sys 0.61.2",
  "x11rb",
 ]
 

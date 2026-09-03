@@ -72,8 +72,8 @@ impl Injector for RecordingInjector {
     fn wheel(&mut self, dx: i32, dy: i32) {
         self.calls.lock().unwrap().push(format!("wheel {dx},{dy}"));
     }
-    fn key(&mut self, kind: KeyKind, key: u32, scan: u32) {
-        self.calls.lock().unwrap().push(format!("key {kind:?} {key} {scan}"));
+    fn key(&mut self, kind: KeyKind, key: u32) {
+        self.calls.lock().unwrap().push(format!("key {kind:?} {key}"));
     }
     fn enter(&mut self) {
         self.calls.lock().unwrap().push("enter".into());
@@ -185,9 +185,9 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     let cc = calls(&client_calls);
     assert!(cc.contains(&"button 0 true".to_string()), "button should forward, got {cc:?}");
 
-    feed(&h, Message::Key { kind: KeyKind::Down, key: 0, scan: 38 }); // 'a' on a US layout
+    feed(&h, Message::Key { kind: KeyKind::Down, key: 0x04 }); // canonical HID usage: 'a'
     let cc = calls(&client_calls);
-    assert!(cc.contains(&"key Down 0 38".to_string()), "key should forward, got {cc:?}");
+    assert!(cc.contains(&"key Down 4".to_string()), "key should forward, got {cc:?}");
 
     // -- Cross back to pc: the client leaves and the server's cursor returns. --
     feed(&h, Message::MouseMoveRel { dx: 102, dy: 0 }); // virtual 1 → past hp's right edge

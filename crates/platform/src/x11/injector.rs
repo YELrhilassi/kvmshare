@@ -82,10 +82,15 @@ impl Injector for X11Injector {
         let _ = self.conn.flush();
     }
 
-    fn key(&mut self, kind: KeyKind, _key: u32, scan: u32) {
+    fn key(&mut self, kind: KeyKind, key: u32) {
+        // Canonical HID usage -> evdev -> X keycode (the standard
+        // `keycode = evdev + 8` mapping). Unknown usages are dropped: a
+        // wrong key would be worse than no key.
+        let Some(evdev) = crate::keys::evdev_from_hid(key) else { return };
+        let keycode = evdev + 8;
         let is_press = matches!(kind, KeyKind::Down | KeyKind::Repeat);
         let ty = if is_press { KEY_PRESS } else { KEY_RELEASE };
-        let _ = self.conn.xtest_fake_input(ty, scan as u8, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
+        let _ = self.conn.xtest_fake_input(ty, keycode as u8, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
         let _ = self.conn.flush();
     }
 

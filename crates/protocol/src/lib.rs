@@ -42,7 +42,7 @@ pub use frame::{Frame, HEADER_LEN, LEN_OFFSET};
 pub use message::{KeyKind, Message, ScreenInfo};
 
 /// Current protocol version. Bump on any breaking wire change.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Maximum payload we will accept on the wire. Guards against
 /// corrupt length fields allocating absurd buffers.

@@ -11,32 +11,39 @@ knows what OS it runs on.
 
 - **`core::server::Engine`** — what the server can do to its *own* machine:
   warp the cursor, hide/show it, read/write the clipboard. Implemented by
-  `platform::x11::engine::X11Engine` (Linux) and stubs elsewhere.
+  `platform::x11::engine::X11Engine` (Linux) and
+  `platform::windows::engine::Win32Engine` (Windows).
 - **`core::client::Injector`** — what a client can do to its *own*
   machine: move the cursor, inject buttons/keys/wheel, hide the cursor
   while being controlled, read/write the clipboard. Implemented by
-  `platform::x11::injector::X11Injector`.
+  `platform::x11::injector::X11Injector` and
+  `platform::windows::injector::Win32Injector`.
 
-A Windows or macOS backend is therefore: implement those two traits plus
-an input source, and wire them into `platform::lib.rs`. Everything else —
-protocol, session, server, client, GUI — is already platform-neutral.
+A new backend (macOS, or a Wayland module next to X11) is therefore:
+implement those two traits plus an input source, and wire them into
+`platform::lib.rs`. Everything else — protocol, session, server, client,
+GUI — is already platform-neutral.
 
 ## Why the mouse motion is smooth (and never oscillates)
 
 This is the heart of the design, and it is a direct response to the bug
 family that plagues Synergy/Barrier/Deskflow.
 
-**1. Input is XI2 *raw* events, and only raw events.** Raw motion carries
-the device's own deltas (`f64` fixed-point, sub-pixel), straight from the
-driver. Two consequences:
+**1. Input is *raw* events, and only raw events** — XI2 raw events on
+X11, Raw Input on Windows (`RegisterRawInputDevices` on a hidden
+message-only window, `RIDEV_INPUTSINK`). Raw motion carries the device's
+own deltas, straight from the driver (sub-pixel fixed-point on X11,
+whole-pixel `lLastX/lLastY` on Windows). Two consequences:
 
-- Slow moves accumulate through a fractional accumulator instead of being
-  truncated — no lost micro-motion, no "stuck at one pixel".
-- **A programmatic cursor warp generates no raw event.** Warps are
-  invisible to the input stream, so parking or re-centering the hidden
-  server cursor can never feed phantom deltas back into the session.
-  The classic KVM oscillation (warp → fake motion → warp back) cannot
-  happen; there is no need for warp-suppression timers or edge hacks.
+- Slow moves are not truncated (X11 accumulates fractions; Windows
+  reports whole pixels natively) — no lost micro-motion, no "stuck at
+  one pixel".
+- **A programmatic cursor warp generates no raw event** (`SetCursorPos`
+  on Windows included). Warps are invisible to the input stream, so
+  parking or re-centering the hidden server cursor can never feed
+  phantom deltas back into the session. The classic KVM oscillation
+  (warp → fake motion → warp back) cannot happen; there is no need for
+  warp-suppression timers or edge hacks.
 
 **2. The session tracks a *virtual* cursor and snaps on every switch.**
 `core::session::Session` owns one virtual position across the whole
@@ -51,6 +58,22 @@ session emits `Action::RecenterLocal` and the engine warps it back to
 center — invisible to the raw input stream, so the remote cursor never
 stops at "halfway across the client screen" (the bug the deskflow
 debugging session hit, and the fix that resolved it).
+
+## Keys: one identity across every OS
+
+Keys travel over the wire as **USB HID usage ids** — the industry
+standard for *physical* key identity. Each backend converts at its edge
+from its native code (X11 keycode → evdev → HID; Windows set-1
+scancode + E0 flag → HID), and back for injection (XTest on X11,
+`SendInput` in scan-code mode on Windows). Because the wire format is
+OS-neutral, a Windows server driving a Linux client — or any other pair
+— delivers the exact physical key the user pressed; each machine's own
+keyboard layout then produces the character.
+
+The tables live in `platform::keys` with both directions kept in sync by
+a consistency test, so a bad entry can never silently break a cross-OS
+pair. Wayland delivers keys as evdev codes, so the future Wayland
+backend uses the same table as X11.
 
 ## The wire protocol
 
@@ -86,6 +109,17 @@ debugging session hit, and the fix that resolved it).
   trailing bytes are *retained* — several frames often share one TCP
   segment, and dropping the remainder silently loses messages (a real bug
   the e2e test caught).
+
+## Logging
+
+Both binaries use `kvmshare-app::log`, a small leveled logger
+(component names come from the binary name: `kvmshare-server`,
+`kvmshare-client`). Levels are **error / warn / info / debug**; the
+default is info, set per-run with `-v` (verbose → debug) or `--quiet`
+(error only), and globally via the `KVMSHARE_LOG` env var (`error`,
+`warn`, `info`, `debug`). Every line is timestamped and goes to the
+state-dir log that the GUI tails and that the notification watcher
+parses.
 
 ## Clipboard sync
 
@@ -171,14 +205,18 @@ whole bundle is ~95 KB gzipped.
 
 ## Future work (in rough priority)
 
-1. **Windows/macOS backends** — implement `Engine`/`Injector`/input
-   source on each OS (Win32 SendInput/raw input, CGEvent on macOS). The
-   traits and stubs are ready.
-2. **Canonical key mapping** — a keysym ↔ keycode ↔ Windows VK table so
-   keys work across different OSes, not just same-OS pairs.
-3. **Live control socket** — replace the config-file watcher with a
+1. **macOS backend** — implement `Engine`/`Injector`/input source
+   (CGEventTap / IOKit, `NSPasteboard`), register it in `lib.rs`. The
+   traits, key tables and stubs are ready.
+2. **Wayland backend** — slots in next to X11 with the same contracts
+   and the same evdev key table (libinput delivers evdev codes).
+3. **Verify the Windows backend on real hardware** — the backend
+   compiles clean (Raw Input capture, SendInput injection, Win32
+   clipboard, cursor control) but has not been exercised on a Windows
+   desktop yet; see `platforms.md`.
+4. **Live control socket** — replace the config-file watcher with a
    direct control channel when more than layout needs to change at
    runtime (the protocol already has `Message::Layout`).
-4. **Richer clipboard** — images and multiple mimes.
-5. **Encryption** — TLS or Noise between peers; the frame has a flags
+5. **Richer clipboard** — images and multiple mimes.
+6. **Encryption** — TLS or Noise between peers; the frame has a flags
    byte reserved for this.

@@ -12,11 +12,13 @@ what is verified today, and is the porting guide for a new OS.
 | `kvmshare-protocol`  | ✅                 | ✅ compiles        | ✅ compiles        |
 | `kvmshare-core`      | ✅                 | ✅ compiles        | ✅ compiles        |
 | `kvmshare-app` (CLI) | ✅                 | ✅ compiles        | ✅ compiles        |
-| `kvmshare-platform`  | ✅ X11 backend     | ⚠️ stub, no input  | ⚠️ stub, no input  |
+| `kvmshare-platform`  | ✅ X11 backend     | ✅ backend, compile-checked | ⚠️ stub, no input  |
 | GUI (Wails v3)       | ✅ GTK4/WebKitGTK6 | ✅ compiles (PE32+) | ⚠️ untested        |
 
 ✅ = built, tested, in use. "Compiles" = cross-compiled clean, zero
-warnings (details below). ⚠️ = builds but does not yet *do* the thing.
+warnings (details below). "Compile-checked" = full backend written and
+cross-compiled clean, but not yet exercised on real hardware (we
+develop on Linux). ⚠️ = builds but does not yet *do* the thing.
 
 ## Verified portability (commands)
 
@@ -55,22 +57,36 @@ Three seams concentrate everything platform-specific:
 Everything else (protocol framing, the switching session, layout math,
 config, the whole frontend) is plain portable code with zero `#ifdef`s.
 
-## Windows: what is left to make it real
+## Windows: implemented, next is hardware verification
 
-The GUI, CLI binaries and core all compile for Windows today. What is
-missing is the input/desktop backend in `kvmshare-platform`:
+The Windows backend in `kvmshare-platform/src/windows/` is written and
+cross-compiles clean (zero warnings). It mirrors the X11 backend
+structure exactly — same `Engine`/`Injector` contracts, same canonical
+HID key model, same message flow:
 
-| Piece            | Linux impl (X11)         | Windows port                    |
-| ---------------- | ------------------------ | ------------------------------- |
-| Input capture    | XI2 raw device events    | Raw Input (`RegisterRawInputDevices`) or low-level hooks |
-| Cursor control   | XTest / XFixes warp+hide | `SetCursorPos` + hide via cursor state |
-| Input injection  | XTest (client side)      | `SendInput`                     |
-| Clipboard        | arboard                  | Win32 clipboard (CF_UNICODETEXT) |
+| Piece            | Linux impl (X11)            | Windows impl (written, compile-checked) |
+| ---------------- | --------------------------- | --------------------------------------- |
+| Input capture    | XI2 raw device events       | Raw Input on a hidden message-only window (`RegisterRawInputDevices`, `RIDEV_INPUTSINK`; absolute-mode deltas handled, keyboard auto-repeat deduplicated) |
+| Cursor control   | XFixes warp+hide            | `SetCursorPos` + `ShowCursor` (transition-balanced, no ref-count drift) |
+| Input injection  | XTest (client side)         | `SendInput` in scan-code mode (layout-independent, like XTest) |
+| Clipboard        | arboard                     | Win32 clipboard via `CF_UNICODETEXT` with pure-Rust UTF-8/UTF-16 conversion |
+| Key identity     | HID ↔ evdev (X11)           | HID ↔ set-1 scancode (+ E0 flag) — same `platform::keys` module, roundtrip-tested on Linux |
+| DPI              | n/a (X11 pixels)            | per-monitor DPI aware at startup; `GetDpiForSystem` for the scale report |
 
-Implement `core::server::Engine` + `core::client::Injector` in a
-`kvmshare-platform/src/windows/` module and register it in `lib.rs` the
-same way `x11` is. That is the entire port — the protocol, session,
-config, GUI and tray logic do not change.
+Because `SetCursorPos` never generates raw input (same property as XI2
+raw events), the anti-oscillation design carries over unchanged: the
+hidden server cursor can be parked/re-centered without feeding phantom
+motion into the session.
+
+### What remains before Windows is "real"
+
+- Run the server and client on actual Windows machines: raw-input
+  capture, injection, cursor hide/show and the clipboard need hardware
+  exercise (a Linux host can only compile-check them).
+- `cargo test --target x86_64-pc-windows-msvc` on a Windows host so the
+  platform unit tests actually execute.
+- The GUI needs a Windows desktop session to verify tray, close-to-tray
+  and notifications visually.
 
 ### Windows GUI notes
 
@@ -87,6 +103,16 @@ config, GUI and tray logic do not change.
 - **Single instance**: `gui.lock` uses `LockFileEx` on Windows (via the
   build-tagged helpers) — same "one GUI per machine" behaviour.
 
+## Cross-OS pairs
+
+There is no "server OS" or "client OS" — any machine can be either
+role, and the roles pair freely: the canonical HID key identity, the
+same binary protocol, the same clipboard mime model, and mirrored
+backends mean a Windows server driving a Linux client works exactly
+like a Linux server driving a Windows client. The only OS-specific
+behavior is inside the per-OS backend module; nothing in core, protocol
+or GUI knows which OS is on the other end of the wire.
+
 ## macOS
 
 Not attempted. The seams are identical: implement the platform backend
@@ -99,8 +125,11 @@ and register it in `lib.rs`. The GUI is expected to build via Wails v3
 
 - `cargo check --target x86_64-pc-windows-msvc --workspace` and the
   `GOOS=windows` build above are cheap; run them when touching `core`,
-  `app`, or the GUI's Go files so portability regressions surface
-  immediately.
+  `app`, `platform`, or the GUI's Go files so portability regressions
+  surface immediately.
+- The pure key tables (`platform::keys`) are compiled and tested on
+  every platform, so a bad HID↔evdev or HID↔scancode entry fails the
+  Linux suite — not just the Windows one.
 - Never reach for `std::os::unix` / `syscall` directly outside
   `kvmshare-platform` (Rust) or `gui/process_os_*.go` (Go).
 

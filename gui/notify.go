@@ -20,8 +20,10 @@ import (
 )
 
 // clientEventRe matches the server's connect/disconnect markers. The
-// marker text lives in the Rust server; keep both sides in sync.
-var clientEventRe = regexp.MustCompile(`^kvmshare-server: client (\S+) (connected|disconnected)$`)
+// marker text lives in the Rust server; keep both sides in sync. Not
+// anchored: lines may carry a timestamp/level prefix from the server's
+// leveled logger.
+var clientEventRe = regexp.MustCompile(`client (\S+) (connected|disconnected)`)
 
 // How often the log is re-read. Cheap (offset-based), so once per second
 // is fine and keeps notifications snappy.

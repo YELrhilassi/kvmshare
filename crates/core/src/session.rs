@@ -139,7 +139,7 @@ impl Session {
                 self.forward_while_remote(Message::MouseButton { button, pressed })
             }
             Message::MouseWheel { dx, dy } => self.forward_while_remote(Message::MouseWheel { dx, dy }),
-            Message::Key { kind, key, scan } => self.forward_while_remote(Message::Key { kind, key, scan }),
+            Message::Key { kind, key } => self.forward_while_remote(Message::Key { kind, key }),
             _ => vec![],
         }
     }
@@ -420,8 +420,8 @@ mod tests {
     fn key_events_forward_when_remote() {
         let mut s = two_screens();
         s.on_local_event(Message::MouseMoveRel { dx: -1000, dy: 0 });
-        let actions = s.on_local_event(Message::Key { kind: KeyKind::Down, key: 10, scan: 20 });
-        assert_eq!(actions, vec![Action::Send(Message::Key { kind: KeyKind::Down, key: 10, scan: 20 })]);
+        let actions = s.on_local_event(Message::Key { kind: KeyKind::Down, key: 0x14 });
+        assert_eq!(actions, vec![Action::Send(Message::Key { kind: KeyKind::Down, key: 0x14 })]);
     }
 
     #[test]

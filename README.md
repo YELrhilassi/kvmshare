@@ -18,7 +18,7 @@ kvmshare/
 ├── crates/
 │   ├── protocol/   # binary wire protocol: framing, messages, (de)serialization
 │   ├── core/       # layout model, cursor/screen-switching session, TCP server/client
-│   ├── platform/   # OS backends: Linux/X11 (XI2 raw input, XFixes, XTest, arboard)
+│   ├── platform/   # OS backends: Linux/X11 (XI2 raw input, XFixes, XTest) + Windows (Raw Input, SendInput)
 │   └── app/        # the kvmshare-server and kvmshare-client executables
 ├── gui/            # Wails v3 desktop app: React + shadcn/ui, 4 pages
 │   └── frontend/   #   Vite + React + TypeScript (built to frontend/dist)
@@ -161,20 +161,22 @@ network listing and log tailing.
 
 - **Linux/X11**: full — input capture (XI2 raw), cursor control, input
   injection, clipboard sync, GUI, tray + notifications.
-- **Windows**: everything compiles clean for `x86_64-pc-windows-msvc`
-  (Rust) and `windows/amd64` (the Wails v3 GUI, no cgo); what is missing
-  is the input/desktop backend (capture, injection, cursor, clipboard).
+- **Windows**: full backend written (Raw Input capture, SendInput
+  injection, Win32 clipboard, cursor control) and the whole workspace
+  cross-compiles clean; the GUI builds to a PE32+ with no cgo. The
+  backend is compile-checked — it still needs exercise on real Windows
+  hardware.
 - **macOS**: the architecture is ready (platform traits + stubs with
   clear errors); not attempted yet.
 
 See `docs/platforms.md` for the full portability audit and the Windows
-porting plan.
+verification checklist.
 
 ## Known limitations (deliberate, documented)
 
-- Keys travel as native scan codes (`scan` in `Message::Key`), so a
-  Linux↔Linux pair works perfectly today; a canonical key map for
-  cross-OS pairs (Linux↔Windows) is planned.
+- Keys travel as canonical USB HID usage ids (`key` in `Message::Key`),
+  so any OS pair (Linux↔Windows included) delivers the physical key;
+  each machine's own layout produces the character.
 - Clipboard sync is text-only (`text/plain`), polled on both sides and
   echo-guarded.
 - Layout/config changes apply **live**: the server watches its config

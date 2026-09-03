@@ -7,11 +7,18 @@
 //! * **Linux** — X11 backend: XI2 raw events for input capture (deltas
 //!   straight from the device, no warp feedback), XFixes for cursor
 //!   hide/show, XTest for input injection, arboard for the clipboard.
-//! * **Windows / macOS** — not yet implemented; [`unsupported`] stubs
+//!   A Wayland backend slots in next to it later (same contracts, same
+//!   evdev-based key table).
+//! * **Windows** — Raw Input capture on a hidden message-only window,
+//!   `SetCursorPos` cursor control, `SendInput` injection (scan-code
+//!   mode), native clipboard. Mirrors the X11 backend structure; keys
+//!   travel as canonical USB HID usages on both.
+//! * **macOS / other** — not yet implemented; [`unsupported`] stubs
 //!   fail with a clear error so the rest of the system still builds.
 //!
 //! The entry points are [`server`] (start local input capture + get the
-//! engine) and [`client`] (get an injector).
+//! engine) and [`client`] (get an injector). `display` is honored by the
+//! X11 backend and ignored elsewhere (uniform signature).
 
 use std::sync::mpsc::Receiver;
 
@@ -19,22 +26,34 @@ use kvmshare_core::client::Injector;
 use kvmshare_core::server::Engine;
 use kvmshare_protocol::message::Message;
 
+pub mod keys;
 pub mod unsupported;
 
+// Per-OS backends. Each implements the same Engine/Injector contracts;
+// the key table in `keys` is shared so the wire identity is identical
+// everywhere.
 #[cfg(target_os = "linux")]
 pub mod x11;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 /// Start the server-side platform: capture local input and build the
 /// engine that controls the local cursor/clipboard.
 ///
-/// `display` is an X display string (`None` = `$DISPLAY`).
+/// `display` is an X display string (`None` = `$DISPLAY`); ignored on
+/// platforms without displays.
 pub fn server(display: Option<&str>) -> Result<(Receiver<Message>, Box<dyn Engine>), String> {
     #[cfg(target_os = "linux")]
     {
         let s = x11::Server::start(display)?;
         Ok((s.input, s.engine))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        let s = windows::Server::start(display)?;
+        Ok((s.input, s.engine))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         unsupported::server(display)
     }
@@ -46,7 +65,11 @@ pub fn client(display: Option<&str>) -> Result<Box<dyn Injector>, String> {
     {
         x11::client_injector(display)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::client_injector(display)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         unsupported::client(display)
     }

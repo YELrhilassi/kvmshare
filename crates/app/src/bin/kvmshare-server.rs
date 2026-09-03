@@ -11,18 +11,22 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use kvmshare_app::guard::{self, RoleGuard};
-use kvmshare_app::{default_config_path, parse_server_args, session_from_config, spawn_server_clipboard, Config};
+use kvmshare_app::log::{self, Level};
+use kvmshare_app::{
+    default_config_path, log_info, log_warn, parse_server_args, session_from_config, spawn_server_clipboard, Config,
+};
 use kvmshare_core::server::{Control, Server};
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("kvmshare-server: {e}");
+        log::write_line(Level::Error, format_args!("{e}"));
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), String> {
     let args = parse_server_args()?;
+    log::init(&args.log_level.unwrap_or_else(log::level_from_env_or_default))?;
 
     // One role per machine, enforced at the OS level: refuse to start if
     // a client is running here, and hold our own lock for the process
@@ -34,8 +38,8 @@ fn run() -> Result<(), String> {
     let config_path = args.config.unwrap_or_else(default_config_path);
     let cfg = Config::load(&config_path)?;
     let port = if args.port != 0 { args.port } else { cfg.port };
-    println!(
-        "kvmshare-server: layout {} screens (local: {}), listening on :{port}",
+    log_info!(
+        "layout {} screens (local: {}), listening on :{port}",
         cfg.screens.len(),
         cfg.screens[0].name
     );
@@ -87,7 +91,7 @@ fn spawn_config_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
                         return; // server gone
                     }
                 }
-                Err(e) => eprintln!("kvmshare-server: config reload deferred: {e}"),
+                Err(e) => log_warn!("config reload deferred: {e}"),
             }
         }
     });

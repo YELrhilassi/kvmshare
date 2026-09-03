@@ -9,7 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use kvmshare_app::guard::{self, RoleGuard};
-use kvmshare_app::{hostname, parse_client_args, with_default_port, DEFAULT_PORT};
+use kvmshare_app::log::{self, Level};
+use kvmshare_app::{hostname, log_info, log_warn, parse_client_args, with_default_port, DEFAULT_PORT};
 use kvmshare_core::client::Client;
 use kvmshare_protocol::message::Message;
 
@@ -20,13 +21,14 @@ const RETRY_DELAY: Duration = Duration::from_secs(3);
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("kvmshare-client: {e}");
+        log::write_line(Level::Error, format_args!("{e}"));
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), String> {
     let args = parse_client_args()?;
+    log::init(&args.log_level.unwrap_or_else(log::level_from_env_or_default))?;
 
     // One role per machine, enforced at the OS level: refuse to start if
     // a server is running here, and hold our own lock for the process
@@ -47,7 +49,7 @@ fn run() -> Result<(), String> {
             Ok(i) => i,
             Err(e) => {
                 if !warned {
-                    eprintln!("kvmshare-client: platform: {e} — retrying every 3 s");
+                    log_warn!("platform: {e} — retrying every 3 s");
                     warned = true;
                 }
                 thread::sleep(RETRY_DELAY);
@@ -55,22 +57,22 @@ fn run() -> Result<(), String> {
             }
         };
 
-        println!("kvmshare-client: connecting to {addr} as {name}");
+        log_info!("connecting to {addr} as {name}");
         match Client::connect(&addr, &name, injector.screen_info()) {
             Ok(client) => {
                 warned = false;
-                println!("kvmshare-client: connected, screen id {}", client.own_id());
+                log_info!("connected, screen id {}", client.own_id());
                 // The outbox is reserved for app-level control messages;
                 // the core run loop handles clipboard upload and
                 // keepalives itself.
                 let (_out_tx, out_rx) = mpsc::channel::<Message>();
                 if let Err(e) = client.run(injector, &out_rx) {
-                    eprintln!("kvmshare-client: session ended: {e} — reconnecting");
+                    log_warn!("session ended: {e} — reconnecting");
                 }
             }
             Err(e) => {
                 if !warned {
-                    eprintln!("kvmshare-client: connect failed: {e} — retrying every 3 s");
+                    log_warn!("connect failed: {e} — retrying every 3 s");
                     warned = true;
                 }
             }
