@@ -27,6 +27,7 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input as ri;
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
+use kvmshare_log::{log_error, log_info};
 use kvmshare_protocol::message::{KeyKind, Message};
 
 use super::buttons;
@@ -144,11 +145,12 @@ pub fn start() -> Result<Receiver<Message>, String> {
     let hwnd = create_capture_window()?;
     register_raw_input(hwnd)?;
 
+    log_info!("input capture started (Raw Input)");
     let (tx, rx) = mpsc::channel();
     let capture = InputCapture { tx, abs: AbsoluteTracker::default(), keys: KeyTracker::default() };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {
-            eprintln!("input capture stopped: {e}");
+            log_error!("input capture stopped: {e}");
         }
     });
     Ok(rx)
@@ -252,9 +254,14 @@ impl InputCapture {
     }
 
     fn on_keyboard(&mut self, kb: &ri::RAWKEYBOARD) {
-        // Key identity: (make code, extended flag). E1 sequences (Pause)
-        // are unmapped and ignored.
-        let extended = kb.Flags & wm::RI_KEY_E1 as u16 == 0 && kb.Flags & wm::RI_KEY_E0 as u16 != 0;
+        // E1-prefixed sequences (Pause) report a make code that collides
+        // with an unrelated key (Pause = E1 1D 45 would look like Num
+        // Lock's 0x45), so they are dropped rather than mis-forwarded.
+        if kb.Flags & wm::RI_KEY_E1 as u16 != 0 {
+            return;
+        }
+        // Key identity: (make code, extended flag).
+        let extended = kb.Flags & wm::RI_KEY_E0 as u16 != 0;
         let is_down = matches!(kb.Message, wm::WM_KEYDOWN | wm::WM_SYSKEYDOWN);
         let is_up = matches!(kb.Message, wm::WM_KEYUP | wm::WM_SYSKEYUP);
         if !is_down && !is_up {
@@ -307,6 +314,22 @@ mod tests {
         assert_eq!(wheel_notches(0), 0);
         // Two notches (some mice report 240).
         assert_eq!(wheel_notches(240), 2);
+    }
+
+    #[test]
+    fn e1_pause_sequence_is_dropped_not_misforwarded() {
+        // Pause arrives as make code 0x45 with RI_KEY_E1 set — the same
+        // make code as Num Lock. It must be dropped, never forwarded as
+        // Num Lock.
+        let mut capture = InputCapture { tx: mpsc::channel().0, abs: AbsoluteTracker::default(), keys: KeyTracker::default() };
+        // SAFETY: zeroed struct; only the fields the handler reads are
+        // populated, matching a real raw-input record.
+        let mut kb: ri::RAWKEYBOARD = unsafe { std::mem::zeroed() };
+        kb.MakeCode = 0x45;
+        kb.Flags = wm::RI_KEY_E1 as u16;
+        kb.Message = wm::WM_KEYDOWN;
+        capture.on_keyboard(&kb);
+        assert!(capture.keys.down.is_empty(), "Pause must not be tracked as a key");
     }
 
     #[test]

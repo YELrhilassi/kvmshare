@@ -12,6 +12,7 @@ use std::net::TcpStream;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use kvmshare_log::{log_debug, log_trace, log_warn};
 use kvmshare_protocol::message::{KeyKind, Layout, Message, ScreenInfo};
 
 use crate::transport::{RecvResult, Transport};
@@ -148,18 +149,39 @@ impl Client {
     fn dispatch(&mut self, msg: Message, injector: &mut dyn Injector) {
         match msg {
             Message::Enter { screen_id: _, x, y } => {
+                log_trace!("control entered at ({x},{y})");
                 injector.enter();
                 injector.move_cursor(x, y);
             }
-            Message::Leave { screen_id: _ } => injector.leave(),
+            Message::Leave { screen_id: _ } => {
+                log_trace!("control left");
+                injector.leave();
+            }
+            // Mouse moves are the hot path (hundreds per second) — not
+            // even trace logs those.
             Message::MouseMoveAbs { x, y } => injector.move_cursor(x, y),
-            Message::MouseButton { button, pressed } => injector.button(button, pressed),
-            Message::MouseWheel { dx, dy } => injector.wheel(dx, dy),
-            Message::Key { kind, key } => injector.key(kind, key),
-            Message::Clipboard { mime, data } => injector.clipboard(&mime, &data),
-            Message::Layout { layout } => self.layout = layout,
+            Message::MouseButton { button, pressed } => {
+                log_trace!("button {button} {}", if pressed { "down" } else { "up" });
+                injector.button(button, pressed);
+            }
+            Message::MouseWheel { dx, dy } => {
+                log_trace!("wheel {dx},{dy}");
+                injector.wheel(dx, dy);
+            }
+            Message::Key { kind, key } => {
+                log_trace!("key {kind:?} {key}");
+                injector.key(kind, key);
+            }
+            Message::Clipboard { mime, data } => {
+                log_debug!("clipboard from server: {} ({} bytes)", mime, data.len());
+                injector.clipboard(&mime, &data);
+            }
+            Message::Layout { layout } => {
+                log_debug!("layout updated: {} screens", layout.screens.len());
+                self.layout = layout;
+            }
             Message::KeepAlive => {}
-            Message::Error { code, text } => eprintln!("server error ({code}): {text}"),
+            Message::Error { code, text } => log_warn!("server error ({code}): {text}"),
             // Not valid client-side traffic; ignore defensively.
             Message::Hello { .. } | Message::Welcome { .. } | Message::ScreenInfo { .. } | Message::MouseMoveRel { .. } => {}
         }

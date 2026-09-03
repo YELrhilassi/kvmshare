@@ -9,9 +9,9 @@ use std::thread;
 use std::time::Duration;
 
 use kvmshare_app::guard::{self, RoleGuard};
-use kvmshare_app::log::{self, Level};
-use kvmshare_app::{hostname, log_info, log_warn, parse_client_args, with_default_port, DEFAULT_PORT};
+use kvmshare_app::{hostname, parse_client_args, with_default_port, DEFAULT_PORT};
 use kvmshare_core::client::Client;
+use kvmshare_log::{log_error, log_info, log_warn};
 use kvmshare_protocol::message::Message;
 
 /// How long to wait between connection attempts. The server may not be up
@@ -21,14 +21,17 @@ const RETRY_DELAY: Duration = Duration::from_secs(3);
 
 fn main() {
     if let Err(e) = run() {
-        log::write_line(Level::Error, format_args!("{e}"));
+        log_error!("{e}");
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), String> {
     let args = parse_client_args()?;
-    log::init(&args.log_level.unwrap_or_else(log::level_from_env_or_default))?;
+    kvmshare_log::init(
+        &args.log_level.unwrap_or_else(kvmshare_log::level_from_env_or_default),
+        args.log_ctl,
+    )?;
 
     // One role per machine, enforced at the OS level: refuse to start if
     // a server is running here, and hold our own lock for the process

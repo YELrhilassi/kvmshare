@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 kvmshare-core = { workspace = true }
 kvmshare-protocol = { workspace = true }
+kvmshare-log = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["allow-unsafe-code", "xinput", "xfixes", "xtest"] }

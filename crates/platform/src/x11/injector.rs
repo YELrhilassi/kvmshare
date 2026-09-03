@@ -9,6 +9,7 @@ use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
 use kvmshare_core::client::Injector;
+use kvmshare_log::log_warn;
 use kvmshare_protocol::message::{KeyKind, ScreenInfo};
 
 use super::buttons;
@@ -113,13 +114,13 @@ impl Injector for X11Injector {
 
     fn clipboard(&mut self, mime: &str, data: &[u8]) {
         if mime != "text/plain" {
-            eprintln!("clipboard: ignoring non-text mime {mime:?}");
+            log_warn!("clipboard: ignoring non-text mime {mime:?}");
             return;
         }
         if let Some(cb) = &mut self.clipboard {
             if let Ok(text) = std::str::from_utf8(data) {
                 if let Err(e) = cb.set_text(text.to_owned()) {
-                    eprintln!("clipboard: set failed: {e}");
+                    log_warn!("clipboard: set failed: {e}");
                 }
             }
             self.last_remote = Some((mime.to_owned(), data.to_vec()));

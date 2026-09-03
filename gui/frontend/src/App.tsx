@@ -7,6 +7,7 @@ import HomePage from "@/pages/Home";
 import ServerPage from "@/pages/Server";
 import ClientPage from "@/pages/Client";
 import LayoutPage from "@/pages/Layout";
+import LogsPage from "@/pages/Logs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 export default function App() {
@@ -93,6 +94,7 @@ export default function App() {
           {effectivePage === "server" && <ServerPage />}
           {effectivePage === "client" && <ClientPage />}
           {effectivePage === "layout" && <LayoutPage />}
+          {effectivePage === "logs" && <LogsPage mode={mode} />}
         </main>
       </div>
     </TooltipProvider>

@@ -17,10 +17,11 @@ with no serialization framework.
 kvmshare/
 ├── crates/
 │   ├── protocol/   # binary wire protocol: framing, messages, (de)serialization
+│   ├── log/        # leveled, hot-reloadable logging shared by every crate
 │   ├── core/       # layout model, cursor/screen-switching session, TCP server/client
 │   ├── platform/   # OS backends: Linux/X11 (XI2 raw input, XFixes, XTest) + Windows (Raw Input, SendInput)
 │   └── app/        # the kvmshare-server and kvmshare-client executables
-├── gui/            # Wails v3 desktop app: React + shadcn/ui, 4 pages
+├── gui/            # Wails v3 desktop app: React + shadcn/ui, 5 pages
 │   └── frontend/   #   Vite + React + TypeScript (built to frontend/dist)
 └── docs/
     └── architecture.md   # design decisions, threading model, future work
@@ -141,16 +142,20 @@ Home:
   address clients connect to (server mode) or the machine this one
   connects to (client mode). Switching role stops whatever was running.
 - **Server** (server role) — start/stop, configuration (port, config
-  path), network details (all interfaces + addresses) and a live log
-  tail.
+  path), network details (all interfaces + addresses).
 - **Client** (client role) — the server address + screen name this
-  machine connects with, start/stop and a live log.
+  machine connects with, start/stop.
 - **Layout** (server role) — the virtual desktop editor: drag screens to
   arrange them (with edge snapping), zoom/pan/fit, nudge with the arrow
   keys, duplicate/delete screens, and a lock toggle that freezes the
   layout against accidental edits. The canvas stays legible at any zoom:
   100% always fits the whole desktop, the grid is adaptive and always
   visible, and screen labels/borders keep their size while zooming.
+- **Logs** (both roles) — the log of this machine's own instance
+  (server in server mode, client in client mode), with a level selector
+  up to **trace**, an enable switch, follow and Clear. Level and
+  enable apply **live to the running process** — no restart — and
+  persist for whichever role starts next.
 
 Role exclusivity is enforced at the OS level too: the server and client
 binaries take `flock`-based role locks, so a machine can never run both,
@@ -170,9 +175,11 @@ A client machine that loses its server (or starts before it) does not
 die: it retries every 3 seconds until the server is reachable, then
 picks the session right back up — no manual restarts.
 
-The GUI's own state (role, client address) persists in
-`~/.local/state/kvmshare/gui.json`; process logs live in the same folder
-and are tailed live by the UI.
+The GUI's own state (role, client address, log level/enabled) persists
+in `~/.local/state/kvmshare/gui.json`; process logs live in the same
+folder, are tailed live by the Logs page, and are controlled there
+through a small `*.logctl` file the running process polls — level
+changes and the enable switch reach it within a fraction of a second.
 
 ## Test
 

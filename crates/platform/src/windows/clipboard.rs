@@ -10,6 +10,7 @@
 //! `arboard`-based clipboard on the X11 backend — same contract, same
 //! `last_remote` echo-guard.
 
+use kvmshare_log::log_warn;
 use windows_sys::Win32::System::DataExchange as dx;
 use windows_sys::Win32::System::Memory as mem;
 use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL};
@@ -34,11 +35,11 @@ impl Clipboard {
     /// Put `data` (as UTF-8 text) into the system clipboard.
     pub fn set_text(&mut self, mime: &str, data: &[u8]) {
         if mime != "text/plain" {
-            eprintln!("clipboard: ignoring non-text mime {mime:?}");
+            log_warn!("clipboard: ignoring non-text mime {mime:?}");
             return;
         }
         let Ok(text) = std::str::from_utf8(data) else {
-            eprintln!("clipboard: incoming data is not valid UTF-8");
+            log_warn!("clipboard: incoming data is not valid UTF-8");
             return;
         };
         // Copy into a moveable global block; the clipboard takes
@@ -48,12 +49,12 @@ impl Clipboard {
         // allocation we size exactly; OpenClipboard serializes access.
         unsafe {
             if dx::OpenClipboard(std::ptr::null_mut()) == 0 {
-                eprintln!("clipboard: OpenClipboard failed");
+                log_warn!("clipboard: OpenClipboard failed");
                 return;
             }
             let h = mem::GlobalAlloc(mem::GMEM_MOVEABLE, wide.len() * 2);
             if h.is_null() {
-                eprintln!("clipboard: GlobalAlloc failed");
+                log_warn!("clipboard: GlobalAlloc failed");
                 dx::CloseClipboard();
                 return;
             }
@@ -62,13 +63,18 @@ impl Clipboard {
                 std::ptr::copy_nonoverlapping(wide.as_ptr(), p as *mut u16, wide.len());
                 mem::GlobalUnlock(h);
             } else {
-                eprintln!("clipboard: GlobalLock failed");
+                log_warn!("clipboard: GlobalLock failed");
                 GlobalFree(h);
                 dx::CloseClipboard();
                 return;
             }
             dx::EmptyClipboard();
-            dx::SetClipboardData(CF_UNICODETEXT, h);
+            // On failure the system did not take ownership — free the
+            // block so nothing leaks.
+            if dx::SetClipboardData(CF_UNICODETEXT, h).is_null() {
+                log_warn!("clipboard: SetClipboardData failed");
+                GlobalFree(h);
+            }
             dx::CloseClipboard();
         }
         self.last_remote = Some((mime.to_owned(), data.to_vec()));

@@ -30,6 +30,14 @@ export interface Settings {
   mode: Mode;
   clientAddr: string;
   clientName: string;
+  logLevel: string;
+  logEnabled: boolean;
+}
+
+export interface LogSettings {
+  role: "server" | "client";
+  level: string;
+  enabled: boolean;
 }
 
 export interface InterfaceInfo {
@@ -73,6 +81,9 @@ interface GoApp {
   StopActive(): Promise<void>;
   ListInterfaces(): Promise<InterfaceInfo[]>;
   TailLog(path: string, lines: number): Promise<string>;
+  GetLogSettings(): Promise<LogSettings>;
+  SetLogSettings(s: LogSettings): Promise<void>;
+  ClearLog(role: string): Promise<void>;
   GetVersion(): Promise<string>;
   CheckForUpdate(): Promise<UpdateInfo>;
   ApplyUpdate(): Promise<UpdateResult>;
@@ -133,6 +144,9 @@ export const api = (): GoApp => ({
   StopActive: () => call<void>("StopActive"),
   ListInterfaces: () => call<InterfaceInfo[]>("ListInterfaces"),
   TailLog: (path, lines) => call<string>("TailLog", path, lines),
+  GetLogSettings: () => call<LogSettings>("GetLogSettings"),
+  SetLogSettings: (s) => call<void>("SetLogSettings", s),
+  ClearLog: (role) => call<void>("ClearLog", role),
   GetVersion: () => call<string>("GetVersion"),
   CheckForUpdate: () => call<UpdateInfo>("CheckForUpdate"),
   ApplyUpdate: () => call<UpdateResult>("ApplyUpdate"),

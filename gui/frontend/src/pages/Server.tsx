@@ -1,11 +1,10 @@
 import { useEffect, useState } from "react";
 import { api, type InterfaceInfo, type LayoutConfig, type Paths } from "@/lib/bridge";
 import { DEFAULT_PORT } from "@/lib/constants";
-import { useLogTail, useRunning } from "@/lib/hooks";
+import { useRunning } from "@/lib/hooks";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Section, Row } from "@/components/Section";
 import { cn } from "@/lib/utils";
 
@@ -17,8 +16,6 @@ export default function ServerPage() {
   const [port, setPort] = useState(String(DEFAULT_PORT));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-
-  const { log, viewportRef, onScroll, setStick } = useLogTail(paths?.serverLog);
 
   useEffect(() => {
     void api()
@@ -72,7 +69,7 @@ export default function ServerPage() {
       <div className="mx-auto max-w-2xl px-10 py-16">
         <header className="mb-12 space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">Server</h1>
-          <p className="text-sm text-muted-foreground">Configuration, network and logs.</p>
+          <p className="text-sm text-muted-foreground">Configuration and network.</p>
         </header>
 
         <div className="space-y-16">
@@ -146,27 +143,6 @@ export default function ServerPage() {
             </div>
           </Section>
 
-          <Section
-            title="Logs"
-            action={
-              <button
-                onClick={() => setStick(true)}
-                className="text-xs text-muted-foreground transition-colors hover:text-foreground"
-              >
-                follow
-              </button>
-            }
-          >
-            <ScrollArea className="h-72 rounded-md border border-border/70 bg-muted/30">
-              <div
-                ref={viewportRef}
-                onScroll={onScroll}
-                className="h-full overflow-y-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap"
-              >
-                {log || "— no log output yet —"}
-              </div>
-            </ScrollArea>
-          </Section>
         </div>
       </div>
     </div>

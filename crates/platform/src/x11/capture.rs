@@ -23,6 +23,7 @@ use x11rb::protocol::xinput::{self, EventMask, Fp3232, XIEventMask};
 use x11rb::protocol::Event as XEvent;
 use x11rb::rust_connection::RustConnection;
 
+use kvmshare_log::{log_error, log_info};
 use kvmshare_protocol::message::{KeyKind, Message};
 
 use super::buttons::{self, XButton};
@@ -108,12 +109,13 @@ pub fn start(display: Option<&str>) -> Result<Receiver<Message>, String> {
     }
 
     select_raw_events(&conn, root)?;
+    log_info!("input capture started (XI2 raw events)");
 
     let (tx, rx) = mpsc::channel();
     let capture = InputCapture { conn, tx, acc: Accum::default() };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {
-            eprintln!("input capture stopped: {e}");
+            log_error!("input capture stopped: {e}");
         }
     });
     Ok(rx)

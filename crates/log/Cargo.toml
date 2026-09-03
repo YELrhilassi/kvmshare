@@ -1,0 +1,8 @@
+[package]
+name = "kvmshare-log"
+description = "Leveled, hot-reloadable logging shared by every kvmshare crate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

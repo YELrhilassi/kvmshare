@@ -213,6 +213,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "kvmshare-core",
+ "kvmshare-log",
  "kvmshare-platform",
  "kvmshare-protocol",
  "libc",
@@ -224,8 +225,13 @@ dependencies = [
 name = "kvmshare-core"
 version = "0.1.0"
 dependencies = [
+ "kvmshare-log",
  "kvmshare-protocol",
 ]
+
+[[package]]
+name = "kvmshare-log"
+version = "0.1.0"
 
 [[package]]
 name = "kvmshare-platform"
@@ -233,6 +239,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "kvmshare-core",
+ "kvmshare-log",
  "kvmshare-protocol",
  "windows-sys 0.61.2",
  "x11rb",

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -317,6 +318,61 @@ func TestListInterfaces(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected at least one address")
+	}
+}
+
+func TestLogSettingsControlFiles(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	// Defaults: info + enabled, for the active role.
+	s := a.GetLogSettings()
+	if s.Role != string(ModeServer) || s.Level != "info" || !s.Enabled {
+		t.Fatalf("default log settings = %+v", s)
+	}
+
+	// SetLogSettings hot-writes BOTH control files (whichever role runs
+	// next picks the level up; the running one hot-applies it).
+	if err := a.SetLogSettings(LogSettings{Role: "server", Level: "debug", Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{roleServer, roleClient} {
+		raw, err := os.ReadFile(filepath.Join(a.stateDir, role+".logctl"))
+		if err != nil {
+			t.Fatalf("control file %s: %v", role, err)
+		}
+		text := string(raw)
+		if !strings.Contains(text, "level=debug") || !strings.Contains(text, "enabled=0") {
+			t.Fatalf("control file %s content = %q", role, text)
+		}
+	}
+
+	// The choice persists across GUI restarts.
+	a2 := NewApp()
+	if got := a2.GetLogSettings(); got.Level != "debug" || got.Enabled {
+		t.Fatalf("persisted log settings = %+v", got)
+	}
+
+	// Unknown levels are rejected.
+	if err := a.SetLogSettings(LogSettings{Role: "server", Level: "loud", Enabled: true}); err == nil {
+		t.Fatal("expected error for invalid level")
+	}
+
+	// ClearLog empties a real file and tolerates a missing one.
+	if err := os.WriteFile(a.serverLogPath, []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ClearLog(roleServer); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(a.serverLogPath)
+	if err != nil || st.Size() != 0 {
+		t.Fatalf("log not cleared: size=%v err=%v", st, err)
+	}
+	if err := a.ClearLog(roleClient); err != nil {
+		t.Fatalf("clearing a missing log should be a no-op: %v", err)
+	}
+	if err := a.ClearLog("banana"); err == nil {
+		t.Fatal("expected error for unknown role")
 	}
 }
 

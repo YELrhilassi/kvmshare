@@ -36,11 +36,23 @@ const (
 	ModeClient Mode = "client"
 )
 
-// Settings is the GUI's own persisted state (role + client connection).
+// Settings is the GUI's own persisted state (role + client connection +
+// the operator's logging preferences).
 type Settings struct {
 	Mode       Mode   `json:"mode"`
 	ClientAddr string `json:"clientAddr"` // host:port of the server to connect to
 	ClientName string `json:"clientName"` // screen name used on the server
+	LogLevel   string `json:"logLevel"`   // error|warn|info|debug|trace
+	LogEnabled bool   `json:"logEnabled"` // false silences the role's log entirely
+}
+
+// LogSettings is what the Logs page shows and edits: the logging
+// configuration for this machine's instance (one role runs at a time, so
+// one level applies to whichever role is active).
+type LogSettings struct {
+	Role    string `json:"role"` // the active role: "server" or "client"
+	Level   string `json:"level"`
+	Enabled bool   `json:"enabled"`
 }
 
 // Paths reports where everything lives (config, logs, binaries).
@@ -125,6 +137,8 @@ func NewApp() *App {
 		settings: Settings{
 			Mode:       ModeServer,
 			ClientName: hostnameOr("client"),
+			LogLevel:   "info",
+			LogEnabled: true,
 		},
 	}
 	a.loadSettings()
@@ -214,6 +228,11 @@ func (a *App) loadSettings() {
 	if err != nil {
 		return
 	}
+	// Presence check: a pre-update gui.json has no log fields, and the
+	// zero value for a bool is *disabled* — so distinguish "absent"
+	// (default logging ON) from an explicit `logEnabled: false`.
+	var present map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &present)
 	var s Settings
 	if json.Unmarshal(raw, &s) != nil {
 		return
@@ -223,6 +242,12 @@ func (a *App) loadSettings() {
 	}
 	if s.ClientName == "" {
 		s.ClientName = hostnameOr("client")
+	}
+	if !validLogLevel(s.LogLevel) {
+		s.LogLevel = "info"
+	}
+	if _, ok := present["logEnabled"]; !ok {
+		s.LogEnabled = true // logging defaults to ON
 	}
 	a.settings = s
 }
@@ -252,9 +277,19 @@ func (a *App) SetSettings(s Settings) error {
 	if s.Mode != ModeServer && s.Mode != ModeClient {
 		return fmt.Errorf("mode must be 'server' or 'client'")
 	}
+	if s.LogLevel == "" {
+		s.LogLevel = "info" // omitted (e.g. older callers) → default
+	}
+	if !validLogLevel(s.LogLevel) {
+		return fmt.Errorf("unknown log level %q (use error, warn, info, debug or trace)", s.LogLevel)
+	}
 	changed := a.settings.Mode != s.Mode
 	a.settings = s
 	a.saveSettingsLocked()
+	// The level/enabled the user picked must apply to the running
+	// instance (hot reload) and to whichever role starts next.
+	a.writeLogCtlLocked(roleServer)
+	a.writeLogCtlLocked(roleClient)
 	if changed {
 		// Switching roles: the old role's instance is no longer wanted.
 		if s.Mode == ModeClient {
@@ -262,6 +297,87 @@ func (a *App) SetSettings(s Settings) error {
 		} else {
 			a.stopRoleLocked(roleClient)
 		}
+	}
+	return nil
+}
+
+// GetLogSettings returns the operator's logging configuration plus the
+// role it applies to (the active role — one instance per machine).
+func (a *App) GetLogSettings() LogSettings {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return LogSettings{
+		Role:    string(a.settings.Mode),
+		Level:   a.settings.LogLevel,
+		Enabled: a.settings.LogEnabled,
+	}
+}
+
+// SetLogSettings stores the level/enabled choice and applies it live:
+// the control files are re-written, and the running role process picks
+// the change up within a poll interval — no restart. The inactive role's
+// control file is written too, so the setting holds whichever role
+// starts next (a machine is one role at a time).
+func (a *App) SetLogSettings(s LogSettings) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !validLogLevel(s.Level) {
+		return fmt.Errorf("unknown log level %q (use error, warn, info, debug or trace)", s.Level)
+	}
+	a.settings.LogLevel = s.Level
+	a.settings.LogEnabled = s.Enabled
+	a.saveSettingsLocked()
+	a.writeLogCtlLocked(roleServer)
+	a.writeLogCtlLocked(roleClient)
+	return nil
+}
+
+func validLogLevel(l string) bool {
+	switch l {
+	case "error", "warn", "info", "debug", "trace":
+		return true
+	}
+	return false
+}
+
+// writeLogCtlLocked writes the role's log-control file, which the Rust
+// process polls and hot-applies (level + enabled). Written atomically
+// (tmp + rename) so a crash never leaves a torn file. Callers hold a.mu.
+func (a *App) writeLogCtlLocked(role string) {
+	content := fmt.Sprintf("level=%s\nenabled=%d\n", a.settings.LogLevel, boolInt(a.settings.LogEnabled))
+	path := filepath.Join(a.stateDir, role+".logctl")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// ClearLog empties the given role's log file ("server" or "client"). The
+// role process keeps appending from the new offset — appends are atomic,
+// so a running process cannot resurrect cleared lines.
+func (a *App) ClearLog(role string) error {
+	a.mu.Lock()
+	var path string
+	switch role {
+	case roleServer:
+		path = a.serverLogPath
+	case roleClient:
+		path = a.clientLogPath
+	default:
+		a.mu.Unlock()
+		return fmt.Errorf("unknown role %q", role)
+	}
+	a.mu.Unlock()
+	if err := os.Truncate(path, 0); err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }

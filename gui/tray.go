@@ -26,6 +26,13 @@ var trayIcon []byte
 // only makes sense when there is a tray to hide into; without one, closing
 // the window quits the GUI (roles are independent background processes).
 func trayHostAvailable() bool {
+	// Windows and macOS always have a system tray; only Linux needs the
+	// StatusNotifierWatcher probe (KDE/GNOME panels, or a standalone SNI
+	// host). Checked once at startup — the result does not change for the
+	// life of the process.
+	if runtime.GOOS != "linux" {
+		return true
+	}
 	trayOnce.Do(func() {
 		conn, err := dbus.SessionBus()
 		if err != nil {

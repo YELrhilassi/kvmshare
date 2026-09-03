@@ -11,22 +11,25 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use kvmshare_app::guard::{self, RoleGuard};
-use kvmshare_app::log::{self, Level};
 use kvmshare_app::{
-    default_config_path, log_info, log_warn, parse_server_args, session_from_config, spawn_server_clipboard, Config,
+    default_config_path, parse_server_args, session_from_config, spawn_server_clipboard, Config,
 };
 use kvmshare_core::server::{Control, Server};
+use kvmshare_log::{log_error, log_info, log_warn};
 
 fn main() {
     if let Err(e) = run() {
-        log::write_line(Level::Error, format_args!("{e}"));
+        log_error!("{e}");
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), String> {
     let args = parse_server_args()?;
-    log::init(&args.log_level.unwrap_or_else(log::level_from_env_or_default))?;
+    kvmshare_log::init(
+        &args.log_level.unwrap_or_else(kvmshare_log::level_from_env_or_default),
+        args.log_ctl,
+    )?;
 
     // One role per machine, enforced at the OS level: refuse to start if
     // a client is running here, and hold our own lock for the process
@@ -73,7 +76,11 @@ const CONFIG_WATCH_POLL: Duration = Duration::from_millis(600);
 /// (file mid-write) just defers the reload until the file is valid.
 fn spawn_config_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
     thread::spawn(move || {
-        let mut last: Option<(SystemTime, u64)> = None;
+        // Prime the watcher with the file as it is now, so startup does
+        // not log a spurious "layout reloaded" — only real changes do.
+        let mut last: Option<(SystemTime, u64)> = std::fs::metadata(&path)
+            .ok()
+            .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()));
         loop {
             thread::sleep(CONFIG_WATCH_POLL);
             let meta = match std::fs::metadata(&path) {

@@ -195,7 +195,11 @@ func (a *App) ServerStart() (bool, error) {
 	if _, err := os.Stat(a.serverPath); err != nil {
 		return false, fmt.Errorf("server binary not found at %s (run make install)", a.serverPath)
 	}
-	p, err := a.spawn(a.serverPath, a.serverLogPath, "--config", a.configPath)
+	// The log-control file sets the level/enabled the operator chose;
+	// the process polls it, so later changes apply without a restart.
+	a.writeLogCtlLocked(roleServer)
+	p, err := a.spawn(a.serverPath, a.serverLogPath, "--config", a.configPath,
+		"--logctl", filepath.Join(a.stateDir, roleServer+".logctl"))
 	if err != nil {
 		return false, err
 	}
@@ -227,6 +231,8 @@ func (a *App) ClientStart() (bool, error) {
 	if name := strings.TrimSpace(a.settings.ClientName); name != "" {
 		args = append(args, "--name", name)
 	}
+	a.writeLogCtlLocked(roleClient)
+	args = append(args, "--logctl", filepath.Join(a.stateDir, roleClient+".logctl"))
 	p, err := a.spawn(a.clientPath, a.clientLogPath, args...)
 	if err != nil {
 		return false, err

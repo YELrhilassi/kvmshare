@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
+use kvmshare_log::{log_debug, log_info, log_trace, log_warn};
 use kvmshare_protocol::id::errors;
 use kvmshare_protocol::message::{Layout, Message};
 
@@ -111,13 +112,14 @@ impl Server {
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
+                        let addr = s.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
                         if let Err(e) =
                             Client::spawn(s, session.clone(), clients.clone(), active.clone(), engine_accept.clone())
                         {
-                            eprintln!("client error: {e}");
+                            log_warn!("client {addr}: {e}");
                         }
                     }
-                    Err(e) => eprintln!("accept error: {e}"),
+                    Err(e) => log_warn!("accept error: {e}"),
                 }
             }
         });
@@ -167,6 +169,8 @@ impl Server {
         engine: &Arc<Mutex<Box<dyn Engine>>>,
     ) -> io::Result<()> {
         let Control::Reload(layout) = cmd;
+        let screen_count = layout.screens.len();
+        log_info!("layout reloaded: {screen_count} screens");
 
         // 1. Let the session adopt the new layout; it may ask us to bring
         //    the cursor home (it was on a client).
@@ -209,13 +213,16 @@ impl Server {
                 .map(|(id, _)| *id)
                 .collect()
         };
-        for id in gone {
-            let _ = self.send_to(id, &Message::Leave { screen_id: id });
-            self.clients.lock().unwrap().remove(&id);
+        for id in &gone {
+            let _ = self.send_to(*id, &Message::Leave { screen_id: *id });
+            self.clients.lock().unwrap().remove(id);
             let mut act = self.active.lock().unwrap();
-            if *act == Some(id) {
+            if *act == Some(*id) {
                 *act = None;
             }
+        }
+        if !gone.is_empty() {
+            log_info!("dropped {} stale client(s) after reload", gone.len());
         }
     }
 
@@ -235,6 +242,11 @@ impl Server {
             Action::Nothing => {}
             Action::Send(msg) => {
                 if let Some(id) = *self.active.lock().unwrap() {
+                    // Absolute mouse moves are the hot path (up to
+                    // hundreds per second) — not even trace logs those.
+                    if !matches!(msg, Message::MouseMoveAbs { .. }) {
+                        log_trace!("forward {msg:?} -> client {id}");
+                    }
                     self.send_to(id, &msg)?;
                 }
             }
@@ -244,6 +256,7 @@ impl Server {
                     self.send_to(old, &Message::Leave { screen_id: old })?;
                 }
                 *self.active.lock().unwrap() = Some(to);
+                log_debug!("cursor switched to client {to} at ({x},{y})");
                 self.send_to(to, &Message::Enter { screen_id: to, x, y })?;
                 self.send_to(to, &Message::MouseMoveAbs { x, y })?;
                 // Park the hidden local cursor at its center so it has
@@ -255,6 +268,7 @@ impl Server {
                 if let Some(old) = self.active.lock().unwrap().take() {
                     self.send_to(old, &Message::Leave { screen_id: old })?;
                 }
+                log_debug!("cursor back to local screen at ({x},{y})");
                 engine.warp_local(x, y);
                 engine.show_local_cursor(true);
             }
@@ -334,9 +348,9 @@ impl Client {
             own_screen_id: id,
         })?;
         clients.lock().unwrap().insert(id, client.clone());
-        // Stable machine-readable marker for the GUI's notification
-        // watcher (kept in sync with the "disconnected" line below).
-        eprintln!("kvmshare-server: client {} connected", client.name);
+        // Stable marker for the GUI's notification watcher (kept in sync
+        // with the "disconnected" line below): "client X connected".
+        log_info!("client {} connected", client.name);
 
         // 4. Service the client until it goes away. The reader owns a
         // socket clone, so it can block on recv without ever holding the
@@ -370,6 +384,7 @@ impl Client {
                     Message::Clipboard { mime, data } => {
                         // Content copied on the client reaches the
                         // server's local clipboard.
+                        log_debug!("clipboard from {}: {} ({} bytes)", c2.name, mime, data.len());
                         if let Ok(mut engine) = engine2.lock() {
                             engine.clipboard_set(&mime, &data);
                         }
@@ -378,7 +393,7 @@ impl Client {
                 }
             }
 
-            eprintln!("kvmshare-server: client {} disconnected", c2.name);
+            log_info!("client {} disconnected", c2.name);
             // Unregister and give the session a chance to return home if
             // this was the active client.
             clients2.lock().unwrap().remove(&c2.id);

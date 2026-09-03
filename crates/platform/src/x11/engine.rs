@@ -7,6 +7,7 @@ use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
 use kvmshare_core::server::Engine;
+use kvmshare_log::log_warn;
 
 /// Clipboard access. `arboard` is a separate object because it manages
 /// its own X selection state.
@@ -64,13 +65,13 @@ impl Engine for X11Engine {
         // v1 supports plain text. Other mimes are acknowledged and
         // dropped with a warning — see docs/architecture.md.
         if mime != "text/plain" {
-            eprintln!("clipboard: ignoring non-text mime {mime:?}");
+            log_warn!("clipboard: ignoring non-text mime {mime:?}");
             return;
         }
         if let Some(cb) = &mut self.clipboard {
             if let Ok(text) = std::str::from_utf8(data) {
                 if let Err(e) = cb.set_text(text.to_owned()) {
-                    eprintln!("clipboard: set failed: {e}");
+                    log_warn!("clipboard: set failed: {e}");
                 }
             }
             self.last_remote = Some((mime.to_owned(), data.to_vec()));

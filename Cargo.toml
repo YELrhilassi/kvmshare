@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/core", "crates/platform", "crates/app"]
+members = ["crates/protocol", "crates/log", "crates/core", "crates/platform", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,5 +10,6 @@ repository = "https://example.invalid/kvmshare"
 
 [workspace.dependencies]
 kvmshare-protocol = { path = "crates/protocol" }
+kvmshare-log = { path = "crates/log" }
 kvmshare-core = { path = "crates/core" }
 kvmshare-platform = { path = "crates/platform" }

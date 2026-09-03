@@ -82,7 +82,10 @@ motion into the session.
 
 - Run the server and client on actual Windows machines: raw-input
   capture, injection, cursor hide/show and the clipboard need hardware
-  exercise (a Linux host can only compile-check them).
+  exercise (a Linux host can only compile-check them). Two runtime
+  details were already hardened in review: E1-prefixed keyboard
+  sequences (Pause) are dropped instead of mis-forwarded as Num Lock,
+  and a failed `SetClipboardData` frees the block it allocated.
 - `cargo test --target x86_64-pc-windows-msvc` on a Windows host so the
   platform unit tests actually execute.
 - The GUI needs a Windows desktop session to verify tray, close-to-tray
@@ -99,7 +102,10 @@ motion into the session.
   the cross-platform API, so it should work once built on Windows. The
   tray icon (`assets/tray.png`) is a plain PNG, which Windows scales.
 - **Close-to-tray**: `WindowClosing` → `Hide()` is handled by wails on
-  all platforms; verified on Linux.
+  all platforms. On Linux the close-to-tray decision probes for a
+  StatusNotifierWatcher (no tray host → closing quits cleanly, never a
+  hidden ghost instance); Windows and macOS always have a tray, so
+  closing hides there unconditionally.
 - **Single instance**: `gui.lock` uses `LockFileEx` on Windows (via the
   build-tagged helpers) — same "one GUI per machine" behaviour.
 

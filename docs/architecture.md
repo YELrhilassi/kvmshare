@@ -112,14 +112,37 @@ backend uses the same table as X11.
 
 ## Logging
 
-Both binaries use `kvmshare-app::log`, a small leveled logger
-(component names come from the binary name: `kvmshare-server`,
-`kvmshare-client`). Levels are **error / warn / info / debug**; the
-default is info, set per-run with `-v` (verbose → debug) or `--quiet`
-(error only), and globally via the `KVMSHARE_LOG` env var (`error`,
-`warn`, `info`, `debug`). Every line is timestamped and goes to the
-state-dir log that the GUI tails and that the notification watcher
-parses.
+Every crate logs through the tiny shared `kvmshare-log` crate: one
+leveled logger, no framework. Each line is
+`HH:MM:SS LEVEL component: message` on stderr (the GUI spawns the
+binaries with stderr pointed at the role's log file, so that is exactly
+what gets tailed). The component comes from the binary name
+(`kvmshare-server`, `kvmshare-client`), so the same macros serve both.
+
+Levels, quietest first: **error / warn / info (default) / debug /
+trace**. Trace is the very-verbose, per-event level (key/button/wheel
+forwarding); absolute mouse moves are never logged even at trace — the
+hot path stays quiet. The startup level comes from `--log-level` or the
+`KVMSHARE_LOG` env var.
+
+### Live control (hot reload)
+
+Both binaries accept `--logctl PATH`, pointing at a small control file
+written by the GUI:
+
+```text
+level=debug
+enabled=1
+```
+
+The logger polls it every 400 ms and applies changes **without a
+restart** — the level selector and the enable switch on the Logs page
+reach a running process instantly, and `enabled=0` silences the role's
+log entirely (an operator override; notifications follow the log, since
+they are parsed from it). The file is applied at startup too, so a
+level chosen in the GUI survives process restarts. Missing or
+malformed lines leave the current settings untouched, and the GUI
+writes it atomically (tmp + rename).
 
 ## Clipboard sync
 
@@ -148,10 +171,15 @@ A machine runs **one role at a time**, and the UI mirrors that:
   (client mode), and quick links. Switching role stops the running
   process.
 - **Server + Layout** (server role only) — start/stop, config (port,
-  path), network details, live log tail; and the virtual-desktop canvas
-  (edge snapping, zoom/pan, arrow nudging, duplicate/delete, lock).
+  path), network details; and the virtual-desktop canvas (edge
+  snapping, zoom/pan, arrow nudging, duplicate/delete, lock).
 - **Client** (client role only) — server address + screen name,
-  start/stop, live log.
+  start/stop.
+- **Logs** (both roles) — the log of *this machine's* instance (server
+  in server mode, client in client mode — never both), with a level
+  selector up to **trace**, an enable switch, follow and Clear. Both
+  controls hot-apply to the running process via the `--logctl` file;
+  the level setting persists for whichever role starts next.
 
 GUI state (role, client address) persists in
 `~/.local/state/kvmshare/gui.json`; both processes log to the same
