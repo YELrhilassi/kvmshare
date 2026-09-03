@@ -7,8 +7,13 @@ gui/build/bin/
 gui/frontend/dist/
 gui/frontend/node_modules/
 gui/kvmshare-gui
+gui/kvmshare-gui.exe
+gui/kvmshare-install
+gui/kvmshare-install.exe
 gui/kvmshare-server.log
-gui/*.exe
+
+# Release artifacts (make release)
+/dist
 
 # Editors / OS
 .vscode/
