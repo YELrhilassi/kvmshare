@@ -203,6 +203,26 @@ Snappiness is deliberate: screen drags write styles directly to the DOM
 log/status polling is mounted only while the relevant page is open; the
 whole bundle is ~95 KB gzipped.
 
+## Releases and updates
+
+Releases are published to GitHub (`make publish`, tag-checked) with
+portable archives per platform, standalone installers, and a
+`SHA256SUMS`. Two compiled consumers share `gui/internal/selfupdate`:
+
+- **`kvmshare-install`** — the one-file bootstrap. It fetches the latest
+  release for its platform, verifies the archive checksum, extracts and
+  installs to `~/.local/bin` (Linux desktop entry, icon and sample
+  config included). Re-running updates in place.
+- **The GUI** — the Home page version line checks GitHub for a newer
+  release and applies it in place, then restarts into the new version.
+
+Replacement is rename-based (old → `.old`, new → in) with a copy
+fallback across filesystems, so a running process is never broken — and
+roles are separate processes, so a running server/client is never
+interrupted by an update (it picks up the new code on its next start).
+The version is injected at link time; a `v0.0.0-dev` build always sees
+published releases as newer, so development machines get updates too.
+
 ## Future work (in rough priority)
 
 1. **macOS backend** — implement `Engine`/`Injector`/input source

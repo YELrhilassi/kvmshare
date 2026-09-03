@@ -29,7 +29,30 @@ kvmshare/
 Each crate is small and readable on purpose — no file in the Rust core is
 more than a few hundred lines, and every layer has tests.
 
-## Build & install
+## Install on a machine (end users)
+
+No source checkout needed. Releases are published on
+[GitHub](https://github.com/YELrhilassi/kvmshare/releases). Download one
+file — the installer for your platform — and run it:
+
+```bash
+curl -sL -o kvmshare-install \
+  https://github.com/YELrhilassi/kvmshare/releases/download/v0.1.0/kvmshare-install_v0.1.0_linux_amd64
+chmod +x kvmshare-install
+./kvmshare-install
+```
+
+The installer is a compiled Go binary (no shell scripts): it downloads
+the release archive for your platform, verifies it against the
+release's `SHA256SUMS`, installs the binaries to `~/.local/bin`, and
+writes the desktop entry, icon and a sample config on first install.
+Running it again updates everything in place.
+
+Alternatively, the GUI has the same machinery built in: the version
+line on the Home page checks GitHub for a newer release and installs +
+restarts with one click.
+
+## Build from source
 
 Requirements: Rust (stable), Go, Node (for the React frontend), and — for
 the Linux GUI — **GTK4 + WebKitGTK 6** development packages, plus a
@@ -46,6 +69,14 @@ After `make install`, `kvmshare-server`, `kvmshare-client` and `kvmshare-gui`
 are on your PATH and launchable from dmenu/rofi/your terminal. The server
 finds its config automatically at `~/.config/kvmshare/kvmshare-server.toml`
 (`--config PATH` overrides it).
+
+### Releasing
+
+```bash
+make release      # portable archives for Linux (+ Windows when mingw-w64 is present)
+                  #   -> dist/ with kvmshare_<ver>_*.tar.gz, installers, SHA256SUMS
+make publish      # tag-checked: builds and uploads a GitHub release (git tag first)
+```
 
 ### Dev loop
 
