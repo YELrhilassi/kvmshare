@@ -45,6 +45,18 @@ export interface Paths {
   clientBin: string;
 }
 
+export interface UpdateInfo {
+  current: string;
+  available: boolean;
+  version: string;
+  error?: string;
+}
+
+export interface UpdateResult {
+  restarting: boolean;
+  error?: string;
+}
+
 interface GoApp {
   GetSettings(): Promise<Settings>;
   SetSettings(s: Settings): Promise<void>;
@@ -61,6 +73,9 @@ interface GoApp {
   StopActive(): Promise<void>;
   ListInterfaces(): Promise<InterfaceInfo[]>;
   TailLog(path: string, lines: number): Promise<string>;
+  GetVersion(): Promise<string>;
+  CheckForUpdate(): Promise<UpdateInfo>;
+  ApplyUpdate(): Promise<UpdateResult>;
 }
 
 interface WailsCall {
@@ -118,4 +133,7 @@ export const api = (): GoApp => ({
   StopActive: () => call<void>("StopActive"),
   ListInterfaces: () => call<InterfaceInfo[]>("ListInterfaces"),
   TailLog: (path, lines) => call<string>("TailLog", path, lines),
+  GetVersion: () => call<string>("GetVersion"),
+  CheckForUpdate: () => call<UpdateInfo>("CheckForUpdate"),
+  ApplyUpdate: () => call<UpdateResult>("ApplyUpdate"),
 });
