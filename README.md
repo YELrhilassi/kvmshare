@@ -20,7 +20,7 @@ kvmshare/
 │   ├── core/       # layout model, cursor/screen-switching session, TCP server/client
 │   ├── platform/   # OS backends: Linux/X11 (XI2 raw input, XFixes, XTest, arboard)
 │   └── app/        # the kvmshare-server and kvmshare-client executables
-├── gui/            # Wails v2 desktop app: React + shadcn/ui, 4 pages
+├── gui/            # Wails v3 desktop app: React + shadcn/ui, 4 pages
 │   └── frontend/   #   Vite + React + TypeScript (built to frontend/dist)
 └── docs/
     └── architecture.md   # design decisions, threading model, future work
@@ -32,8 +32,9 @@ more than a few hundred lines, and every layer has tests.
 ## Build & install
 
 Requirements: Rust (stable), Go, Node (for the React frontend), and — for
-the Linux GUI — `webkit2gtk-4.1` and `gtk3` development packages
-(Void: `xbps-install webkit2gtk-devel gtk+3-devel`).
+the Linux GUI — **GTK4 + WebKitGTK 6** development packages, plus a
+DBus session for the tray (Void: `xbps-install gtk4-devel
+libwebkitgtk60-devel`).
 
 ```bash
 make build       # compile everything (release Rust + GUI)
@@ -100,22 +101,43 @@ That's it: move the cursor to the left edge of pc and it slides onto hp.
 
 ### GUI
 
-Launch `kvmshare-gui` (from dmenu/rofi/terminal). A dark, minimal
-interface with a top navigation bar — one window manages both roles:
+Launch `kvmshare-gui` (from dmenu/rofi/terminal). A dark, minimal,
+role-aware interface: **a machine runs as a server or a client — never
+both** — so the top bar only shows the pages for the role you pick on
+Home:
 
-- **Home** — the role switch (server/client) and live status: whether
-  the active process is running, the address clients connect to (server
-  mode) or the machine this one connects to (client mode), plus quick
-  access to the other pages.
-- **Server** — start/stop, configuration (port, config path), network
-  details (all interfaces + addresses) and a live log tail.
-- **Client** — the server address + screen name this machine connects
-  with, client start/stop and its live log.
-- **Layout** — the virtual desktop editor: drag screens to arrange them
-  (with edge snapping), zoom/pan/fit the canvas, nudge with the arrow
+- **Home** — the role switch. Live status for the current role, the
+  address clients connect to (server mode) or the machine this one
+  connects to (client mode). Switching role stops whatever was running.
+- **Server** (server role) — start/stop, configuration (port, config
+  path), network details (all interfaces + addresses) and a live log
+  tail.
+- **Client** (client role) — the server address + screen name this
+  machine connects with, start/stop and a live log.
+- **Layout** (server role) — the virtual desktop editor: drag screens to
+  arrange them (with edge snapping), zoom/pan/fit, nudge with the arrow
   keys, duplicate/delete screens, and a lock toggle that freezes the
-  whole layout against accidental edits. Saving restarts the running
-  server so changes apply immediately.
+  layout against accidental edits. The canvas stays legible at any zoom:
+  100% always fits the whole desktop, the grid is adaptive and always
+  visible, and screen labels/borders keep their size while zooming.
+
+Role exclusivity is enforced at the OS level too: the server and client
+binaries take `flock`-based role locks, so a machine can never run both,
+crashes leave no stale locks, and starting one role stops the other. Only
+one GUI instance per machine is allowed.
+
+**The GUI runs in the background.** Closing the window hides it to the
+system tray (live role status + Start/Stop/Open/Quit) instead of
+quitting, and the role processes are independent of the GUI entirely:
+quit the GUI and they keep running; reopen it and it discovers and
+adopts the running instance via the role locks. Reopening also restores
+the window; Quit from the tray exits the GUI without touching the
+background role. The tray also shows how many clients are connected, and
+raises desktop notifications when a client connects or disconnects.
+
+A client machine that loses its server (or starts before it) does not
+die: it retries every 3 seconds until the server is reachable, then
+picks the session right back up — no manual restarts.
 
 The GUI's own state (role, client address) persists in
 `~/.local/state/kvmshare/gui.json`; process logs live in the same folder
@@ -128,18 +150,25 @@ make test   # cargo test --workspace + go test ./gui
 ```
 
 Rust covers the protocol round-trips, the layout/adjacency math, the
-entire switching session (including the physical-cursor edge guard), and
-a real end-to-end test: server + client over TCP with mock input and a
-recording injector. The Go suite covers config round-trips, settings
-persistence, process start/stop, network listing and log tailing.
+entire switching session (including the physical-cursor edge guard and
+live layout swaps), role-lock exclusivity, and real end-to-end tests:
+server + client over TCP with mock input, a recording injector and a
+config hot-reload. The Go suite covers config round-trips, settings
+persistence, process start/stop + role exclusivity, instance locking,
+network listing and log tailing.
 
 ## Status
 
 - **Linux/X11**: full — input capture (XI2 raw), cursor control, input
-  injection, clipboard sync, GUI.
-- **Windows/macOS**: the architecture is ready (platform traits + stubs
-  with clear errors); the backends are not yet implemented. See
-  `docs/architecture.md`.
+  injection, clipboard sync, GUI, tray + notifications.
+- **Windows**: everything compiles clean for `x86_64-pc-windows-msvc`
+  (Rust) and `windows/amd64` (the Wails v3 GUI, no cgo); what is missing
+  is the input/desktop backend (capture, injection, cursor, clipboard).
+- **macOS**: the architecture is ready (platform traits + stubs with
+  clear errors); not attempted yet.
+
+See `docs/platforms.md` for the full portability audit and the Windows
+porting plan.
 
 ## Known limitations (deliberate, documented)
 
@@ -148,9 +177,9 @@ persistence, process start/stop, network listing and log tailing.
   cross-OS pairs (Linux↔Windows) is planned.
 - Clipboard sync is text-only (`text/plain`), polled on both sides and
   echo-guarded.
-- Layout changes apply on server restart (the GUI restarts the server on
-  save); a live control socket is the planned next step (see the
-  architecture doc).
+- Layout/config changes apply **live**: the server watches its config
+  file and adopts edits without a restart (returning the cursor home and
+  dropping clients whose screens disappeared).
 
 ## License
 

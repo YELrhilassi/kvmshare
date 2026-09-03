@@ -5,6 +5,8 @@
 //! The binaries themselves are thin — one page each — so the interesting
 //! logic stays in `kvmshare-core` and `kvmshare-platform`.
 
+pub mod guard;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;

@@ -104,6 +104,31 @@ impl Session {
         }
     }
 
+    /// Adopt a new layout at runtime (config hot-reload).
+    ///
+    /// If the cursor was on a remote client it is brought home first
+    /// (`SwitchToLocal` at the new local center); if it was already local
+    /// the virtual cursor is re-anchored to the local center without
+    /// moving the physical one. A layout whose local screen (id 0) is
+    /// missing is rejected and leaves the session untouched.
+    pub fn swap_layout(&mut self, layout: Layout) -> Vec<Action> {
+        let local = match layout.find(0) {
+            Some(s) => s.rect,
+            None => return vec![],
+        };
+        let was_remote = self.cursor.mode != Mode::Local;
+        let (cx, cy) = local.center();
+        self.layout = layout;
+        self.local = local;
+        self.cursor = Cursor { x: cx, y: cy, mode: Mode::Local };
+        self.phys = (cx, cy);
+        if was_remote {
+            vec![Action::SwitchToLocal { x: cx, y: cy }]
+        } else {
+            vec![]
+        }
+    }
+
     /// Process a *local* input event (the user's physical mouse/keyboard
     /// on the server machine). Returns everything the caller must do.
     pub fn on_local_event(&mut self, msg: Message) -> Vec<Action> {
@@ -436,5 +461,54 @@ mod tests {
         // A small push right after the recenter must NOT recenter again.
         let actions = s.on_local_event(Message::MouseMoveRel { dx: 5, dy: 0 });
         assert_eq!(actions, vec![Action::Send(Message::MouseMoveAbs { x: 954, y: 540 })]);
+    }
+
+    #[test]
+    fn swap_layout_while_local_stays_put() {
+        let mut s = two_screens();
+        assert_eq!(s.mode(), Mode::Local);
+
+        // Same geometry, only names change: nothing to do, cursor stays.
+        let new_layout = Layout::new(vec![
+            Screen { id: 0, name: "pc".into(), rect: Rect { x: 0, y: 0, w: 1920, h: 1080 } },
+            Screen { id: 1, name: "hp".into(), rect: Rect { x: -3840, y: 0, w: 1920, h: 1080 } },
+        ]);
+        let actions = s.swap_layout(new_layout);
+        assert_eq!(actions, vec![]);
+        assert_eq!(s.mode(), Mode::Local);
+        assert_eq!(s.layout().screens[1].rect.x, -3840);
+    }
+
+    #[test]
+    fn swap_layout_while_remote_comes_home() {
+        let mut s = two_screens();
+        s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }); // now on hp
+        assert_eq!(s.mode(), Mode::Remote(1));
+
+        // New layout without hp at all (and a different local size).
+        let new_layout = Layout::new(vec![Screen {
+            id: 0,
+            name: "pc".into(),
+            rect: Rect { x: 0, y: 0, w: 2560, h: 1440 },
+        }]);
+        let actions = s.swap_layout(new_layout);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 1280, y: 720 }]);
+        assert_eq!(s.mode(), Mode::Local);
+        assert_eq!(s.cursor_pos(), (1280, 720));
+    }
+
+    #[test]
+    fn swap_layout_rejects_missing_local_screen() {
+        let mut s = two_screens();
+        s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }); // on hp
+        let bad = Layout::new(vec![Screen {
+            id: 1,
+            name: "hp".into(),
+            rect: Rect { x: -1920, y: 0, w: 1920, h: 1080 },
+        }]);
+        let actions = s.swap_layout(bad);
+        assert_eq!(actions, vec![]);
+        assert_eq!(s.mode(), Mode::Remote(1), "bad layout must not disturb the session");
+        assert_eq!(s.layout().screens.len(), 2);
     }
 }

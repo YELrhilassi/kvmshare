@@ -13,10 +13,10 @@ use kvmshare_protocol::message::Message;
 
 const MSG: &str = "kvmshare: this OS does not have a platform backend yet (Linux/X11 is implemented)";
 
-pub fn server() -> Result<(Receiver<Message>, Box<dyn Engine>), String> {
+pub fn server(_display: Option<&str>) -> Result<(Receiver<Message>, Box<dyn Engine>), String> {
     Err(MSG.into())
 }
 
-pub fn client() -> Result<Box<dyn Injector>, String> {
+pub fn client(_display: Option<&str>) -> Result<Box<dyn Injector>, String> {
     Err(MSG.into())
 }

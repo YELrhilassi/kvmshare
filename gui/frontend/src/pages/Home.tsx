@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type Mode, type Settings } from "@/lib/bridge";
 import { DEFAULT_PORT } from "@/lib/constants";
 import type { RunningStatus } from "@/lib/hooks";
-import type { Page } from "@/lib/nav";
+import { pagesFor, type Page } from "@/lib/nav";
 import { Button } from "@/components/ui/button";
 import { Section } from "@/components/Section";
 import { cn } from "@/lib/utils";
@@ -73,6 +73,8 @@ export default function HomePage({ mode, onModeChange, onNavigate, running }: Pr
     }
   };
 
+  const quickLinks = pagesFor(mode).filter((p) => p !== "home");
+
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-2xl px-10 py-16">
@@ -98,6 +100,11 @@ export default function HomePage({ mode, onModeChange, onNavigate, running }: Pr
               {mode === "server"
                 ? "Share this machine's keyboard and mouse with other machines."
                 : "Let another machine control this one."}
+            </p>
+            <p className="text-xs text-muted-foreground/70">
+              {active
+                ? "Switching role stops the running process."
+                : "This machine runs as one role at a time."}
             </p>
           </Section>
 
@@ -150,24 +157,19 @@ export default function HomePage({ mode, onModeChange, onNavigate, running }: Pr
 
           <Section title="Quick access">
             <div className="flex flex-wrap gap-x-10 gap-y-3">
-              <button
-                onClick={() => onNavigate("layout")}
-                className="text-sm text-muted-foreground transition-colors hover:text-foreground"
-              >
-                Layout · {screens} screens
-              </button>
-              <button
-                onClick={() => onNavigate("server")}
-                className="text-sm text-muted-foreground transition-colors hover:text-foreground"
-              >
-                Server settings
-              </button>
-              <button
-                onClick={() => onNavigate("client")}
-                className="text-sm text-muted-foreground transition-colors hover:text-foreground"
-              >
-                Client settings
-              </button>
+              {quickLinks.map((p) => (
+                <button
+                  key={p}
+                  onClick={() => onNavigate(p)}
+                  className="text-sm text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  {p === "layout"
+                    ? `Layout · ${screens} screens`
+                    : p === "server"
+                      ? "Server settings"
+                      : "Client settings"}
+                </button>
+              ))}
             </div>
           </Section>
         </div>

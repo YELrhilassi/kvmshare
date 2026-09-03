@@ -36,7 +36,7 @@ pub fn server(display: Option<&str>) -> Result<(Receiver<Message>, Box<dyn Engin
     }
     #[cfg(not(target_os = "linux"))]
     {
-        unsupported::server()
+        unsupported::server(display)
     }
 }
 
@@ -48,6 +48,6 @@ pub fn client(display: Option<&str>) -> Result<Box<dyn Injector>, String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        unsupported::client()
+        unsupported::client(display)
     }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, type Mode } from "@/lib/bridge";
 import { useRunning } from "@/lib/hooks";
-import { NAV, type Page } from "@/lib/nav";
+import { NAV, pagesFor, type Page } from "@/lib/nav";
 import { cn } from "@/lib/utils";
 import HomePage from "@/pages/Home";
 import ServerPage from "@/pages/Server";
@@ -21,10 +21,15 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  // The layout only shows pages that belong to the current role. A role
+  // switch on Home can invalidate the open page — fall back to Home.
+  const visible = pagesFor(mode);
+  const effectivePage = visible.includes(page) ? page : "home";
+
   // Window title mirrors live status (also handy for taskbars/wm hints).
   useEffect(() => {
-    document.title = `kvmshare — server ${running.server ? "running" : "stopped"} · client ${running.client ? "running" : "stopped"}`;
-  }, [running]);
+    document.title = `kvmshare — ${mode} ${running[mode] ? "running" : "stopped"}`;
+  }, [running, mode]);
 
   const changeMode = async (m: Mode) => {
     try {
@@ -49,62 +54,45 @@ export default function App() {
           </div>
 
           <nav className="flex h-full items-center gap-1">
-            {NAV.map(({ id, label }) => (
+            {NAV.filter(({ id }) => visible.includes(id)).map(({ id, label }) => (
               <button
                 key={id}
                 onClick={() => setPage(id)}
                 className={cn(
                   "relative flex h-full items-center px-3 text-sm transition-colors",
-                  page === id
+                  effectivePage === id
                     ? "font-medium text-foreground"
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
                 {label}
-                {page === id && (
+                {effectivePage === id && (
                   <span className="absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-primary" />
                 )}
               </button>
             ))}
           </nav>
 
-          <div className="ml-auto flex items-center gap-6 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1.5">
-              <span
-                className={cn(
-                  "h-2 w-2 rounded-full",
-                  running.server ? "bg-emerald-500" : "bg-muted-foreground/40",
-                )}
-              />
-              server {running.server ? "running" : "stopped"}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span
-                className={cn(
-                  "h-2 w-2 rounded-full",
-                  running.client ? "bg-emerald-500" : "bg-muted-foreground/40",
-                )}
-              />
-              client {running.client ? "running" : "stopped"}
-            </span>
-            <button
-              onClick={() => setPage("home")}
-              title="Change on Home"
-              className="rounded-full border border-border px-2.5 py-0.5 font-medium text-foreground/80 transition-colors hover:border-primary/60 hover:text-foreground"
-            >
-              {mode}
-            </button>
+          <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
+            <span
+              className={cn(
+                "h-2 w-2 rounded-full",
+                running[mode] ? "bg-emerald-500" : "bg-muted-foreground/40",
+              )}
+            />
+            <span className="font-medium text-foreground/80">{mode}</span>
+            {running[mode] ? "running" : "stopped"}
           </div>
         </header>
 
         {/* Page */}
         <main className="min-h-0 flex-1 overflow-hidden">
-          {page === "home" && (
+          {effectivePage === "home" && (
             <HomePage mode={mode} onModeChange={changeMode} onNavigate={setPage} running={running} />
           )}
-          {page === "server" && <ServerPage />}
-          {page === "client" && <ClientPage />}
-          {page === "layout" && <LayoutPage />}
+          {effectivePage === "server" && <ServerPage />}
+          {effectivePage === "client" && <ClientPage />}
+          {effectivePage === "layout" && <LayoutPage />}
         </main>
       </div>
     </TooltipProvider>

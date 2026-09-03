@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -79,8 +80,9 @@ func (a *App) LoadConfig() (Config, error) {
 	return cfg, nil
 }
 
-// SaveConfig writes the layout and restarts the server so it takes
-// effect. The first screen is always the server's own screen.
+// SaveConfig writes the layout and validates it. The first screen is
+// always the server's own screen. If the server is running it notices the
+// change on disk and adopts it live — no restart needed.
 func (a *App) SaveConfig(cfg Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -88,7 +90,19 @@ func (a *App) SaveConfig(cfg Config) error {
 	if len(cfg.Screens) == 0 {
 		return fmt.Errorf("at least one screen is required (the server's own)")
 	}
-	for _, s := range cfg.Screens {
+	// Screen names are how clients are matched to screens on the wire, so
+	// they must be non-empty and unique — a bad name silently breaks
+	// connections.
+	seen := map[string]bool{}
+	for i, s := range cfg.Screens {
+		s.Name = strings.TrimSpace(s.Name)
+		if s.Name == "" {
+			return fmt.Errorf("screen %d has no name", i+1)
+		}
+		if seen[s.Name] {
+			return fmt.Errorf("screen name %q is used more than once", s.Name)
+		}
+		seen[s.Name] = true
 		if s.Width <= 0 || s.Height <= 0 {
 			return fmt.Errorf("screen %q has an invalid size", s.Name)
 		}
@@ -96,7 +110,7 @@ func (a *App) SaveConfig(cfg Config) error {
 	cf := configFile{Port: cfg.Port}
 	for _, s := range cfg.Screens {
 		cf.Screens = append(cf.Screens, screenFile{
-			Name:   s.Name,
+			Name:   strings.TrimSpace(s.Name),
 			Width:  s.Width,
 			Height: s.Height,
 			X:      s.X,
@@ -109,11 +123,13 @@ func (a *App) SaveConfig(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
 	}
-	if err := os.WriteFile(a.configPath, raw, 0o644); err != nil {
+	// Atomic replace: the running server watches this file, so it must
+	// never see a torn write.
+	if err := atomicWriteFile(a.configPath, raw, 0o644); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 
-	return a.restartServerLocked()
+	return nil
 }
 
 // defaultConfig is shown when no config file exists yet (never written

@@ -20,6 +20,12 @@ CONFIG_DIR ?= $(HOME)/.config/kvmshare
 CARGO ?= cargo
 GO    ?= go
 
+# The GUI is built with Wails v3 on GTK4/WebKitGTK 6. Its bundled C
+# sources trip deprecation warnings on modern GTK headers; silence them
+# so a clean build really is clean.
+GO_CFLAGS ?= -Wno-deprecated-declarations
+GO_ENV    := CGO_CFLAGS="$(GO_CFLAGS)"
+
 SERVER_BIN := target/release/kvmshare-server
 CLIENT_BIN := target/release/kvmshare-client
 GUI_BIN    := gui/kvmshare-gui
@@ -30,7 +36,7 @@ GUI_BIN    := gui/kvmshare-gui
 build:
 	$(CARGO) build --release
 	cd gui/frontend && npm install --no-audit --no-fund >/dev/null && npm run build
-	cd gui && $(GO) build -tags "production webkit2_41" -o kvmshare-gui .
+	cd gui && $(GO_ENV) $(GO) build -tags production -o kvmshare-gui .
 
 ## Build + install into $(BINDIR), plus sample config and launcher.
 install: build
@@ -57,7 +63,7 @@ dev:
 ## Run the Rust and Go test suites.
 test:
 	$(CARGO) test --workspace
-	cd gui && $(GO) test ./...
+	cd gui && $(GO_ENV) $(GO) test ./...
 
 ## Remove build artifacts.
 clean:

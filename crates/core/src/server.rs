@@ -8,13 +8,15 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::Duration;
 
-use kvmshare_protocol::message::{Layout, Message};
 use kvmshare_protocol::id::errors;
+use kvmshare_protocol::message::{Layout, Message};
 
+use crate::layout::Layout as Desktop;
 use crate::session::{Action, Session};
 use crate::transport::{RecvResult, Transport};
 
@@ -41,6 +43,16 @@ struct Client {
     transport: Mutex<Transport>,
 }
 
+/// Control messages from the app layer (never travel over the wire).
+#[derive(Debug)]
+pub enum Control {
+    /// The config changed on disk — adopt this new desktop layout now.
+    Reload(Desktop),
+}
+
+/// How often the main loop polls for control messages while idle.
+const CONTROL_POLL: Duration = Duration::from_millis(100);
+
 /// A running server.
 pub struct Server {
     listener: TcpListener,
@@ -48,16 +60,30 @@ pub struct Server {
     clients: Arc<Mutex<HashMap<u8, Arc<Client>>>>,
     /// Id of the client the cursor is currently on (`None` = local).
     active: Arc<Mutex<Option<u8>>>,
+    /// App-layer control messages (hot reload). `None` disables them.
+    /// In a `Mutex` so `Server` stays `Sync` (the channel itself is not).
+    control: Mutex<Option<Receiver<Control>>>,
 }
 
 impl Server {
+    /// Bind without a control channel (no hot reload).
     pub fn bind(session: Session, port: u16) -> io::Result<Self> {
+        Self::with_control(session, port, None)
+    }
+
+    /// Bind with an optional app-layer control channel.
+    pub fn with_control(
+        session: Session,
+        port: u16,
+        control: Option<Receiver<Control>>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         Ok(Self {
             listener,
             session: Arc::new(Mutex::new(session)),
             clients: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(None)),
+            control: Mutex::new(control),
         })
     }
 
@@ -99,15 +125,98 @@ impl Server {
         // Main loop: process local input. The engine lock is taken per
         // event (not held for the whole loop) so other threads — client
         // threads applying remote clipboard content, and the app's
-        // clipboard poller — can reach the engine between events.
-        while let Ok(msg) = input.recv() {
-            let actions = { self.session.lock().unwrap().on_local_event(msg) };
+        // clipboard poller — can reach the engine between events. Idle
+        // timeouts also drain the app-layer control channel (hot reload).
+        loop {
+            match input.recv_timeout(CONTROL_POLL) {
+                Ok(msg) => {
+                    let actions = { self.session.lock().unwrap().on_local_event(msg) };
+                    let mut engine = engine.lock().unwrap();
+                    for action in actions {
+                        self.execute(action, &mut engine)?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Drain the app-layer control channel, then apply each
+                    // command on this (serialized) thread.
+                    let cmds: Vec<Control> = {
+                        let mut control = self.control.lock().unwrap();
+                        let mut v = Vec::new();
+                        if let Some(rx) = control.as_mut() {
+                            while let Ok(cmd) = rx.try_recv() {
+                                v.push(cmd);
+                            }
+                        }
+                        v
+                    };
+                    for cmd in cmds {
+                        self.apply_control(cmd, &engine)?;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply an app-layer control message. Runs on the main loop thread
+    /// so it is serialized with input processing.
+    fn apply_control(
+        &self,
+        cmd: Control,
+        engine: &Arc<Mutex<Box<dyn Engine>>>,
+    ) -> io::Result<()> {
+        let Control::Reload(layout) = cmd;
+
+        // 1. Let the session adopt the new layout; it may ask us to bring
+        //    the cursor home (it was on a client).
+        let actions = { self.session.lock().unwrap().swap_layout(layout) };
+        {
             let mut engine = engine.lock().unwrap();
             for action in actions {
                 self.execute(action, &mut engine)?;
             }
         }
-        Ok(())
+
+        // 2. Drop clients that no longer exist in the layout (their name
+        //    or id changed), so no ghost connections linger.
+        self.drop_stale_clients();
+
+        // 3. Tell every remaining client about the new layout.
+        let layout = {
+            let s = self.session.lock().unwrap();
+            Layout { screens: s.layout().screens.clone() }
+        };
+        self.broadcast(&Message::Layout { layout })
+    }
+
+    /// Disconnect clients whose screen disappeared from the new layout
+    /// (their id no longer maps to a screen with the same name), so no
+    /// ghost connections linger after a reload.
+    fn drop_stale_clients(&self) {
+        let gone: Vec<u8> = {
+            let session = self.session.lock().unwrap();
+            let clients = self.clients.lock().unwrap();
+            clients
+                .iter()
+                .filter(|(_, c)| {
+                    !session
+                        .layout()
+                        .screens
+                        .iter()
+                        .any(|s| s.id == c.id && s.name == c.name)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in gone {
+            let _ = self.send_to(id, &Message::Leave { screen_id: id });
+            self.clients.lock().unwrap().remove(&id);
+            let mut act = self.active.lock().unwrap();
+            if *act == Some(id) {
+                *act = None;
+            }
+        }
     }
 
     /// Send a message to every connected client (e.g. layout or
@@ -225,6 +334,9 @@ impl Client {
             own_screen_id: id,
         })?;
         clients.lock().unwrap().insert(id, client.clone());
+        // Stable machine-readable marker for the GUI's notification
+        // watcher (kept in sync with the "disconnected" line below).
+        eprintln!("kvmshare-server: client {} connected", client.name);
 
         // 4. Service the client until it goes away. The reader owns a
         // socket clone, so it can block on recv without ever holding the
@@ -266,7 +378,7 @@ impl Client {
                 }
             }
 
-            eprintln!("client {} disconnected", c2.name);
+            eprintln!("kvmshare-server: client {} disconnected", c2.name);
             // Unregister and give the session a chance to return home if
             // this was the active client.
             clients2.lock().unwrap().remove(&c2.id);

@@ -4,15 +4,16 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 
-export const MIN_ZOOM = 0.05;
-export const MAX_ZOOM = 4;
+export const MIN_ZOOM = 0.05; // real (CSS) scale floor
+export const MAX_ZOOM = 4; // real (CSS) scale ceiling
 
 interface ToolbarProps {
-  zoom: number;
-  onZoomChange: (zoom: number) => void;
+  percent: number; // zoom level, where 100 = the layout fits the view
+  minPercent: number;
+  maxPercent: number;
+  onPercentChange: (percent: number) => void;
   onZoomBy: (factor: number) => void;
   onFit: () => void;
-  onReset: () => void;
   snap: boolean;
   onSnapChange: (v: boolean) => void;
   lock: boolean;
@@ -21,14 +22,16 @@ interface ToolbarProps {
   onSave: () => void;
   dirty: boolean;
   savedMsg: string;
+  error: string;
 }
 
 export default function Toolbar({
-  zoom,
-  onZoomChange,
+  percent,
+  minPercent,
+  maxPercent,
+  onPercentChange,
   onZoomBy,
   onFit,
-  onReset,
   snap,
   onSnapChange,
   lock,
@@ -37,6 +40,7 @@ export default function Toolbar({
   onSave,
   dirty,
   savedMsg,
+  error,
 }: ToolbarProps) {
   return (
     <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
@@ -45,23 +49,24 @@ export default function Toolbar({
       </Button>
       <Slider
         className="w-28"
-        min={MIN_ZOOM * 100}
-        max={MAX_ZOOM * 100}
+        min={minPercent}
+        max={maxPercent}
         step={5}
-        value={[Math.round(zoom * 100)]}
-        onValueChange={([v]) => onZoomChange(v / 100)}
+        value={[Math.round(percent)]}
+        onValueChange={([v]) => onPercentChange(v)}
       />
       <Button variant="ghost" size="icon" title="Zoom in" onClick={() => onZoomBy(1.25)}>
         <ZoomIn className="h-4 w-4" />
       </Button>
-      <span className="w-12 text-center font-mono text-xs text-muted-foreground">
-        {Math.round(zoom * 100)}%
+      <span
+        className="w-12 cursor-pointer text-center font-mono text-xs text-muted-foreground hover:text-foreground"
+        title="Fit the whole desktop"
+        onClick={onFit}
+      >
+        {Math.round(percent)}%
       </span>
-      <Button variant="ghost" size="icon" title="Fit layout" onClick={onFit}>
+      <Button variant="ghost" size="icon" title="Fit whole desktop (100%)" onClick={onFit}>
         <Maximize className="h-4 w-4" />
-      </Button>
-      <Button variant="ghost" size="sm" onClick={onReset} className="text-xs">
-        100%
       </Button>
 
       <Separator orientation="vertical" className="h-5" />
@@ -79,9 +84,9 @@ export default function Toolbar({
 
       <div className="flex-1" />
 
-      <span className="text-xs text-muted-foreground">
+      <span className="hidden text-xs text-muted-foreground xl:inline">
         <Move className="mr-1 inline h-3.5 w-3.5" />
-        drag to move · middle-drag to pan · wheel to zoom · arrows to nudge
+        drag screens · hold space + drag to pan · wheel to zoom · arrows to nudge
       </span>
 
       <Button onClick={onAdd} variant="outline" size="sm" disabled={lock}>
@@ -90,7 +95,8 @@ export default function Toolbar({
       <Button onClick={onSave} size="sm" disabled={lock} variant={dirty ? "default" : "outline"}>
         <Save className="h-4 w-4" /> {dirty ? "Save*" : "Save"}
       </Button>
-      {savedMsg && <span className="text-xs text-emerald-600">{savedMsg}</span>}
+      {error && <span className="text-xs text-destructive">{error}</span>}
+      {!error && savedMsg && <span className="text-xs text-emerald-600">{savedMsg}</span>}
     </div>
   );
 }

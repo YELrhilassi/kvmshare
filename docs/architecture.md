@@ -96,31 +96,73 @@ peer is remembered and skipped by the poller. Text-only for now.
 
 ## The GUI
 
-A Wails v2 app with a **React + TypeScript + shadcn/ui** frontend built
-by Vite (output embedded into the Go binary via `//go:embed
-all:frontend/dist`). Dark-only theme, no sidebar: a top bar navigates
-between four pages (Home / Server / Client / Layout), and the design is
-card-free — sections are plain type over hairline rules with generous
-whitespace.
+A **Wails v3** app (GTK4 + WebKitGTK 6 on Linux) with a **React +
+TypeScript + shadcn/ui** frontend built by Vite (output embedded into
+the Go binary via `//go:embed all:frontend/dist`). Wails v3 pages load
+through the `wails://` scheme, the runtime is served at
+`/wails/runtime.js`, and the frontend's typed bridge (`frontend/src/lib/bridge.ts`)
+calls the bound `App` service by fully-qualified name (`main.App.*` —
+types in `package main` register under `main`). Dark-only theme, no
+sidebar: a top bar shows only the pages that belong to the current role,
+and the design is card-free — sections are plain type over hairline
+rules with generous whitespace.
 
-- **Home** — the role switch (server/client), live status, the address
-  clients connect to (server mode) or the target machine (client mode),
-  and quick access links.
-- **Server** — start/stop, server config (port, path), network details
-  (interfaces + addresses) and a live log tail.
-- **Client** — server address + screen name, client start/stop, client
-  log.
-- **Layout** — the virtual-desktop canvas: drag screens with **edge
-  snapping**, cursor-anchored wheel zoom, middle-drag pan, fit/100%
-  views, arrow-key nudging, duplicate/delete, and a **lock** that
-  freezes the layout against accidental edits.
+A machine runs **one role at a time**, and the UI mirrors that:
 
-The Go backend owns both processes. `StartActive`/`StopActive` operate on
-whichever role is selected on Home; the server and client can still be
-managed independently. GUI state (role, client address) persists in
+- **Home** (always) — the role switch, live status for the current role,
+  the address clients connect to (server mode) or the target machine
+  (client mode), and quick links. Switching role stops the running
+  process.
+- **Server + Layout** (server role only) — start/stop, config (port,
+  path), network details, live log tail; and the virtual-desktop canvas
+  (edge snapping, zoom/pan, arrow nudging, duplicate/delete, lock).
+- **Client** (client role only) — server address + screen name,
+  start/stop, live log.
+
+GUI state (role, client address) persists in
 `~/.local/state/kvmshare/gui.json`; both processes log to the same
 folder, tailed live by the UI (`TailLog` reads the last N lines, polled
 at ~1.5s).
+
+### Process ownership and exclusivity
+
+`proc` wrappers spawn each managed process with a reaper goroutine, so
+"running" is accurate the moment a child dies (no ghost states) and
+stops never leak or double-wait. The GUI enforces one role at a time:
+starting a role stops the other, and switching role stops the old
+process. A `flock` instance lock means only one GUI per machine; a
+second instance exits with a clear error.
+
+The Rust binaries enforce the same rule at the OS level via flock-based
+role locks in `kvmshare-app::guard` (state dir `server.lock`/`client.lock`):
+refuse to start when the other role runs, the lock dies with the
+process (crashes leave nothing stale), and the lock file records the
+instance's pid so a controller can signal it.
+
+### Background model: roles outlive the GUI
+
+The GUI is a controller, not a babysitter. Roles run as independent
+background processes: **closing the window hides it** (a `WindowClosing`
+hook cancels the close), the app stays alive as a system-tray item
+(DBus StatusNotifierItem — status line + Start/Stop/Open/Quit, refreshed
+whenever the role state changes), and quitting the GUI (tray → Quit)
+leaves the running role untouched.
+
+On startup the GUI *adopts*: `ServerRunning`/`ClientRunning` probe the
+role locks (not just the GUI's own children), so a role started by an
+earlier GUI session — or by hand — is discovered, reported, and
+stoppable by pid; `Start` never spawns a second instance. Spawned
+children get a brief health check so an immediate death (port taken,
+role lock refused) surfaces as a clear error instead of a silent no-op.
+
+### Live config changes
+
+The server watches its config file and pushes the new layout through an
+app-layer control channel (`Server::with_control` + `Session::swap_layout`),
+serialized with input processing on the main loop. The cursor is brought
+home if it was on a client, clients whose screens disappeared are
+politely disconnected, and the new layout is broadcast — so saving in the
+GUI applies with **no restart**.
 
 Snappiness is deliberate: screen drags write styles directly to the DOM
 (refs) during the gesture and commit to React state only on release;
@@ -134,9 +176,9 @@ whole bundle is ~95 KB gzipped.
    traits and stubs are ready.
 2. **Canonical key mapping** — a keysym ↔ keycode ↔ Windows VK table so
    keys work across different OSes, not just same-OS pairs.
-3. **Live control socket** — a small JSON socket on the server so the GUI
-   can change the layout without a restart (the protocol already has
-   `Message::Layout` for broadcasting it to clients).
+3. **Live control socket** — replace the config-file watcher with a
+   direct control channel when more than layout needs to change at
+   runtime (the protocol already has `Message::Layout`).
 4. **Richer clipboard** — images and multiple mimes.
 5. **Encryption** — TLS or Noise between peers; the frame has a flags
    byte reserved for this.

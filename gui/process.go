@@ -6,85 +6,247 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
-// ServerRunning reports whether the managed server process is up.
-func (a *App) ServerRunning() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return isRunning(a.serverCmd)
+// A kvmshare role runs in the background, independent of the GUI: closing
+// the window leaves it running, and only one instance per role may exist
+// (enforced by flock locks taken by the Rust binaries). This file is the
+// GUI's side of that contract:
+//
+//   - Running  = our own child is up, OR someone holds the role lock
+//     (started by an earlier GUI, or by hand). Detected via the lock.
+//   - Start    = never spawn a second instance: if the role already runs
+//     in the background, adopt it.
+//   - Stop     = kill our child if any, else signal the pid recorded in
+//     the lock file, and wait for the lock to clear.
+//   - Starting one role stops the other (a machine is one or the other).
+
+// proc wraps a managed child process with a reaper goroutine.
+//
+// The reaper calls Wait and closes `done`, so running() is accurate the
+// moment the child dies (crash, role-lock refusal, kill) instead of only
+// after an explicit stop — no ghost "running" states. Stopping is a
+// single, non-leaking operation: stop() may be called any number of times.
+type proc struct {
+	cmd  *exec.Cmd
+	done chan struct{}
 }
 
-// ClientRunning reports whether the managed client process is up.
-func (a *App) ClientRunning() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return isRunning(a.clientCmd)
-}
-
-func isRunning(cmd *exec.Cmd) bool {
-	return cmd != nil && cmd.Process != nil && cmd.ProcessState == nil
-}
-
-// ServerStart launches kvmshare-server with the current config.
-func (a *App) ServerStart() (bool, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if isRunning(a.serverCmd) {
-		return true, nil
+func (p *proc) running() bool {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return false
 	}
-	if _, err := os.Stat(a.serverPath); err != nil {
-		return false, fmt.Errorf("server binary not found at %s (run make install)", a.serverPath)
+	select {
+	case <-p.done:
+		return false
+	default:
+		return true
 	}
-	cmd, err := spawn(a.serverPath, a.serverLogPath, "--config", a.configPath)
-	if err != nil {
-		return false, err
-	}
-	a.serverCmd = cmd
-	return true, nil
 }
 
-// ServerStop stops the managed server process.
-func (a *App) ServerStop() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.serverCmd = stopAndForget(a.serverCmd)
+// stop terminates the process group (SIGTERM, then SIGKILL after 3s) and
+// waits for the reaper. Safe to call more than once or on a dead proc.
+func (p *proc) stop() {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	select {
+	case <-p.done:
+		return // already gone
+	default:
+	}
+	// Signal the whole process group (on Windows: terminate the process).
+	_ = signalGroup(p.cmd.Process.Pid, signalTerm)
+	select {
+	case <-p.done:
+	case <-time.After(3 * time.Second):
+		_ = signalGroup(p.cmd.Process.Pid, signalKill)
+		<-p.done
+	}
+}
+
+func stopProc(p *proc) *proc {
+	p.stop()
 	return nil
 }
 
-// ClientStart launches kvmshare-client against the configured server.
+// ---------------------------------------------------------------------------
+// Role discovery through the lock files (which only exist while a process
+// holds them — flock releases on process death, so "lock held" == running).
+// ---------------------------------------------------------------------------
+
+func (a *App) roleLockPath(role string) string {
+	return filepath.Join(a.stateDir, role+".lock")
+}
+
+// roleActive reports whether a kvmshare process of `role` is running on
+// this machine — ours or not (detected by probing the role's flock).
+func (a *App) roleActive(role string) bool {
+	f, err := os.OpenFile(a.roleLockPath(role), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if tryLockFile(f) == nil {
+		unlockFile(f) // not held: we own it
+		return false
+	}
+	return true // another process holds it
+}
+
+// pidFromLock returns the pid a running instance recorded in its lock
+// file (0 when unknown).
+func (a *App) pidFromLock(role string) int {
+	raw, err := os.ReadFile(a.roleLockPath(role))
+	if err != nil {
+		return 0
+	}
+	var pid int
+	if _, err := fmt.Sscanf(string(raw), "%d", &pid); err != nil || pid <= 1 {
+		return 0
+	}
+	return pid
+}
+
+// logTail returns the last lines of a log file (for start-failure
+// messages), or a generic note when the log is missing.
+func logTail(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "see the log for details"
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) > 3 {
+		lines = lines[len(lines)-3:]
+	}
+	out := strings.Join(lines, " | ")
+	if out == "" {
+		return "see the log for details"
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+func (a *App) ServerRunning() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.serverProc.running() || a.roleActive(roleServer)
+}
+
+func (a *App) ClientRunning() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.clientProc.running() || a.roleActive(roleClient)
+}
+
+const roleServer = "server"
+const roleClient = "client"
+
+// ---------------------------------------------------------------------------
+// Start (never two instances) / Stop (whoever holds the lock)
+// ---------------------------------------------------------------------------
+
+// stopRoleLocked stops the role's instance whether we spawned it or not:
+// our child first, then whoever still holds the lock (signalled via the
+// pid recorded in the lock file). Callers hold a.mu.
+func (a *App) stopRoleLocked(role string) {
+	if role == roleServer {
+		a.serverProc = stopProc(a.serverProc)
+	} else {
+		a.clientProc = stopProc(a.clientProc)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for a.roleActive(role) && time.Now().Before(deadline) {
+		if pid := a.pidFromLock(role); pid > 0 {
+			_ = signalPid(pid)
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
+}
+
+func (a *App) ServerStop() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopRoleLocked(roleServer)
+	return nil
+}
+
+func (a *App) ClientStop() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopRoleLocked(roleClient)
+	return nil
+}
+
+func (a *App) ServerStart() (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.serverProc.running() || a.roleActive(roleServer) {
+		return true, nil // already running (adopt the background instance)
+	}
+	// One role per machine: stop any client first.
+	a.stopRoleLocked(roleClient)
+
+	if _, err := os.Stat(a.serverPath); err != nil {
+		return false, fmt.Errorf("server binary not found at %s (run make install)", a.serverPath)
+	}
+	p, err := a.spawn(a.serverPath, a.serverLogPath, "--config", a.configPath)
+	if err != nil {
+		return false, err
+	}
+	if err := a.checkStarted(p, a.serverLogPath, "server"); err != nil {
+		return false, err
+	}
+	a.serverProc = p
+	return true, nil
+}
+
 func (a *App) ClientStart() (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if isRunning(a.clientCmd) {
-		return true, nil
+
+	if a.clientProc.running() || a.roleActive(roleClient) {
+		return true, nil // already running (adopt the background instance)
 	}
+	// One role per machine: stop any server first.
+	a.stopRoleLocked(roleServer)
+
 	if _, err := os.Stat(a.clientPath); err != nil {
 		return false, fmt.Errorf("client binary not found at %s (run make install)", a.clientPath)
 	}
 	addr := strings.TrimSpace(a.settings.ClientAddr)
 	if addr == "" {
-		return false, fmt.Errorf("set the server address on the client page first")
+		return false, fmt.Errorf("set the server address first (client page)")
 	}
 	args := []string{addr}
 	if name := strings.TrimSpace(a.settings.ClientName); name != "" {
 		args = append(args, "--name", name)
 	}
-	cmd, err := spawn(a.clientPath, a.clientLogPath, args...)
+	p, err := a.spawn(a.clientPath, a.clientLogPath, args...)
 	if err != nil {
 		return false, err
 	}
-	a.clientCmd = cmd
+	if err := a.checkStarted(p, a.clientLogPath, "client"); err != nil {
+		return false, err
+	}
+	a.clientProc = p
 	return true, nil
 }
 
-// ClientStop stops the managed client process.
-func (a *App) ClientStop() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.clientCmd = stopAndForget(a.clientCmd)
+// checkStarted gives a freshly spawned child a moment to prove it is
+// alive. A child that dies immediately (role lock refused, port taken,
+// missing display) surfaces as a clear error instead of a silent no-op.
+func (a *App) checkStarted(p *proc, logPath, label string) error {
+	select {
+	case <-p.done:
+		return fmt.Errorf("%s exited immediately: %s", label, logTail(logPath))
+	case <-time.After(350 * time.Millisecond):
+	}
 	return nil
 }
 
@@ -110,22 +272,11 @@ func (a *App) currentMode() Mode {
 	return a.settings.Mode
 }
 
-// restartServerLocked must be called with a.mu held.
-func (a *App) restartServerLocked() error {
-	if isRunning(a.serverCmd) {
-		a.serverCmd = stopAndForget(a.serverCmd)
-	}
-	cmd, err := spawn(a.serverPath, a.serverLogPath, "--config", a.configPath)
-	if err != nil {
-		return err
-	}
-	a.serverCmd = cmd
-	return nil
-}
-
 // spawn starts `bin` logging stdout+stderr to logPath, in its own process
-// group so it survives GUI exit and can be killed as a unit.
-func spawn(bin, logPath string, args ...string) (*exec.Cmd, error) {
+// group, with a reaper attached. The child is NOT tied to the GUI's life:
+// closing the GUI leaves it running in the background (flock keeps it
+// unique).
+func (a *App) spawn(bin, logPath string, args ...string) (*proc, error) {
 	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open log: %w", err)
@@ -133,33 +284,15 @@ func spawn(bin, logPath string, args ...string) (*exec.Cmd, error) {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = log
 	cmd.Stderr = log
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = processGroupAttrs()
 	if err := cmd.Start(); err != nil {
 		log.Close()
 		return nil, fmt.Errorf("start %s: %w", filepath.Base(bin), err)
 	}
-	return cmd, nil
-}
-
-// stopAndForget terminates the process group and reaps the process.
-func stopAndForget(cmd *exec.Cmd) *exec.Cmd {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	if cmd.ProcessState == nil {
-		// Negative pid signals the whole process group.
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-		waited := make(chan struct{})
-		go func() {
-			_, _ = cmd.Process.Wait() // reap; avoids a zombie
-			close(waited)
-		}()
-		select {
-		case <-waited:
-		case <-time.After(3 * time.Second):
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			<-waited
-		}
-	}
-	return nil
+	p := &proc{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait() // reap; closes done when the process is truly gone
+		close(p.done)
+	}()
+	return p, nil
 }

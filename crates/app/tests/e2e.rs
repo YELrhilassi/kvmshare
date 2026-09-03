@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use kvmshare_core::client::{Client, Injector};
 use kvmshare_core::layout::Layout;
-use kvmshare_core::server::{Engine, Server};
+use kvmshare_core::server::{Control, Engine, Server};
 use kvmshare_core::session::Session;
 use kvmshare_protocol::message::{KeyKind, Message, Rect, Screen, ScreenInfo};
 
@@ -90,11 +90,12 @@ impl Injector for RecordingInjector {
     }
 }
 
-/// A running server with a channel for feeding it local input, plus
-/// handles to both recorders.
+/// A running server with a channel for feeding it local input, a control
+/// channel for hot reloads, plus handles to both recorders.
 struct Harness {
     server: Arc<Server>,
     input_tx: mpsc::Sender<Message>,
+    control_tx: mpsc::Sender<Control>,
     engine_calls: Arc<Mutex<Vec<String>>>,
     port: u16,
 }
@@ -114,7 +115,8 @@ impl Harness {
 
 fn start_server() -> Harness {
     let session = Session::new(two_screen_layout(), 0);
-    let server = Arc::new(Server::bind(session, 0).unwrap());
+    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let server = Arc::new(Server::with_control(session, 0, Some(control_rx)).unwrap());
     let port = server.local_addr().unwrap().port();
 
     let (input_tx, input_rx) = mpsc::channel::<Message>();
@@ -129,7 +131,7 @@ fn start_server() -> Harness {
         move || server.run(input_rx, engine).unwrap()
     });
 
-    Harness { server, input_tx, engine_calls, port }
+    Harness { server, input_tx, control_tx, engine_calls, port }
 }
 
 fn connect_client(port: u16) -> (Client, RecordingInjector, Arc<Mutex<Vec<String>>>, Receiver<Message>) {
@@ -220,4 +222,36 @@ fn unknown_client_name_is_rejected() {
     let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
     let err = Client::connect(&format!("127.0.0.1:{}", h.port), "not-in-layout", info).unwrap_err();
     assert!(err.to_string().contains("no screen named"), "got: {err}");
+}
+
+#[test]
+fn config_hot_reload_returns_cursor_home_and_broadcasts() {
+    let h = start_server();
+
+    let (client, injector, client_calls, out_rx) = connect_client(h.port);
+    thread::spawn(move || client.run(Box::new(injector), &out_rx).unwrap());
+    h.wait_for_clients(1);
+
+    // Move onto hp, then reload a layout that no longer has hp: the
+    // cursor must come home and the client must be told to leave.
+    feed(&h, Message::MouseMoveRel { dx: -1000, dy: 0 });
+    assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
+
+    let new_layout = Layout::new(vec![Screen {
+        id: 0,
+        name: "pc".into(),
+        rect: Rect { x: 0, y: 0, w: 1920, h: 1080 },
+    }]);
+    h.control_tx.send(Control::Reload(new_layout)).unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    let ec = calls(&h.engine_calls);
+    assert!(ec.iter().any(|c| c == "cursor true"), "cursor should return home, got {ec:?}");
+    assert!(ec.iter().any(|c| c == "warp 960,540"), "cursor should warp to local center, got {ec:?}");
+
+    let cc = calls(&client_calls);
+    assert!(cc.contains(&"leave".to_string()), "client should be told to leave, got {cc:?}");
+
+    // hp was dropped from the layout, so it must be unregistered.
+    assert_eq!(h.server.client_count(), 0, "stale client should be dropped after reload");
 }
