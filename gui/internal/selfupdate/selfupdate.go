@@ -192,14 +192,21 @@ func FetchChecksums(rel *Release) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseChecksums(string(raw)), nil
+}
+
+// parseChecksums parses `sha256sum` output ("<hex>  <name>") into a name
+// -> hash map. Generators may prefix paths with "./"; that is stripped
+// so lookups by bare asset name always match.
+func parseChecksums(raw string) map[string]string {
 	sums := map[string]string{}
-	for _, line := range strings.Split(string(raw), "\n") {
+	for _, line := range strings.Split(raw, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 2 {
-			sums[fields[1]] = fields[0]
+			sums[strings.TrimPrefix(fields[1], "./")] = fields[0]
 		}
 	}
-	return sums, nil
+	return sums
 }
 
 // Newer reports whether version `a` is newer than `b`. Tags are vX.Y.Z

@@ -7,6 +7,7 @@ package selfupdate
 import (
 	_ "embed"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -70,7 +71,9 @@ func Apply(extracted map[string]string) ([]string, error) {
 
 // replaceFile moves `src` over `dst`, surviving a running process: the
 // target is first renamed aside (renaming a running binary is allowed on
-// both Linux and Windows; deleting it is not).
+// both Linux and Windows; deleting it is not). Falls back to a copy when
+// a rename is impossible (e.g. src sits on a tmpfs while the install
+// dir is on the real disk).
 func replaceFile(src, dst string) error {
 	old := dst + ".old"
 	_ = os.Remove(old)
@@ -79,13 +82,39 @@ func replaceFile(src, dst string) error {
 			return err
 		}
 	}
-	if err := os.Rename(src, dst); err != nil {
+	if err := moveInto(src, dst); err != nil {
 		// Put the old one back rather than leaving a gap.
 		_ = os.Rename(old, dst)
 		return err
 	}
 	_ = os.Remove(old)
 	return nil
+}
+
+// moveInto puts `src` at `dst`, renaming when possible and copying
+// across devices (os.Rename returns EXDEV for that).
+func moveInto(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	_, cerr := io.Copy(out, in)
+	cerr2 := out.Close()
+	if cerr != nil {
+		return cerr
+	}
+	if cerr2 != nil {
+		return cerr2
+	}
+	return os.Chmod(dst, 0o755)
 }
 
 // installExtras writes the non-binary pieces (Linux desktop integration;

@@ -118,6 +118,21 @@ func TestExtractFindsBinariesInNestedArchive(t *testing.T) {
 	}
 }
 
+func TestParseChecksums(t *testing.T) {
+	raw := "abc123  kvmshare_v0.1.0_linux_amd64.tar.gz\n" +
+		"def456  ./kvmshare-install_v0.1.0_linux_amd64\n" +
+		"\n" + // blank lines ignored
+		"junk line without hash\n"
+	sums := parseChecksums(raw)
+	if sums["kvmshare_v0.1.0_linux_amd64.tar.gz"] != "abc123" {
+		t.Errorf("plain entry not parsed: %v", sums)
+	}
+	// A "./" prefix must not break the lookup by bare name.
+	if sums["kvmshare-install_v0.1.0_linux_amd64"] != "def456" {
+		t.Errorf("./-prefixed entry not parsed: %v", sums)
+	}
+}
+
 func TestVerifyFileChecksum(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "f")
 	if err := os.WriteFile(p, []byte("hello kvmshare"), 0o644); err != nil {

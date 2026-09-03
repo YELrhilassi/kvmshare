@@ -110,7 +110,7 @@ release:
 		echo "note: x86_64-w64-mingw32-gcc not found — Windows server/client binaries omitted (install mingw-w64, then make release includes them)"; \
 		rm -rf dist/kvmshare_$(VERSION)_windows_amd64; \
 	fi
-	cd dist && sha256sum *.tar.gz *.zip kvmshare-install_* > SHA256SUMS
+	cd dist && for f in *; do [ -f "$$f" ] && [ "$$f" != SHA256SUMS ] && sha256sum "$$f"; done > SHA256SUMS
 	@echo "release $(VERSION) -> dist/"
 	@ls -lh dist/
 
@@ -124,9 +124,8 @@ publish: release
 	fi
 	gh release create $(VERSION) \
 		dist/kvmshare_$(VERSION)_linux_amd64.tar.gz \
-		dist/kvmshare_$(VERSION)_windows_amd64.zip \
 		dist/kvmshare-install_$(VERSION)_linux_amd64 \
-		dist/kvmshare-install_$(VERSION)_windows_amd64.exe \
+		$(if $(MINGW),dist/kvmshare_$(VERSION)_windows_amd64.zip dist/kvmshare-install_$(VERSION)_windows_amd64.exe) \
 		dist/SHA256SUMS \
 		--title "kvmshare $(VERSION)" \
 		--notes "Portable kvmshare release. Download the installer for your platform (or the full archive) and run it — it fetches and verifies everything itself."
