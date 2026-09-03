@@ -24,6 +24,12 @@ func processGroupAttrs() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{CreationFlags: createNewProcessGroup, HideWindow: true}
 }
 
+// restartAttrs is like processGroupAttrs (Windows has no sessions); used
+// when the GUI restarts itself into a new version.
+func restartAttrs() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{CreationFlags: createNewProcessGroup, HideWindow: true}
+}
+
 // No signals on Windows: both the graceful and forced stop map to
 // TerminateProcess. Keep the names so the shared code reads the same.
 const (

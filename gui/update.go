@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"kvmshare/gui/internal/selfupdate"
@@ -131,10 +130,7 @@ func restart(exe string) {
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if runtime.GOOS != "windows" {
-		cmd.SysProcAttr = processGroupAttrs()
-		cmd.SysProcAttr.Setsid = true
-	}
+	cmd.SysProcAttr = restartAttrs()
 	_ = cmd.Start()
 	// Let the child prove it started before we quit (a broken update
 	// should not silently leave nothing running).

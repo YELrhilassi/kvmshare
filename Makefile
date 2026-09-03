@@ -29,8 +29,9 @@ GO    ?= go
 
 # The version baked into the Go binaries (shown in the GUI and compared
 # against GitHub releases). On a tag it is exactly that tag; otherwise a
-# describe string keeps dev builds identifiable.
-VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo v0.0.0-dev)
+# stable dev label keeps the updater honest (dev builds always see
+# published releases as newer).
+VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$tag" ]; then echo "$$tag"; else echo v0.0.0-dev; fi)
 VERSION_LDFLAGS := -X kvmshare/gui/internal/selfupdate.Version=$(VERSION)
 
 # The GUI is built with Wails v3 on GTK4/WebKitGTK 6. Its bundled C
@@ -109,7 +110,7 @@ release:
 		echo "note: x86_64-w64-mingw32-gcc not found — Windows server/client binaries omitted (install mingw-w64, then make release includes them)"; \
 		rm -rf dist/kvmshare_$(VERSION)_windows_amd64; \
 	fi
-	cd dist && sha256sum * > SHA256SUMS
+	cd dist && sha256sum *.tar.gz *.zip kvmshare-install_* > SHA256SUMS
 	@echo "release $(VERSION) -> dist/"
 	@ls -lh dist/
 

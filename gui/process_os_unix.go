@@ -18,6 +18,13 @@ func processGroupAttrs() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setpgid: true}
 }
 
+// restartAttrs is like processGroupAttrs but detaches the child into its
+// own session too — used when the GUI restarts itself into a new version
+// (the child must survive the parent exiting).
+func restartAttrs() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setpgid: true, Setsid: true}
+}
+
 // The graceful and forced termination signals.
 const (
 	signalTerm = syscall.SIGTERM
