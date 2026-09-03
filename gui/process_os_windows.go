@@ -8,6 +8,7 @@ package main
 // process death).
 
 import (
+	"fmt"
 	"os"
 	"syscall"
 
@@ -39,6 +40,16 @@ func signalGroup(pid int, _ syscall.Signal) error {
 func signalPid(pid int) error {
 	return terminateProcess(pid)
 }
+
+// raiseInstance is not yet implemented on Windows (no POSIX signals; a
+// registered window message would do it). A second launch on Windows
+// falls back to the plain "already running" message.
+func raiseInstance(pid int) error {
+	return fmt.Errorf("raise not supported on windows")
+}
+
+// watchRaiseSignal is a no-op on Windows (see raiseInstance).
+func watchRaiseSignal(func()) {}
 
 func terminateProcess(pid int) error {
 	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))

@@ -9,6 +9,7 @@ package main
 
 import (
 	"os"
+	"os/signal"
 	"syscall"
 )
 
@@ -32,6 +33,35 @@ func signalGroup(pid int, sig syscall.Signal) error {
 // did not spawn itself — the pid recorded in the role lock file).
 func signalPid(pid int) error {
 	return syscall.Kill(pid, syscall.SIGTERM)
+}
+
+// raiseSignal is the "show your window" signal between GUI instances.
+//
+// Deliberately NOT SIGUSR1: JavaScriptCore (WebKit's JS engine) uses
+// SIGUSR1 for its garbage collector on Linux, so claiming it here
+// corrupts the webview (verified: a SIGUSR1-based raise crashed the GUI
+// with a SIGSEGV inside GTK after WebKit warned "Overriding existing
+// handler for signal 10"). SIGUSR2 is unclaimed by the graphics stack.
+const raiseSignal = syscall.SIGUSR2
+
+// raiseInstance asks a running GUI to show and focus its window. A second
+// launch uses this so "already running" never looks like "nothing
+// happened" (the classic invisible-ghost trap: the window was hidden to
+// the tray, so a dmenu relaunch died silently).
+func raiseInstance(pid int) error {
+	return syscall.Kill(pid, raiseSignal)
+}
+
+// watchRaiseSignal calls `onRaise` when another instance asks us to come
+// forward. Signals are only meaningful on Unix; Windows gets a no-op.
+func watchRaiseSignal(onRaise func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, raiseSignal)
+	go func() {
+		for range ch {
+			onRaise()
+		}
+	}()
 }
 
 // tryLockFile takes a non-blocking exclusive flock. Returns an error if

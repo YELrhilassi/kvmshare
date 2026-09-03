@@ -34,10 +34,16 @@ var windowIcon []byte
 func main() {
 	core := NewApp()
 
-	// Only one GUI per machine: a second instance exits with an error
-	// instead of fighting over processes and the role locks.
-	if err := core.SingleInstance(); err != nil {
+	// Only one GUI per machine. A second launch raises the running
+	// instance's window and exits quietly — from dmenu or a launcher
+	// there is no terminal, so "already running" must never look like
+	// "nothing happened".
+	raised, err := core.SingleInstance()
+	if err != nil {
 		log.Fatalf("kvmshare: %v", err)
+	}
+	if raised {
+		return // the running instance is now in front
 	}
 
 	assets, err := fs.Sub(dist, "frontend/dist")
@@ -78,11 +84,29 @@ func main() {
 		BackgroundColour: application.NewRGBA(10, 10, 12, 255),
 	})
 
-	// Closing the window hides it to the tray — roles keep running and
-	// the app stays reachable for status and control.
+	// A second launch asks us to come forward (see SingleInstance).
+	watchRaiseSignal(func() {
+		window.Show()
+		window.Focus()
+	})
+
+	// Closing the window hides it to the tray when a tray is actually
+	// present (roles keep running and the app stays reachable). With no
+	// tray host — no session bus, or no StatusNotifierWatcher — hiding
+	// would strand the app invisibly (the classic ghost-instance trap),
+	// so closing quits the GUI instead. Roles are independent background
+	// processes either way: quitting the GUI never stops them, and a
+	// later launch adopts them again.
 	window.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
-		window.Hide()
+		if trayHostAvailable() {
+			window.Hide()
+			e.Cancel()
+			return
+		}
+		// No tray: cancel the default close (which would destroy the
+		// window and leave a windowless zombie process) and quit cleanly.
 		e.Cancel()
+		app.Quit()
 	})
 
 	setupTray(app, core, window)

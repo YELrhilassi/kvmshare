@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -488,13 +490,38 @@ func TestSaveConfigDoesNotStartServer(t *testing.T) {
 	}
 }
 
-func TestSingleInstanceLock(t *testing.T) {
+func TestSingleInstanceLockAndRaise(t *testing.T) {
+	// A second launch raises the first with SIGUSR2 (never SIGUSR1 —
+	// JavaScriptCore uses that for GC). In this test both "instances" are
+	// the same process, so ignore the signal (its default action would
+	// terminate the test) and assert the raise contract.
+	signal.Ignore(syscall.SIGUSR2)
+
 	a, _ := newTestApp(t)
-	if err := a.SingleInstance(); err != nil {
-		t.Fatalf("first instance should get the lock: %v", err)
+	if raised, err := a.SingleInstance(); err != nil || raised {
+		t.Fatalf("first instance should hold the lock quietly, got raised=%v err=%v", raised, err)
 	}
 	b := NewApp() // second instance, same HOME -> same lock file
-	if err := b.SingleInstance(); err == nil {
-		t.Fatal("second instance must be refused")
+	raised, err := b.SingleInstance()
+	if err != nil {
+		t.Fatalf("second instance should raise the first and exit quietly, got: %v", err)
+	}
+	if !raised {
+		t.Fatal("second instance must report that it raised the running one")
+	}
+}
+
+func TestSingleInstanceWritesPid(t *testing.T) {
+	a, _ := newTestApp(t)
+	if _, err := a.SingleInstance(); err != nil {
+		t.Fatalf("first instance should get the lock: %v", err)
+	}
+	raw, err := os.ReadFile(a.instanceLockPath)
+	if err != nil {
+		t.Fatalf("lock file readable: %v", err)
+	}
+	var pid int
+	if _, err := fmt.Sscanf(string(raw), "%d", &pid); err != nil || pid <= 1 {
+		t.Fatalf("lock file should record our pid, got %q", raw)
 	}
 }

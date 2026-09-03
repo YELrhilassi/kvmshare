@@ -11,12 +11,41 @@ import (
 	"sync"
 	"time"
 
+	"github.com/godbus/dbus/v5"
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/icons"
 )
 
 //go:embed assets/tray.png
 var trayIcon []byte
+
+// trayHostAvailable reports whether a system tray actually exists on this
+// desktop: a session bus AND an org.kde.StatusNotifierWatcher (provided by
+// KDE/GNOME panels, or a standalone SNI host). Checked once at startup —
+// the result does not change for the life of the process. Close-to-tray
+// only makes sense when there is a tray to hide into; without one, closing
+// the window quits the GUI (roles are independent background processes).
+func trayHostAvailable() bool {
+	trayOnce.Do(func() {
+		conn, err := dbus.SessionBus()
+		if err != nil {
+			return // no session bus — no tray
+		}
+		defer conn.Close()
+		var owner string
+		if err := conn.Object("org.freedesktop.DBus", "/org/freedesktop/DBus").
+			Call("org.freedesktop.DBus.GetNameOwner", 0, "org.kde.StatusNotifierWatcher").
+			Store(&owner); err == nil && owner != "" {
+			trayAvailable = true
+		}
+	})
+	return trayAvailable
+}
+
+var (
+	trayOnce      sync.Once
+	trayAvailable bool
+)
 
 // tray owns the tray menu items so their labels and enabled state can
 // track the current role and whether it is running. The menu is updated
