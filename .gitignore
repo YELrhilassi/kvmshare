@@ -1,0 +1,17 @@
+# Rust build output. Cargo.lock is NOT ignored: this workspace ships
+# binaries, so the lockfile is part of a reproducible build.
+/target
+
+# Go / Wails
+gui/build/bin/
+gui/frontend/dist/
+gui/frontend/node_modules/
+gui/kvmshare-gui
+gui/kvmshare-server.log
+gui/*.exe
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

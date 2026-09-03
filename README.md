@@ -1,0 +1,157 @@
+# kvmshare
+
+A from-scratch, cross-platform KVM (keyboard/video/mouse) sharer, built in
+**Rust** with a **Wails** desktop GUI. One machine (the **server**) shares
+its keyboard and mouse with other machines (**clients**) across a virtual
+desktop: move the cursor off one screen edge and it appears on the
+neighbor machine, taking keyboard and clipboard with it.
+
+It is designed around the hard lessons of existing tools (Synergy,
+Barrier, Deskflow): a single, warp-proof motion pipeline, a pure-logic
+switching brain that is fully unit-tested, and a simple binary protocol
+with no serialization framework.
+
+## Layout
+
+```
+kvmshare/
+├── crates/
+│   ├── protocol/   # binary wire protocol: framing, messages, (de)serialization
+│   ├── core/       # layout model, cursor/screen-switching session, TCP server/client
+│   ├── platform/   # OS backends: Linux/X11 (XI2 raw input, XFixes, XTest, arboard)
+│   └── app/        # the kvmshare-server and kvmshare-client executables
+├── gui/            # Wails v2 desktop app: React + shadcn/ui, 4 pages
+│   └── frontend/   #   Vite + React + TypeScript (built to frontend/dist)
+└── docs/
+    └── architecture.md   # design decisions, threading model, future work
+```
+
+Each crate is small and readable on purpose — no file in the Rust core is
+more than a few hundred lines, and every layer has tests.
+
+## Build & install
+
+Requirements: Rust (stable), Go, Node (for the React frontend), and — for
+the Linux GUI — `webkit2gtk-4.1` and `gtk3` development packages
+(Void: `xbps-install webkit2gtk-devel gtk+3-devel`).
+
+```bash
+make build       # compile everything (release Rust + GUI)
+make install     # copy binaries to ~/.local/bin, config to ~/.config/kvmshare,
+                 # launcher to ~/.local/share/applications
+```
+
+After `make install`, `kvmshare-server`, `kvmshare-client` and `kvmshare-gui`
+are on your PATH and launchable from dmenu/rofi/your terminal. The server
+finds its config automatically at `~/.config/kvmshare/kvmshare-server.toml`
+(`--config PATH` overrides it).
+
+### Dev loop
+
+```bash
+make dev         # watch crates/ and gui/, rebuild + reinstall on every save
+```
+
+`make dev` stays running: edit any Rust/Go/frontend file, and within a few
+seconds the installed binaries are rebuilt and re-installed — ready to
+launch and test. Ctrl-C to stop.
+
+Other targets: `make test` (full Rust **and** Go GUI suites), `make clean`,
+`make uninstall`
+(keeps your config), `make install PREFIX=/usr/local` to install elsewhere.
+
+## Run
+
+### Server (the machine whose keyboard/mouse is shared)
+
+```toml
+# kvmshare-server.toml — the virtual desktop. The FIRST screen is this
+# machine (the server). Client names must match the client's hostname
+# (or whatever --name the client was started with).
+port = 24800
+
+[[screens]]
+name = "pc"
+width = 1920
+height = 1080
+x = 0
+y = 0
+
+[[screens]]
+name = "hp"
+width = 1920
+height = 1080
+x = -1920   # hp sits to the LEFT of pc
+y = 0
+```
+
+```bash
+kvmshare-server --config kvmshare-server.toml
+```
+
+### Client (a machine being controlled)
+
+```bash
+kvmshare-client pc:24800            # name defaults to this machine's hostname
+kvmshare-client pc:24800 --name hp  # ...or be explicit
+```
+
+That's it: move the cursor to the left edge of pc and it slides onto hp.
+
+### GUI
+
+Launch `kvmshare-gui` (from dmenu/rofi/terminal). A dark, minimal
+interface with a top navigation bar — one window manages both roles:
+
+- **Home** — the role switch (server/client) and live status: whether
+  the active process is running, the address clients connect to (server
+  mode) or the machine this one connects to (client mode), plus quick
+  access to the other pages.
+- **Server** — start/stop, configuration (port, config path), network
+  details (all interfaces + addresses) and a live log tail.
+- **Client** — the server address + screen name this machine connects
+  with, client start/stop and its live log.
+- **Layout** — the virtual desktop editor: drag screens to arrange them
+  (with edge snapping), zoom/pan/fit the canvas, nudge with the arrow
+  keys, duplicate/delete screens, and a lock toggle that freezes the
+  whole layout against accidental edits. Saving restarts the running
+  server so changes apply immediately.
+
+The GUI's own state (role, client address) persists in
+`~/.local/state/kvmshare/gui.json`; process logs live in the same folder
+and are tailed live by the UI.
+
+## Test
+
+```bash
+make test   # cargo test --workspace + go test ./gui
+```
+
+Rust covers the protocol round-trips, the layout/adjacency math, the
+entire switching session (including the physical-cursor edge guard), and
+a real end-to-end test: server + client over TCP with mock input and a
+recording injector. The Go suite covers config round-trips, settings
+persistence, process start/stop, network listing and log tailing.
+
+## Status
+
+- **Linux/X11**: full — input capture (XI2 raw), cursor control, input
+  injection, clipboard sync, GUI.
+- **Windows/macOS**: the architecture is ready (platform traits + stubs
+  with clear errors); the backends are not yet implemented. See
+  `docs/architecture.md`.
+
+## Known limitations (deliberate, documented)
+
+- Keys travel as native scan codes (`scan` in `Message::Key`), so a
+  Linux↔Linux pair works perfectly today; a canonical key map for
+  cross-OS pairs (Linux↔Windows) is planned.
+- Clipboard sync is text-only (`text/plain`), polled on both sides and
+  echo-guarded.
+- Layout changes apply on server restart (the GUI restarts the server on
+  save); a live control socket is the planned next step (see the
+  architecture doc).
+
+## License
+
+MIT.

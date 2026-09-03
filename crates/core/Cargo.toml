@@ -1,0 +1,9 @@
+[package]
+name = "kvmshare-core"
+description = "Layout model, cursor/screen-switching session, and TCP server/client for kvmshare."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvmshare-protocol = { workspace = true }

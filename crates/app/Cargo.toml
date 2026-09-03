@@ -1,0 +1,13 @@
+[package]
+name = "kvmshare-app"
+description = "The kvmshare server and client executables."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvmshare-core = { workspace = true }
+kvmshare-protocol = { workspace = true }
+kvmshare-platform = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
