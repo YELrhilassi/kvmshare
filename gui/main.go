@@ -46,6 +46,17 @@ func main() {
 		return // the running instance is now in front
 	}
 
+	// A D-Bus session bus must exist before anything touches D-Bus: the
+	// tray, the notify watcher, and the WebKitGTK webview (its child
+	// processes inherit this env). Without one, godbus/WebKit autolaunch
+	// a fresh private bus per launch, and each private bus grows an
+	// immortal dbus-activated stack (portals, at-spi, gvfs, notification
+	// daemon) that survives the GUI — the process explosion. This adopts
+	// an existing bus or creates exactly one managed one, and stops it
+	// again on exit.
+	stopBus := ensureSessionBus(core.stateDir)
+	defer stopBus()
+
 	// Input isolation (Linux server) needs a one-time system grant. The
 	// sibling installer handles it silently — at most one privilege
 	// prompt, never again after. Runs in the background.
