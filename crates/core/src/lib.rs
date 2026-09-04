@@ -14,9 +14,11 @@
 
 pub mod client;
 pub mod layout;
+pub mod motion;
 pub mod server;
 pub mod session;
 pub mod transport;
+pub mod udp;
 
 pub use layout::{Direction, Layout};
 pub use session::{Action, Session};

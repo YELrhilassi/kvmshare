@@ -19,11 +19,23 @@
 //! raw events), so presses are deduplicated per key: only true
 //! down/up transitions are forwarded, preventing stuck keys on the
 //! receiving machine.
+//!
+//! ## Position beacons
+//!
+//! Raw input carries only *deltas* — the session's boundary model needs
+//! the **real** cursor position too (see `core::session`: a crossing is
+//! armed by a beacon placing the visible cursor on a screen wall, and raw
+//! deltas alone must never fire one). The capture therefore polls
+//! `GetCursorPos` on a timer ([`BEACON_MS`]) and forwards each *changed*
+//! position as a [`Message::MouseMoveAbs`] beacon — mirroring the X11
+//! backend exactly, where ordinary XI motion events stop arriving once
+//! the pointer is pinned at a wall (so the last beacon before the pin is
+//! the one that arms it).
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::UI::Input as ri;
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
@@ -41,6 +53,15 @@ const USAGE_KEYBOARD: u16 = 0x06;
 const CAPTURE_CLASS: &[u16] = &[
     'K' as u16, 'V' as u16, 'M' as u16, 'S' as u16, 'H' as u16, 'A' as u16, 'R' as u16, 'E' as u16, 0,
 ];
+
+/// How often the position beacon polls `GetCursorPos` (ms). Same order
+/// as the X11 capture's coalesced beacons (~6 ms + poll slack): tight
+/// enough that edge crossings arm promptly, sparse enough to stay
+/// negligible. Beacons are only forwarded when the position *changed*, so
+/// an idle desktop sends nothing.
+const BEACON_MS: usize = 8;
+/// The timer id for the position beacon poll.
+const BEACON_TIMER: usize = 1;
 
 /// Tracks the last absolute mouse position so absolute-mode deltas can
 /// be computed (raw input can report either mode depending on the
@@ -62,6 +83,9 @@ struct InputCapture {
     tx: Sender<Message>,
     abs: AbsoluteTracker,
     keys: KeyTracker,
+    /// The last beaconed cursor position (`None` = none yet). Only
+    /// changes are forwarded, so a still (or pinned) cursor goes quiet.
+    beacon: Option<(i32, i32)>,
 }
 
 /// Register the hidden capture window for raw mouse + keyboard input.
@@ -135,6 +159,11 @@ fn create_capture_window() -> Result<HWND, String> {
     if hwnd.is_null() {
         return Err("CreateWindowExW failed".into());
     }
+    // Start the position-beacon poller (see the module docs).
+    // SAFETY: hwnd is valid and owned by this thread's message loop.
+    if unsafe { wm::SetTimer(hwnd, BEACON_TIMER as usize, BEACON_MS as u32, None) } == 0 {
+        return Err("SetTimer failed".into());
+    }
     Ok(hwnd)
 }
 
@@ -147,7 +176,12 @@ pub fn start() -> Result<Receiver<Message>, String> {
 
     log_info!("input capture started (Raw Input)");
     let (tx, rx) = mpsc::channel();
-    let capture = InputCapture { tx, abs: AbsoluteTracker::default(), keys: KeyTracker::default() };
+    let capture = InputCapture {
+        tx,
+        abs: AbsoluteTracker::default(),
+        keys: KeyTracker::default(),
+        beacon: None,
+    };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {
             log_error!("input capture stopped: {e}");
@@ -172,6 +206,8 @@ impl InputCapture {
                 }
                 if msg.message == wm::WM_INPUT {
                     self.on_raw_input(msg.lParam as ri::HRAWINPUT);
+                } else if msg.message == wm::WM_TIMER && msg.wParam as usize == BEACON_TIMER {
+                    self.on_timer();
                 } else {
                     wm::TranslateMessage(&msg);
                     wm::DispatchMessageW(&msg);
@@ -202,6 +238,24 @@ impl InputCapture {
                 _ => {}
             }
         }
+    }
+
+    /// One beacon poll: forward the real cursor position when it moved
+    /// since the last poll. See the module docs for why the session needs
+    /// these and why changes only.
+    fn on_timer(&mut self) {
+        let mut pt = POINT { x: 0, y: 0 };
+        // SAFETY: GetCursorPos writes one POINT into a valid buffer.
+        let got = unsafe { wm::GetCursorPos(&mut pt) } != 0;
+        if !got {
+            return;
+        }
+        let pos = (pt.x, pt.y);
+        if self.beacon == Some(pos) {
+            return; // still (or pinned): quiet, exactly like X11 at a wall
+        }
+        self.beacon = Some(pos);
+        self.send(Message::MouseMoveAbs { x: pos.0, y: pos.1 });
     }
 
     fn on_mouse(&mut self, mouse: &ri::RAWMOUSE) {
@@ -321,7 +375,7 @@ mod tests {
         // Pause arrives as make code 0x45 with RI_KEY_E1 set — the same
         // make code as Num Lock. It must be dropped, never forwarded as
         // Num Lock.
-        let mut capture = InputCapture { tx: mpsc::channel().0, abs: AbsoluteTracker::default(), keys: KeyTracker::default() };
+        let mut capture = InputCapture { tx: mpsc::channel().0, abs: AbsoluteTracker::default(), keys: KeyTracker::default(), beacon: None };
         // SAFETY: zeroed struct; only the fields the handler reads are
         // populated, matching a real raw-input record.
         let mut kb: ri::RAWKEYBOARD = unsafe { std::mem::zeroed() };

@@ -20,9 +20,55 @@
 //!   every local window it crosses (and moving it *before* hiding made it
 //!   visibly dash to the screen center on every crossing), so pc elements
 //!   would react while the user is working on a client. The virtual
-//!   cursor is driven entirely by XI2 *raw* motion (see
-//!   `kvmshare-platform`), which does not depend on the physical cursor's
-//!   position at all — so a static park loses nothing.
+//!   cursor is driven entirely by *raw* motion and real-position beacons
+//!   (see `kvmshare-platform`), which do not depend on the physical
+//!   cursor's position at all — so a static park loses nothing.
+//!
+//! ## The boundary model
+//!
+//! A screen edge is a **wall**: the OS pins a real cursor there and no
+//! amount of outward motion moves it off-screen. Two cursor streams feed
+//! the session:
+//!
+//! * **Raw deltas** — what the device reported. They are instantaneous
+//!   but *pre-acceleration*: they run ahead of the visible cursor, so
+//!   they can never decide a crossing alone (deltas alone are exactly
+//!   what made the cursor jump to a neighbor while merely approaching an
+//!   edge in earlier designs).
+//! * **Real-position beacons** — where the *visible* cursor actually is
+//!   (the server's own screen on the local side, the active client's
+//!   reports on the remote side). They lag a few milliseconds but are the
+//!   ground truth.
+//!
+//! A crossing therefore needs **both, together**:
+//!
+//! 1. **Arm** — a beacon places the real cursor within [`EDGE_BAND`] px
+//!    of a screen edge ("at the wall"). The OS has *committed* the cursor
+//!    to that boundary; the user is standing on the seam.
+//! 2. **Fire** — an outward push (raw deltas toward that edge) while
+//!    armed. At the wall, outward deltas are unambiguous intent: the OS
+//!    cannot move the cursor any further, so the push can only mean
+//!    "cross".
+//!
+//! Because arming comes from the *real* cursor and firing from a *push*,
+//! the rule is symmetric in both directions and needs no fragile
+//! point-exact edge math:
+//!
+//! * resting at the wall never crosses (no push);
+//! * an interior cursor never crosses, no matter how fast the deltas run;
+//! * a sweep that ends exactly at the wall still crosses: when a beacon
+//!   parks the cursor on a wall while a push arrived within
+//!   [`EDGE_PUSH_FRESH`], the crossing fires **on the park itself** —
+//!   no dead frame at the boundary, no "I have to push again" stickiness;
+//! * moving *away* from a wall disarms it, so the entry placement on the
+//!   neighbor (which sits on the seam) can never bounce control back.
+//!
+//! The one fallback left is for a **stalled beacon stream** (a platform
+//! whose position events stop while the pointer is pinned, a wedged
+//! client, an old peer without beacon support): sustained outward pushing
+//! past [`EDGE_PUSH_FALLBACK`] — with the *virtual* cursor (raw deltas)
+//! actually outside the screen rect, so an interior real cursor can never
+//! trip it — crosses anyway. It is the rescue path, never the common one.
 
 use std::time::{Duration, Instant};
 
@@ -50,46 +96,129 @@ pub enum Action {
     Nothing,
 }
 
-/// The cursor model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Cursor {
-    /// Virtual position.
-    x: i32,
-    y: i32,
-    mode: Mode,
-}
+/// Wall-band width (px). A real cursor within [`EDGE_BAND`] px of a
+/// screen edge counts as "at the wall". Two pixels absorb pointer
+/// position quantization (a pinned cursor reports the very last pixel on
+/// both X11 and Windows; one pixel of slack covers off-by-ones) without
+/// making the band wide enough to steal aim from UI elements near the
+/// edge. The band is *not* what makes a crossing fire — the push is — it
+/// only makes the "at the wall" test robust.
+const EDGE_BAND: i32 = 2;
 
-/// How long outward deltas must keep pushing against a screen edge — with
-/// no beacon correcting them — before the switch fires anyway. The normal
-/// crossing is confirmed instantly by the beacon (the real cursor parked
-/// at the edge); this is only the fallback for a stalled beacon stream
-/// (the OS pinned the pointer at the edge, so motion events — and with
-/// them beacons — stop). 150 ms is far shorter than an accidental hover
-/// but long enough that a beacon lag can never fire a crossing on its
-/// own.
+/// How recent an outward push must be for a beacon that *parks* the real
+/// cursor on a wall to complete the crossing on the park itself. Crossing
+/// on the next delta would otherwise add one motion frame of dead time at
+/// the exact moment a crossing should feel seamless — and a sweep that
+/// ends precisely at the wall (the flick-and-stop case) would not cross
+/// until the user pushed again, which feels sticky. A beacon alone —
+/// the user resting at the edge — never crosses: the push within this
+/// window is what marks intent. Far shorter than a hover, long enough to
+/// cover the beacon lag between the last delta and the park confirmation
+/// even under load.
+const EDGE_PUSH_FRESH: Duration = Duration::from_millis(40);
+
+/// How long outward deltas must keep pushing against a screen edge —
+/// with the *virtual* cursor outside the rect and no beacon correcting
+/// it — before the switch fires anyway. This is the rescue path for a
+/// stalled beacon stream (the OS pinned the pointer at the edge, motion
+/// events — and with them beacons — stop, and only raw deltas keep
+/// flowing; or a peer that cannot report its real cursor at all). The
+/// virtual cursor must actually be *outside* the rect, so an interior
+/// real cursor can never trip it. Far shorter than an accidental hover,
+/// long enough that a beacon lag can never fire a crossing on its own.
 const EDGE_PUSH_FALLBACK: Duration = Duration::from_millis(150);
-
-/// How recent an outward push must be for a beacon that parks the real
-/// cursor at the shared edge to complete the crossing immediately.
-/// Crossing on the *next* delta after the park beacon adds one motion
-/// frame of dead time at the exact moment a crossing should feel
-/// seamless — but a beacon alone (the user merely resting at the edge)
-/// must never cross, so only a push within this window counts as intent.
-/// Far shorter than a hover, long enough to cover the beacon lag between
-/// the last delta and the park confirmation.
-const EDGE_PUSH_FRESH: Duration = Duration::from_millis(60);
 
 /// How old a client cursor-position beacon may be and still be treated
 /// as the real cursor's location. Beacons arrive every few ms while the
 /// client is controlled; anything older than this means the stream
-/// stalled (a wedged client, a network drop) and the virtual position
-/// must take over for edge decisions.
+/// stalled (a wedged client, a network drop) and the wall-arm expires —
+/// outward pushes then need the sustained fallback instead, so a stale
+/// "at the wall" report can never fire a crossing the user did not push
+/// for.
 const REMOTE_BEACON_FRESH: Duration = Duration::from_millis(120);
 
-/// The real cursor position on a remote screen, as reported by the
-/// client itself (client-local pixels + arrival time).
-struct RemoteBeacon {
+// Direction bits for the "which walls is the real cursor on" mask. A
+// corner can set two bits at once; the push direction picks which one
+// fires.
+const BIT_LEFT: u8 = 1 << 0;
+const BIT_RIGHT: u8 = 1 << 1;
+const BIT_TOP: u8 = 1 << 2;
+const BIT_BOTTOM: u8 = 1 << 3;
+
+fn bit(dir: Direction) -> u8 {
+    match dir {
+        Direction::Left => BIT_LEFT,
+        Direction::Right => BIT_RIGHT,
+        Direction::Top => BIT_TOP,
+        Direction::Bottom => BIT_BOTTOM,
+    }
+}
+
+/// The four directions, in a stable order (left/right before top/bottom,
+/// mirroring [`Layout::exit_direction`] so corners resolve consistently).
+const DIRS: [Direction; 4] = [Direction::Left, Direction::Right, Direction::Top, Direction::Bottom];
+
+/// Does this delta push *outward* through `dir` (toward that edge)?
+fn pushes_outward(dir: Direction, dx: i32, dy: i32) -> bool {
+    match dir {
+        Direction::Left => dx < 0,
+        Direction::Right => dx > 0,
+        Direction::Top => dy < 0,
+        Direction::Bottom => dy > 0,
+    }
+}
+
+/// Does this delta move *away* from `dir`'s wall (back into the screen)?
+fn pulls_inward(dir: Direction, dx: i32, dy: i32) -> bool {
+    match dir {
+        Direction::Left => dx > 0,
+        Direction::Right => dx < 0,
+        Direction::Top => dy > 0,
+        Direction::Bottom => dy < 0,
+    }
+}
+
+/// Which walls a *local* position sits on, if any. `x`/`y` are local
+/// pixels inside `rect` (or up to a hair past it — beacon lag). The OS
+/// pins the pointer at the outer pixel column/row (`0` / `w - 1`), so
+/// those are the walls; [`EDGE_BAND`] gives the test slack. Degenerate
+/// screens smaller than two bands arm nothing.
+fn wall_bits(rect: &Rect, x: i32, y: i32) -> u8 {
+    let mut bits = 0;
+    if rect.w > 2 * EDGE_BAND {
+        if x <= EDGE_BAND - 1 {
+            bits |= BIT_LEFT;
+        }
+        if x >= rect.w - EDGE_BAND {
+            bits |= BIT_RIGHT;
+        }
+    }
+    if rect.h > 2 * EDGE_BAND {
+        if y <= EDGE_BAND - 1 {
+            bits |= BIT_TOP;
+        }
+        if y >= rect.h - EDGE_BAND {
+            bits |= BIT_BOTTOM;
+        }
+    }
+    bits
+}
+
+/// One outward push: which edge it pushed through and when. Used to give
+/// a beacon that parks the cursor on a wall the "is the user mid-sweep?"
+/// answer ([`EDGE_PUSH_FRESH`]).
+#[derive(Debug, Clone, Copy)]
+struct Push {
+    dir: Direction,
     at: Instant,
+}
+
+/// A stalled-stream fallback in progress: which edge the virtual cursor
+/// is pushed out through and when that started.
+#[derive(Debug, Clone, Copy)]
+struct Pushing {
+    dir: Direction,
+    since: Instant,
 }
 
 /// The switching brain.
@@ -98,37 +227,27 @@ pub struct Session {
     cursor: Cursor,
     /// The local screen's rectangle in virtual coordinates.
     local: Rect,
-    /// While local: which edge the *real* (beacon-reported) cursor is
-    /// parked on, if any. A crossing fires only when outward motion
-    /// follows a beacon that confirms the real cursor is at the edge.
-    at_edge: Option<Direction>,
-    /// While local: when outward deltas first pushed against an edge the
-    /// beacon had not confirmed. If they keep pushing for
-    /// [`EDGE_PUSH_FALLBACK`] with no beacon correcting them (pinned
-    /// cursor, stalled beacon stream), the crossing fires — see
-    /// [`Session::handle_local_motion`]. Cleared whenever a beacon shows
-    /// the real cursor back inside the screen.
-    edge_pushing_since: Option<Instant>,
-    /// While remote: the most recent real cursor position the active
-    /// client reported (its screen-local pixels) and when it arrived.
-    /// The client's OS applies its own pointer acceleration to the
-    /// relative motion we forward, so its real cursor is the ground
-    /// truth for where the shared cursor sits — exactly the role the
-    /// local capture's position beacons play on the server screen.
-    remote_beacon: Option<RemoteBeacon>,
-    /// While remote: which edge of the active client's screen its real
-    /// cursor is pinned on, per the latest beacon. A crossing fires only
-    /// when outward motion follows a beacon pinned at the shared edge.
-    remote_at_edge: Option<Direction>,
-    /// While remote: when outward deltas first pushed against a screen
-    /// edge the beacon had not confirmed (see
-    /// [`Session::handle_remote_motion`]; mirrors
-    /// [`Session::edge_pushing_since`] for the local screen).
-    remote_pushing_since: Option<Instant>,
-    /// The last relative motion forwarded while remote, so a beacon that
-    /// parks the cursor at an edge can tell whether the user is still
-    /// pushing outward.
-    last_remote_delta: Instant,
+
+    // Local-mode boundary state.
+    //
+    // `at_wall` mirrors what the *real* (beacon-reported) cursor is doing
+    // on the local screen. A crossing fires when outward motion follows a
+    // beacon that put the cursor on a wall — never on motion alone and
+    // never on a beacon alone.
+    at_wall: u8,
+    /// The most recent outward push through each shared edge (used to
+    /// fire on a park beacon mid-sweep).
+    last_out: Option<Push>,
+    /// A stalled-stream fallback in progress on the local screen.
+    pushing: Option<Pushing>,
+
+    // Remote-mode boundary state (mirrors the local side, fed by the
+    // active client's real-cursor beacons).
+    remote_at_wall: u8,
+    /// When the last remote beacon arrived (`None` = none yet).
+    remote_beacon_at: Option<Instant>,
+    remote_last_out: Option<Push>,
+    remote_pushing: Option<Pushing>,
 }
 
 impl Session {
@@ -139,12 +258,13 @@ impl Session {
             cursor: Cursor { x: cx, y: cy, mode: Mode::Local },
             layout,
             local,
-            at_edge: None,
-            edge_pushing_since: None,
-            remote_beacon: None,
-            remote_at_edge: None,
-            remote_pushing_since: None,
-            last_remote_delta: Instant::now(),
+            at_wall: 0,
+            last_out: None,
+            pushing: None,
+            remote_at_wall: 0,
+            remote_beacon_at: None,
+            remote_last_out: None,
+            remote_pushing: None,
         }
     }
 
@@ -192,11 +312,7 @@ impl Session {
         self.layout = layout;
         self.local = local;
         self.cursor = Cursor { x: cx, y: cy, mode: Mode::Local };
-        self.at_edge = None;
-        self.edge_pushing_since = None;
-        self.remote_beacon = None;
-        self.remote_at_edge = None;
-        self.remote_pushing_since = None;
+        self.clear_boundary_state();
         if was_remote {
             vec![Action::SwitchToLocal { x: cx, y: cy }]
         } else {
@@ -217,40 +333,13 @@ impl Session {
                 // visible cursors drift apart and boundaries become
                 // unreliable. In Remote mode the physical cursor is
                 // hidden, parked and warped, so its position is
-                // meaningless — raw deltas rule there (they drive the
-                // client's visible cursor 1:1 and never drift).
+                // meaningless — raw deltas and the client's own beacons
+                // rule there.
                 if matches!(self.cursor.mode, Mode::Local) {
-                    let vx = self.local.x + x;
-                    let vy = self.local.y + y;
-                    self.cursor.x = vx;
-                    self.cursor.y = vy;
-                    // The beacon is the truth about where the real cursor
-                    // is. Remember whether it sits exactly on a screen
-                    // edge — only then can outward motion mean "cross".
-                    self.at_edge = edge_direction(&self.local, vx, vy);
-                    match self.at_edge {
-                        Some(dir) => {
-                            // The real cursor just parked on an edge
-                            // while the user is mid-push: cross now, on
-                            // the park itself, instead of waiting for the
-                            // next delta. A beacon alone — the user
-                            // resting at the edge — never crosses.
-                            let pushing = self
-                                .edge_pushing_since
-                                .is_some_and(|t| t.elapsed() < EDGE_PUSH_FRESH);
-                            if pushing {
-                                return self.switch_out(dir);
-                            }
-                        }
-                        None => {
-                            // The real cursor is back inside: any edge-
-                            // push attempt was a transient overshoot, and
-                            // it is over.
-                            self.edge_pushing_since = None;
-                        }
-                    }
+                    self.on_local_beacon(x, y)
+                } else {
+                    vec![]
                 }
-                vec![]
             }
             Message::MouseButton { button, pressed } => {
                 self.forward_while_remote(Message::MouseButton { button, pressed })
@@ -295,82 +384,113 @@ impl Session {
         self.cursor.y += dy;
 
         match self.cursor.mode {
-            Mode::Local => self.handle_local_motion(),
+            Mode::Local => self.handle_local_motion(dx, dy),
             Mode::Remote(id) => self.handle_remote_motion(id, dx, dy),
         }
     }
 
-    /// A client reported where its *real* cursor is (client-local
-    /// pixels). Runs from the client's connection thread while this
-    /// client is the active one; the session mutex serializes it with the
-    /// main loop's local-input processing.
-    ///
-    /// Only *state* is updated here — the actual crossing is fired by the
-    /// next outward delta on the main loop (≤ a motion frame later), so
-    /// no action needs executing from this thread. The state mirrors the
-    /// local-screen beacon: which edge the real cursor is pinned on, and
-    /// whether it has come back inside (which cancels any edge-push
-    /// attempt — an interior beacon means the deltas were an overshoot).
-    pub fn on_remote_beacon(&mut self, id: u8, x: i32, y: i32) -> Vec<Action> {
-        if !matches!(self.cursor.mode, Mode::Remote(cur) if cur == id) {
+    /// A beacon reporting the *real* cursor position on the local screen
+    /// (capture pixels). Re-anchors the virtual cursor and updates the
+    /// wall-arm state; may fire a crossing when the cursor parks on a
+    /// wall mid-sweep.
+    fn on_local_beacon(&mut self, x: i32, y: i32) -> Vec<Action> {
+        // The beacon is the truth about where the visible cursor is.
+        self.cursor.x = self.local.x + x;
+        self.cursor.y = self.local.y + y;
+        let bits = wall_bits(&self.local, x, y);
+        let newly = bits & !self.at_wall;
+        self.at_wall = bits;
+        if bits == 0 {
+            // The real cursor is back inside: any wall-arm or push
+            // attempt was a transient overshoot, and it is over.
+            self.pushing = None;
             return vec![];
         }
-        let Some(screen) = self.layout.find(id) else { return vec![] };
-        self.remote_beacon = Some(RemoteBeacon { at: Instant::now() });
-        let vx = screen.rect.x + x;
-        let vy = screen.rect.y + y;
-        self.remote_at_edge = edge_direction(&screen.rect, vx, vy);
-        if self.remote_at_edge.is_none() {
-            self.remote_pushing_since = None;
+        // A beacon that parks the cursor on a wall the user is pushing
+        // against completes the crossing on the park itself — a fast
+        // sweep has no dead frame at the boundary, and a sweep that ends
+        // exactly at the wall still crosses. A beacon alone (resting at
+        // the edge) only arms: the next outward push fires.
+        for dir in DIRS {
+            if newly & bit(dir) != 0
+                && self
+                    .last_out
+                    .is_some_and(|p| p.dir == dir && p.at.elapsed() < EDGE_PUSH_FRESH)
+            {
+                let actions = self.switch_out(dir);
+                if !actions.is_empty() {
+                    return actions;
+                }
+                // Dead edge (no neighbor there): fall through, stay armed
+                // for the other directions if any.
+            }
         }
         vec![]
     }
 
-    /// Cursor is on the local screen and moving. If it leaves toward a
-    /// neighbor, switch.
-    fn handle_local_motion(&mut self) -> Vec<Action> {
+    /// Cursor is on the local screen and moving.
+    fn handle_local_motion(&mut self, dx: i32, dy: i32) -> Vec<Action> {
+        let now = Instant::now();
+
+        // Beacon-confirmed crossings. A delta pushing outward through a
+        // wall the *real* cursor sits on (a beacon armed it) IS the
+        // crossing intent — fire immediately: the OS has already pinned
+        // the cursor at the boundary, so the push cannot mean anything
+        // else. A delta moving away from a wall disarms it — the user is
+        // leaving the edge, and the next push must re-arm from a beacon
+        // (this is what makes the seam placement on entry never bounce).
+        for dir in DIRS {
+            if pushes_outward(dir, dx, dy) {
+                self.last_out = Some(Push { dir, at: now });
+                if self.at_wall & bit(dir) != 0 {
+                    let actions = self.switch_out(dir);
+                    if !actions.is_empty() {
+                        return actions;
+                    }
+                    // Dead edge: stop trying to cross here.
+                    self.at_wall &= !bit(dir);
+                }
+            } else if pulls_inward(dir, dx, dy) {
+                self.at_wall &= !bit(dir);
+            }
+        }
+
+        // Fallback for a stalled beacon stream (see the module docs). The
+        // virtual cursor must have actually crossed the rect — raw deltas
+        // ran past the edge — so an interior real cursor can never trip
+        // it, and the outward pushing must be sustained.
         let dir = match self.layout.exit_direction(0, self.cursor.x, self.cursor.y) {
             Some(d) => d,
             None => {
-                // Still inside the local screen: any earlier edge-push
-                // attempt was a transient overshoot and is over.
-                self.edge_pushing_since = None;
+                self.pushing = None;
                 return vec![];
             }
         };
-        // The virtual cursor left the local rect through `dir`. Raw
-        // deltas run *ahead* of the real cursor (they are
-        // pre-acceleration and the beacon that corrects them can lag
-        // under load), so switching on deltas alone is what made the
-        // cursor jump to a neighbor while merely approaching its edge.
-        // Cross only when the real cursor is confirmed parked on this
-        // edge (a beacon put it there and outward motion follows) — or,
-        // as a fallback for a beacon stream that stalls on a pinned
-        // cursor, after sustained outward pushing.
         let local = self.local;
         self.clamp_to(&local);
-        let confirmed = self.at_edge == Some(dir);
-        let sustained = self.edge_pushing_since.is_some_and(|t| t.elapsed() >= EDGE_PUSH_FALLBACK);
-        if !confirmed && !sustained {
-            self.edge_pushing_since.get_or_insert(Instant::now());
+        let sustained = self.pushing.is_some_and(|p| p.dir == dir && p.since.elapsed() >= EDGE_PUSH_FALLBACK);
+        if !sustained {
+            self.pushing = match self.pushing {
+                Some(p) if p.dir == dir => self.pushing,
+                _ => Some(Pushing { dir, since: now }),
+            };
             return vec![];
         }
+        self.pushing = None;
         self.switch_out(dir)
     }
 
     /// Leave the local screen through `dir`: switch to the neighbor in
-    /// that direction. Resets the edge/push state and snaps the virtual
+    /// that direction. Resets the boundary state and snaps the virtual
     /// cursor to the neighbor's entry point. Returns nothing on a dead
     /// edge (the cursor stays clamped).
     fn switch_out(&mut self, dir: Direction) -> Vec<Action> {
         match self.layout.neighbor(0, dir, self.cursor.x, self.cursor.y) {
             Some((id, x, y)) => {
-                self.at_edge = None;
-                self.edge_pushing_since = None;
                 self.enter_screen(id, x, y);
                 vec![Action::SwitchTo { to: id, x, y }]
             }
-            None => vec![], // dead edge: stay clamped
+            None => vec![], // dead edge: stay
         }
     }
 
@@ -383,69 +503,136 @@ impl Session {
     /// absolute positions made the client cursor crawl at speed). The
     /// client reports its real cursor position back as beacons
     /// ([`Session::on_remote_beacon`]) and those — not the raw virtual
-    /// position — drive edge crossings, because after acceleration the
-    /// raw deltas no longer equal real travel. Without fresh beacons
-    /// (stalled stream, old client) the virtual position is the
-    /// fallback. The hidden local cursor never moves while we are away.
+    /// position — arm edge crossings, because after acceleration the raw
+    /// deltas no longer equal real travel. The hidden local cursor never
+    /// moves while we are away.
     fn handle_remote_motion(&mut self, id: u8, dx: i32, dy: i32) -> Vec<Action> {
-        self.last_remote_delta = Instant::now();
-        let mut actions = Vec::with_capacity(2);
-        // Forward the raw motion so the client's pointer transform turns
-        // it into real travel.
-        actions.push(Action::Send(Message::MouseMoveRel { dx, dy }));
-
+        let now = Instant::now();
         let rect = match self.layout.find(id) {
             Some(s) => s.rect,
-            None => return actions, // layout changed under us
+            None => return vec![], // layout changed under us
         };
-        let (local_x, local_y) = self.cursor.local_pos(&rect);
-        if local_x >= 0 && local_x < rect.w && local_y >= 0 && local_y < rect.h {
-            return actions; // still inside
+
+        // Beacon-confirmed crossings, mirroring the local side. An
+        // outward push through a wall the client's *real* cursor sits on
+        // (a fresh beacon armed it) crosses back — immediately.
+        let fresh = self
+            .remote_beacon_at
+            .is_some_and(|t| now.duration_since(t) < REMOTE_BEACON_FRESH);
+        for dir in DIRS {
+            if pushes_outward(dir, dx, dy) {
+                self.remote_last_out = Some(Push { dir, at: now });
+                if fresh && self.remote_at_wall & bit(dir) != 0 {
+                    if self.layout.neighbor(id, dir, self.cursor.x, self.cursor.y).is_some() {
+                        return self.cross_from_remote(id, dir);
+                    }
+                    // Dead edge (outer wall of the desktop): stop trying.
+                    self.remote_at_wall &= !bit(dir);
+                }
+            } else if pulls_inward(dir, dx, dy) {
+                self.remote_at_wall &= !bit(dir);
+            }
         }
 
-        // The virtual cursor left this screen's rect. Which way?
+        // No confirmed crossing: forward the motion verbatim — the
+        // client's pointer transform turns it into real travel.
+        let actions = vec![Action::Send(Message::MouseMoveRel { dx, dy })];
+
+        // Stalled-stream fallback (see the module docs): only when the
+        // beacon stream is dead or absent — a fresh beacon means the real
+        // cursor is the authority and it has not armed this wall. The
+        // virtual cursor must be outside the rect (raw deltas ran past
+        // the edge) so an interior real cursor can never trip it.
         let dir = match self.layout.exit_direction(id, self.cursor.x, self.cursor.y) {
             Some(d) => d,
             None => {
-                self.clamp_to(&rect);
+                self.remote_pushing = None;
                 return actions;
             }
         };
         self.clamp_to(&rect);
-
-        let beacon_fresh = self
-            .remote_beacon
-            .as_ref()
-            .is_some_and(|b| b.at.elapsed() < REMOTE_BEACON_FRESH);
-        let pinned_here = self.remote_at_edge == Some(dir);
-        // While the beacon stream is fresh the *real* cursor is the
-        // authority: cross only when it is genuinely pinned on this edge
-        // (the client's OS parked it there) and the user keeps pushing.
-        // Deltas alone must not cross — after acceleration they run far
-        // ahead of the real cursor (the same trap as the local screen).
-        let confirmed = beacon_fresh && pinned_here;
-        // Fallback for a stalled beacon stream: sustained outward
-        // pushing on a virtual-exit eventually crosses (the OS has the
-        // real cursor pinned against the wall, so raw deltas keep
-        // flowing only while the user pushes).
-        let sustained = !beacon_fresh
+        let sustained = !fresh
             && self
-                .remote_pushing_since
-                .is_some_and(|t| t.elapsed() >= EDGE_PUSH_FALLBACK);
-        if !confirmed && !sustained {
-            self.remote_pushing_since.get_or_insert(Instant::now());
+                .remote_pushing
+                .is_some_and(|p| p.dir == dir && p.since.elapsed() >= EDGE_PUSH_FALLBACK);
+        if !sustained {
+            self.remote_pushing = match self.remote_pushing {
+                Some(p) if p.dir == dir => self.remote_pushing,
+                _ => Some(Pushing { dir, since: now }),
+            };
             return actions;
         }
-        self.cross_from_remote(id, dir)
+        self.remote_pushing = None;
+        match self.cross_from_remote(id, dir) {
+            actions if actions.is_empty() => {
+                // Dead edge after all (layout changed): keep the motion.
+                vec![Action::Send(Message::MouseMoveRel { dx, dy })]
+            }
+            actions => actions,
+        }
+    }
+
+    /// A client reported where its *real* cursor is (client-local
+    /// pixels). Runs from the client's connection thread while this
+    /// client is the active one; the session mutex serializes it with the
+    /// main loop's local-input processing.
+    ///
+    /// The real position is the ground truth on a remote screen (the
+    /// client's OS applied its own transform to our relative motion), so
+    /// it both re-anchors the virtual cursor and updates the wall-arm
+    /// state — mirroring the local-screen beacon exactly. When the beacon
+    /// *parks* the cursor on a wall mid-push, the crossing is returned
+    /// here so the caller can execute it on the spot (the client's
+    /// position stream is the only input that may not be followed by
+    /// another motion frame).
+    pub fn on_remote_beacon(&mut self, id: u8, x: i32, y: i32) -> Vec<Action> {
+        if !matches!(self.cursor.mode, Mode::Remote(cur) if cur == id) {
+            return vec![];
+        }
+        let Some(screen) = self.layout.find(id) else { return vec![] };
+        let now = Instant::now();
+        self.remote_beacon_at = Some(now);
+        // Clamp the report into the rect: the OS pins the cursor at the
+        // last pixel, but a report in flight can be a hair past it. The
+        // `.max(0)` keeps a degenerate zero-size rect from panicking.
+        let x = x.clamp(0, (screen.rect.w - 1).max(0));
+        let y = y.clamp(0, (screen.rect.h - 1).max(0));
+        // Re-anchor the virtual cursor to the real position so the
+        // stalled-stream fallback starts from reality, not from raw
+        // deltas that acceleration ran far ahead of.
+        self.cursor.x = screen.rect.x + x;
+        self.cursor.y = screen.rect.y + y;
+        let bits = wall_bits(&screen.rect, x, y);
+        let newly = bits & !self.remote_at_wall;
+        self.remote_at_wall = bits;
+        if bits == 0 {
+            // The client's real cursor is back inside its screen: any
+            // edge-push attempt was a transient overshoot.
+            self.remote_pushing = None;
+            return vec![];
+        }
+        // A beacon parking the real cursor on a wall mid-push crosses on
+        // the park itself — mirror [`Session::on_local_beacon`]. The
+        // caller (the client's connection thread) executes the actions.
+        for dir in DIRS {
+            if newly & bit(dir) != 0
+                && self
+                    .remote_last_out
+                    .is_some_and(|p| p.dir == dir && p.at.elapsed() < EDGE_PUSH_FRESH)
+            {
+                let actions = self.cross_from_remote(id, dir);
+                if !actions.is_empty() {
+                    return actions;
+                }
+            }
+        }
+        vec![]
     }
 
     /// Switch away from the remote screen `id` through `dir` (back home
-    /// or on to another client). Resets the remote beacon/push state and
+    /// or on to another client). Resets the remote boundary state and
     /// snaps the virtual cursor to the destination's entry point.
     fn cross_from_remote(&mut self, id: u8, dir: Direction) -> Vec<Action> {
-        self.remote_beacon = None;
-        self.remote_at_edge = None;
-        self.remote_pushing_since = None;
         match self.layout.neighbor(id, dir, self.cursor.x, self.cursor.y) {
             Some((next, x, y)) => {
                 self.enter_screen(next, x, y);
@@ -460,17 +647,28 @@ impl Session {
     }
 
     /// Snap the virtual cursor to the entry point of screen `id` (local
-    /// coords `x, y`) and set the mode.
+    /// coords `x, y`), set the mode, and clear every boundary latch — the
+    /// cursor has just arrived on a new screen, and any arm from the old
+    /// one is meaningless. The destination's own wall/beacon stream
+    /// re-arms from scratch.
     fn enter_screen(&mut self, id: u8, x: i32, y: i32) {
         let s = self.layout.find(id).expect("entry screen must exist");
         self.cursor.x = s.rect.x + x;
         self.cursor.y = s.rect.y + y;
         self.cursor.mode = if id == 0 { Mode::Local } else { Mode::Remote(id) };
-        self.at_edge = None;
-        self.edge_pushing_since = None;
-        self.remote_beacon = None;
-        self.remote_at_edge = None;
-        self.remote_pushing_since = None;
+        self.clear_boundary_state();
+    }
+
+    /// Reset every boundary latch (used on entry, layout swaps and
+    /// forced returns home).
+    fn clear_boundary_state(&mut self) {
+        self.at_wall = 0;
+        self.last_out = None;
+        self.pushing = None;
+        self.remote_at_wall = 0;
+        self.remote_beacon_at = None;
+        self.remote_last_out = None;
+        self.remote_pushing = None;
     }
 
     /// Clamp the virtual cursor inside `rect` (in virtual coords).
@@ -495,29 +693,13 @@ impl Session {
     }
 }
 
-impl Cursor {
-    /// Convert a virtual position to `rect`'s local coordinates.
-    fn local_pos(&self, rect: &Rect) -> (i32, i32) {
-        (self.x - rect.x, self.y - rect.y)
-    }
-}
-
-/// Which screen edge a position sits exactly on, if any. The OS pins the
-/// pointer at the outer pixel column/row (`left`/`right - 1`), so those
-/// are the edges. Precedence mirrors [`Layout::exit_direction`]
-/// (left, right, top, bottom) so a corner is treated consistently.
-fn edge_direction(rect: &Rect, x: i32, y: i32) -> Option<Direction> {
-    if x <= rect.left() {
-        Some(Direction::Left)
-    } else if x >= rect.right() - 1 {
-        Some(Direction::Right)
-    } else if y <= rect.top() {
-        Some(Direction::Top)
-    } else if y >= rect.bottom() - 1 {
-        Some(Direction::Bottom)
-    } else {
-        None
-    }
+/// The cursor model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    /// Virtual position.
+    x: i32,
+    y: i32,
+    mode: Mode,
 }
 
 #[cfg(test)]
@@ -534,11 +716,24 @@ mod tests {
     }
 
     /// Cross from the local screen onto hp (left of pc) the way it
-    /// really happens: the beacon parks the real cursor at the shared
-    /// edge, then an outward push confirms the intent.
+    /// really happens: a beacon arms the left wall (the real cursor
+    /// reached it), then an outward push fires the crossing.
     fn cross_to_hp(s: &mut Session) {
         s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 });
         s.on_local_event(Message::MouseMoveRel { dx: -1, dy: 0 });
+        assert_eq!(s.mode(), Mode::Remote(1));
+    }
+
+    /// Assert the only action is a switch to hp at its right edge.
+    fn assert_switch_to_hp(actions: &[Action], y: i32) {
+        match actions {
+            [Action::SwitchTo { to, x, y: ay }] => {
+                assert_eq!(*to, 1);
+                assert_eq!(*x, 1919); // hp's right edge, local coords
+                assert_eq!(*ay, y);
+            }
+            other => panic!("expected SwitchTo to hp, got {other:?}"),
+        }
     }
 
     #[test]
@@ -569,21 +764,100 @@ mod tests {
     #[test]
     fn crossing_left_edge_switches_to_hp() {
         let mut s = two_screens();
-        // The real cursor parks at the left edge (beacon), then an
-        // outward push crosses.
+        // The real cursor reaches the left wall (beacon arms it), then an
+        // outward push fires the crossing.
         s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 });
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -10, dy: 0 });
-        match actions.as_slice() {
-            [Action::SwitchTo { to, x, y }] => {
-                assert_eq!(*to, 1);
-                assert_eq!(*x, 1919); // hp's right edge, local coords
-                assert_eq!(*y, 540);
-            }
-            other => panic!("expected SwitchTo, got {other:?}"),
-        }
+        assert_switch_to_hp(&actions, 540);
         assert_eq!(s.mode(), Mode::Remote(1));
         // Virtual position was snapped to hp's entry point (-1, 540).
         assert_eq!(s.cursor_pos(), (-1, 540));
+    }
+
+    #[test]
+    fn interior_beacon_never_arms_and_pushes_do_not_cross() {
+        // The real cursor is mid-screen: even a hard outward push (raw
+        // deltas run ahead of the visible cursor) must not cross until a
+        // beacon puts the real cursor on the wall.
+        let mut s = two_screens();
+        s.on_local_event(Message::MouseMoveAbs { x: 500, y: 540 });
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 });
+        assert_eq!(actions, vec![]);
+        assert_eq!(s.mode(), Mode::Local, "interior real cursor must never cross");
+        assert_eq!(s.cursor_pos(), (0, 540)); // virtual clamped at the wall
+    }
+
+    #[test]
+    fn beacon_park_mid_push_crosses_on_the_park_itself() {
+        // A fast sweep: raw deltas race to the wall while the real cursor
+        // is still travelling. The beacon that parks it there arrives
+        // mid-push and must complete the crossing *on the park* — no
+        // waiting for the next delta, no dead frame at the boundary.
+        let mut s = two_screens();
+        assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }), vec![]);
+        assert_eq!(s.mode(), Mode::Local);
+        let actions = s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 });
+        assert_switch_to_hp(&actions, 540);
+        assert_eq!(s.mode(), Mode::Remote(1));
+    }
+
+    #[test]
+    fn beacon_park_after_push_went_stale_only_arms() {
+        // A flick ends with the cursor at the wall, then the user stops
+        // and waits: the push is no longer fresh when the park beacon
+        // arrives, so it must only arm — resting at the edge never
+        // crosses. A later outward push fires.
+        let mut s = two_screens();
+        assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }), vec![]);
+        std::thread::sleep(EDGE_PUSH_FRESH + Duration::from_millis(20));
+        assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 }), vec![]);
+        assert_eq!(s.mode(), Mode::Local, "resting at the wall must not cross");
+        // A fresh push while parked crosses immediately (confirmed by the
+        // beacon).
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -5, dy: 0 });
+        assert_switch_to_hp(&actions, 540);
+        assert_eq!(s.mode(), Mode::Remote(1));
+    }
+
+    #[test]
+    fn inward_motion_disarms_the_wall() {
+        // The cursor parks on the left wall (armed), then the user moves
+        // back inside: the wall must disarm, so a later outward push
+        // cannot fire until a beacon re-arms it (this is the hysteresis
+        // that keeps the seam placement from bouncing).
+        let mut s = two_screens();
+        s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 }); // arm left
+        // Move away from the wall — the real cursor leaves it.
+        s.on_local_event(Message::MouseMoveRel { dx: 5, dy: 0 }); // inward: disarm
+        // An outward push without a fresh wall beacon must not cross.
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -1, dy: 0 });
+        assert_eq!(actions, vec![]);
+        assert_eq!(s.mode(), Mode::Local);
+        // The real cursor confirms it is back inside.
+        s.on_local_event(Message::MouseMoveAbs { x: 100, y: 540 });
+        // Let the push record go stale so the next park beacon only arms
+        // (a beacon parks the wall mid-push would fire on the park).
+        std::thread::sleep(EDGE_PUSH_FRESH + Duration::from_millis(20));
+        // The real cursor reaches the wall again: the beacon arms it, and
+        // only then does an outward push cross.
+        s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 });
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -1, dy: 0 });
+        assert_switch_to_hp(&actions, 540);
+    }
+
+    #[test]
+    fn sliding_along_the_wall_does_not_cross() {
+        // The cursor is pinned on the left wall and slides vertically
+        // (aiming at something near the edge). Vertical motion is not an
+        // outward push through the left wall, so it must never fire.
+        let mut s = two_screens();
+        s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 });
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: 0, dy: -200 });
+        assert_eq!(actions, vec![]);
+        assert_eq!(s.mode(), Mode::Local);
+        // Only a genuine outward push crosses.
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -1, dy: 0 });
+        assert_switch_to_hp(&actions, 340);
     }
 
     #[test]
@@ -603,32 +877,69 @@ mod tests {
     fn crossing_back_returns_to_local() {
         let mut s = two_screens();
         cross_to_hp(&mut s); // to hp, virtual (-1, 540) = hp's right edge
-        // The client's real cursor sits where control placed it: pinned
-        // on hp's right edge (the shared edge with pc).
+        // The client's real cursor sits where control placed it: on hp's
+        // right wall (the shared edge with pc). The beacon arms it.
         assert_eq!(s.on_remote_beacon(1, 1919, 540), vec![]);
-        // A push right while the real cursor is pinned on that edge
-        // crosses home.
+        // A push right while the real cursor is on that wall crosses
+        // home.
         let actions = s.on_local_event(Message::MouseMoveRel { dx: 1, dy: 0 });
         assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
     }
 
     #[test]
-    fn crossing_home_requires_the_real_cursor_at_the_edge() {
+    fn crossing_home_requires_the_real_cursor_at_the_wall() {
         // Deltas alone must never cross back home: after acceleration the
         // raw deltas run far ahead of the client's real cursor. While the
         // real cursor is still interior, an outward overshoot only
-        // clamps.
+        // forwards motion.
         let mut s = two_screens();
         cross_to_hp(&mut s);
         assert_eq!(s.on_remote_beacon(1, 900, 540), vec![]); // real cursor mid-screen
         let actions = s.on_local_event(Message::MouseMoveRel { dx: 5, dy: 0 });
         assert_eq!(actions, vec![Action::Send(Message::MouseMoveRel { dx: 5, dy: 0 })]);
         assert_eq!(s.mode(), Mode::Remote(1), "overshoot while interior must not cross");
-        // Only once the client reports its real cursor pinned on the
-        // shared edge does a push cross.
-        assert_eq!(s.on_remote_beacon(1, 1919, 540), vec![]);
+        // Only once the client reports its real cursor on the shared wall
+        // does the crossing happen — and with the push still fresh it
+        // fires on the park itself (no dead frame at the boundary).
+        let actions = s.on_remote_beacon(1, 1919, 540);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(s.mode(), Mode::Local);
+    }
+
+    #[test]
+    fn remote_inward_motion_disarms_the_wall() {
+        // After entering hp the cursor sits on the seam (hp's right
+        // wall). Moving *into* hp disarms it, so a stray outward jitter
+        // cannot bounce control straight back home.
+        let mut s = two_screens();
+        cross_to_hp(&mut s);
+        s.on_remote_beacon(1, 1919, 540); // arm the seam wall
+        s.on_local_event(Message::MouseMoveRel { dx: -1, dy: 0 }); // into hp: disarm
         let actions = s.on_local_event(Message::MouseMoveRel { dx: 1, dy: 0 });
+        assert_eq!(actions, vec![Action::Send(Message::MouseMoveRel { dx: 1, dy: 0 })]);
+        assert_eq!(s.mode(), Mode::Remote(1), "disarmed wall must not fire");
+        // The real cursor must reach the wall again; with the push still
+        // fresh, the park itself completes the crossing home.
+        let actions = s.on_remote_beacon(1, 1919, 540);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(s.mode(), Mode::Local);
+    }
+
+    #[test]
+    fn remote_beacon_park_mid_push_crosses_on_the_park() {
+        // The user sweeps right across hp toward home and the beacon
+        // parks the real cursor on the shared wall mid-push: the crossing
+        // fires on the park itself (the actions are returned to the
+        // client thread to execute), no dead frame at the boundary.
+        let mut s = two_screens();
+        cross_to_hp(&mut s);
+        // A hard outward push races the virtual cursor out of hp.
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: 2000, dy: 0 });
+        assert_eq!(actions, vec![Action::Send(Message::MouseMoveRel { dx: 2000, dy: 0 })]);
+        assert_eq!(s.mode(), Mode::Remote(1));
+        // The beacon parks the real cursor on the wall mid-push: cross now.
+        let actions = s.on_remote_beacon(1, 1919, 540);
         assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
     }
@@ -652,11 +963,12 @@ mod tests {
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -3000, dy: 0 });
         assert_eq!(actions, vec![Action::Send(Message::MouseMoveRel { dx: -3000, dy: 0 })]);
         assert_eq!(s.mode(), Mode::Remote(1));
-        // Even with the real cursor pinned on that outer edge and a
-        // fresh push, there is nowhere to go: stay on hp.
+        // Even with the real cursor pinned on that outer wall and a
+        // fresh push, there is nowhere to go: motion forwards, hp keeps
+        // control.
         assert_eq!(s.on_remote_beacon(1, 0, 540), vec![]);
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -5, dy: 0 });
-        assert_eq!(actions, vec![]);
+        assert_eq!(actions, vec![Action::Send(Message::MouseMoveRel { dx: -5, dy: 0 })]);
         assert_eq!(s.mode(), Mode::Remote(1));
     }
 
@@ -697,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_to_remote_switch_keeps_park() {
+    fn remote_to_remote_switch_fires_on_the_park() {
         let layout = Layout::new(vec![
             Screen { id: 0, name: "pc".into(), rect: Rect { x: 0, y: 0, w: 1920, h: 1080 } },
             Screen { id: 1, name: "hp".into(), rect: Rect { x: -1920, y: 0, w: 1920, h: 1080 } },
@@ -706,15 +1018,15 @@ mod tests {
         let mut s = Session::new(layout, 0);
         // pc -> hp
         cross_to_hp(&mut s);
-        // Swoop across hp to its left edge (raw deltas overshoot the
+        // Swoop across hp toward its left wall (raw deltas overshoot the
         // rect; no beacon has confirmed the real cursor there yet).
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 });
         assert_eq!(actions, vec![Action::Send(Message::MouseMoveRel { dx: -2000, dy: 0 })]);
         assert_eq!(s.mode(), Mode::Remote(1), "overshoot alone must not switch");
-        // The client reports its real cursor pinned on hp's left edge,
-        // then the push continues: switch on to mac.
-        assert_eq!(s.on_remote_beacon(1, 0, 540), vec![]);
-        let actions = s.on_local_event(Message::MouseMoveRel { dx: -1, dy: 0 });
+        // The client reports its real cursor parked on hp's left wall
+        // while the sweep is still pushing: switch on to mac, on the
+        // park itself.
+        let actions = s.on_remote_beacon(1, 0, 540);
         match actions.as_slice() {
             [Action::SwitchTo { to, x, y }] => {
                 assert_eq!(*to, 2);
@@ -799,27 +1111,6 @@ mod tests {
     }
 
     #[test]
-    fn beacon_crosses_when_pinned_at_the_wall() {
-        let mut s = two_screens();
-        // The OS clamps the real pointer at the left screen edge: the
-        // last beacon says x=0, and the raw deltas of the continued
-        // outward push arrive anyway, so the virtual cursor crosses the
-        // boundary — the switch fires exactly when the cursor is visibly
-        // jammed against the edge.
-        assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 }), vec![]);
-        let actions = s.on_local_event(Message::MouseMoveRel { dx: -5, dy: 0 });
-        match actions.as_slice() {
-            [Action::SwitchTo { to, x, y, .. }] => {
-                assert_eq!(*to, 1);
-                assert_eq!(*x, 1919); // hp's right edge
-                assert_eq!(*y, 540);
-            }
-            other => panic!("expected SwitchTo, got {other:?}"),
-        }
-        assert_eq!(s.mode(), Mode::Remote(1));
-    }
-
-    #[test]
     fn deltas_alone_never_jump_to_a_neighbor() {
         // The bug this guards against: raw deltas run ahead of the real
         // cursor (they are pre-acceleration and the beacon can lag under
@@ -830,8 +1121,8 @@ mod tests {
         let mut s = two_screens();
         assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }), vec![]);
         assert_eq!(s.mode(), Mode::Local, "overshoot alone must not switch");
-        // The virtual cursor was clamped at the edge; a beacon showing
-        // the real cursor back inside confirms it was an overshoot.
+        // A beacon showing the real cursor back inside confirms it was an
+        // overshoot.
         assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 300, y: 540 }), vec![]);
         assert_eq!(s.cursor_pos(), (300, 540));
         // Continuing from there stays local.
@@ -840,57 +1131,13 @@ mod tests {
     }
 
     #[test]
-    fn beacon_park_crosses_immediately_during_a_fresh_push() {
-        let mut s = two_screens();
-        // A fast approach overshoots the boundary via raw deltas (no
-        // beacon has confirmed anything yet — the cursor may still be
-        // mid-screen).
-        assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }), vec![]);
-        assert_eq!(s.mode(), Mode::Local);
-        // The beacon then reports the real cursor parked on the shared
-        // edge while the user is still pushing: the crossing must fire
-        // on the park itself — not on a later delta — so a fast crossing
-        // has no dead frame at the boundary.
-        let actions = s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 });
-        match actions.as_slice() {
-            [Action::SwitchTo { to, x, y, .. }] => {
-                assert_eq!(*to, 1);
-                assert_eq!(*x, 1919); // hp's right edge, local coords
-                assert_eq!(*y, 540);
-            }
-            other => panic!("expected immediate SwitchTo on park-during-push, got {other:?}"),
-        }
-        assert_eq!(s.mode(), Mode::Remote(1));
-    }
-
-    #[test]
-    fn resting_at_the_edge_never_crosses_without_a_fresh_push() {
-        let mut s = two_screens();
-        // A flick ends with the cursor pushed against the left edge, then
-        // the user stops: the outward deltas are no longer fresh.
-        assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }), vec![]);
-        std::thread::sleep(EDGE_PUSH_FRESH + Duration::from_millis(20));
-        // A beacon shows the real cursor parked on the edge, but nothing
-        // has pushed outward recently: resting there must not cross.
-        assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 }), vec![]);
-        assert_eq!(s.mode(), Mode::Local);
-        // A fresh push while parked crosses immediately (confirmed by the
-        // beacon).
-        let actions = s.on_local_event(Message::MouseMoveRel { dx: -5, dy: 0 });
-        match actions.as_slice() {
-            [Action::SwitchTo { to, .. }] => assert_eq!(*to, 1),
-            other => panic!("expected SwitchTo after a fresh push at the parked edge, got {other:?}"),
-        }
-        assert_eq!(s.mode(), Mode::Remote(1));
-    }
-
-    #[test]
     fn sustained_push_crosses_when_the_beacon_stream_stalls() {
         // A stalled beacon stream: the OS has pinned the pointer at the
-        // edge, motion events (and with them beacons) stop, and only raw
-        // deltas keep flowing. Without a beacon the first push cannot be
-        // confirmed — but sustained pushing must still cross, or the
-        // cursor would stick at the edge forever.
+        // edge, position events (and with them beacons) stop, and only
+        // raw deltas keep flowing. Without a beacon the first push cannot
+        // be confirmed — but sustained pushing past the fallback window
+        // (with the virtual cursor outside the rect) must still cross, or
+        // the cursor would stick at the edge forever.
         let mut s = two_screens();
         // The push reaches the edge and stays there (unconfirmed, no
         // switch yet).
@@ -899,10 +1146,7 @@ mod tests {
         // Wait out the fallback window, then keep pushing.
         std::thread::sleep(EDGE_PUSH_FALLBACK + Duration::from_millis(20));
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -5, dy: 0 });
-        match actions.as_slice() {
-            [Action::SwitchTo { to, .. }] => assert_eq!(*to, 1),
-            other => panic!("expected SwitchTo after sustained push, got {other:?}"),
-        }
+        assert_switch_to_hp(&actions, 540);
         assert_eq!(s.mode(), Mode::Remote(1));
     }
 
@@ -948,6 +1192,20 @@ mod tests {
     }
 
     #[test]
+    fn remote_beacon_resyncs_the_virtual_cursor() {
+        // The client's real cursor (post-acceleration) is the ground
+        // truth on its screen. A beacon must re-anchor the virtual cursor
+        // so the stalled-stream fallback and entry math start from
+        // reality instead of raw deltas that acceleration ran ahead of.
+        let mut s = two_screens();
+        cross_to_hp(&mut s); // virtual (-1, 540)
+        // The client reports its real cursor mid-screen (our raw deltas
+        // had overshot): snap to reality.
+        s.on_remote_beacon(1, 900, 200);
+        assert_eq!(s.cursor_pos(), (-1020, 200));
+    }
+
+    #[test]
     fn swap_layout_rejects_missing_local_screen() {
         let mut s = two_screens();
         cross_to_hp(&mut s); // on hp
@@ -960,5 +1218,37 @@ mod tests {
         assert_eq!(actions, vec![]);
         assert_eq!(s.mode(), Mode::Remote(1), "bad layout must not disturb the session");
         assert_eq!(s.layout().screens.len(), 2);
+    }
+
+    #[test]
+    fn wall_bits_marks_the_outer_band_only() {
+        let rect = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+        assert_eq!(wall_bits(&rect, 0, 540), BIT_LEFT);
+        assert_eq!(wall_bits(&rect, 1, 540), BIT_LEFT); // band slack
+        assert_eq!(wall_bits(&rect, 2, 540), 0);
+        assert_eq!(wall_bits(&rect, 1918, 540), BIT_RIGHT);
+        assert_eq!(wall_bits(&rect, 1919, 540), BIT_RIGHT);
+        assert_eq!(wall_bits(&rect, 1919, 0), BIT_RIGHT | BIT_TOP); // corner
+        assert_eq!(wall_bits(&rect, 960, 540), 0);
+    }
+
+    #[test]
+    fn crossing_roundtrip_back_and_forth_is_crisp() {
+        // Rapid back-and-forth at the boundary: each direction must cross
+        // on a beacon-arm plus one push — no fallback timers in the
+        // common path.
+        let mut s = two_screens();
+        // pc -> hp
+        cross_to_hp(&mut s);
+        // hp -> pc
+        assert_eq!(s.on_remote_beacon(1, 1919, 540), vec![]);
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: 2, dy: 0 });
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(s.mode(), Mode::Local);
+        // pc -> hp again, immediately.
+        assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 }), vec![]);
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -2, dy: 0 });
+        assert_switch_to_hp(&actions, 540);
+        assert_eq!(s.mode(), Mode::Remote(1));
     }
 }

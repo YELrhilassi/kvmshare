@@ -18,7 +18,7 @@ kvmshare/
 ├── crates/
 │   ├── protocol/   # binary wire protocol: framing, messages, (de)serialization
 │   ├── log/        # leveled, hot-reloadable logging shared by every crate
-│   ├── core/       # layout model, cursor/screen-switching session, TCP server/client
+│   ├── core/       # layout model, cursor/screen-switching session, server/client (UDP cursor stream + TCP control)
 │   ├── platform/   # OS backends: Linux/X11 (XI2 raw input, XFixes, XTest) + Windows (Raw Input, SendInput)
 │   └── app/        # the kvmshare-server and kvmshare-client executables
 ├── gui/            # Wails v3 desktop app: React + shadcn/ui, 5 pages
@@ -188,10 +188,12 @@ make test   # cargo test --workspace + go test ./gui
 ```
 
 Rust covers the protocol round-trips, the layout/adjacency math, the
-entire switching session (parked hidden cursor, escape key, live layout
-swaps), role-lock exclusivity, and real end-to-end tests:
-server + client over TCP with mock input, a recording injector and a
-config hot-reload. The Go suite covers config round-trips, settings
+entire switching session (wall-band crossings, parked hidden cursor,
+escape key, live layout swaps), the dual-transport link (UDP cursor
+stream + TCP control, pacing and dedup), role-lock exclusivity, and
+real end-to-end tests: server + client over the real transports with
+mock input, a recording injector and a config hot-reload. The Go suite
+covers config round-trips, settings
 persistence, process start/stop + role exclusivity, instance locking,
 network listing and log tailing.
 

@@ -51,14 +51,35 @@ desktop. When the cursor crosses an edge, it is snapped exactly to the
 destination screen's entry point, so absolute positions and `Enter`
 always agree — no off-by-one drift accumulates over hours of use.
 
-**3. The hidden server cursor is parked and stays put.** While the user
+**3. Crossings are armed by the *real* cursor and fired by a push.**
+Two streams feed the session: raw deltas (instant but pre-acceleration)
+and real-position beacons (a few ms behind, but the ground truth). A
+crossing needs **both**: a beacon must place the visible cursor within a
+thin wall-band of a screen edge (the OS has *pinned* it there — the
+cursor is committed to the boundary), and an outward push must follow
+(at the wall, outward deltas can only mean "cross"). This is symmetric
+in both directions, needs no point-exact edge math and no timeouts in
+the common path:
+
+- deltas alone never cross (they run ahead of the visible cursor),
+  resting at a wall never crosses, and moving away from a wall disarms
+  it — so the entry placement on a neighbor never bounces control back;
+- a beacon that parks the cursor on a wall mid-push fires the crossing
+  **on the park itself**, so a fast sweep has no dead frame at the
+  boundary and a flick that ends exactly at the wall still crosses;
+- a stalled beacon stream (a platform whose position events stop while
+  the pointer is pinned, a wedged client) falls back to sustained
+  outward pushing past a long window, with the virtual cursor actually
+  outside the rect — the rescue path, never the common one.
+
+**4. The hidden server cursor is parked and stays put.** While the user
 is on a client, the server's own cursor is hidden and parked at its
 screen center — and never moves again until control returns. Moving a
 hidden cursor would sweep hover/enter effects across every local window
 it crossed (pc elements visibly reacting while the user works on a
 client), so the session never emits warps while remote. The virtual
-cursor is driven entirely by raw input, which does not depend on the
-physical cursor's position at all.
+cursor is driven entirely by raw input and beacons, which do not depend
+on the physical cursor's position at all.
 
 ## Keys: one identity across every OS
 
@@ -90,22 +111,60 @@ backend uses the same table as X11.
 - Big-endian integers, length-prefixed UTF-8 strings.
 - The 4-byte magic lets a receiver detect desync and resynchronize by
   scanning, instead of hanging on garbage.
-- The hot path (mouse move) is one ~16-byte frame; TCP_NODELAY keeps it
-  on the wire immediately.
 - `Message::decode` is strict (trailing bytes are an error), which catches
   encode/decode bugs at the source.
 
+## The transport: UDP for the cursor, TCP for everything else
+
+Most of a KVM link is **relative mouse motion** (server → client) and
+**real-cursor beacons** (client → server). Both are additive and
+loss-tolerant: a dropped delta means the cursor travels a few pixels
+less on that frame and the next frame continues from wherever it is —
+there is nothing to retransmit. They ride **UDP** on the same port as
+the control channel, wrapped in a tiny envelope:
+
+```text
+[ client id: u8 ] [ seq: u32 BE ] [ frame bytes ]
+```
+
+The client id routes a datagram to the right peer; the sequence number
+lets the receiver drop stale and duplicate datagrams, so a replayed
+"at the wall" beacon can never arm a crossing the user did not push
+for. Reordering an additive stream is harmless — older traffic the
+cursor already moved past is simply dropped, exactly like loss.
+
+**TCP carries everything that must be reliable and ordered**: handshake,
+Enter/Leave, buttons, keys, wheel, clipboard, layout, keepalive.
+Because the high-rate stream is UDP, the cursor's latency is never
+coupled to the reliable channel's buffering or a busy peer's
+backpressure — the failure mode that turned smooth motion into clumps
+and stalls under load in earlier designs.
+
 ## The transport and threading model
 
-- **Server:** one accept thread; each client gets a service thread with
-  its own **lock-free reader** (`Transport::reader` clones the socket —
-  TCP is full-duplex, so reads never contend with the main thread's
-  writes). The main loop drains local input events and executes session
-  actions. The engine is behind a mutex that is taken *per event*, so
-  client threads (clipboard) and the GUI's poller can reach it.
-- **Client:** a single loop with a 100 ms read timeout, which lets it
-  drain the outbox, notice resolution changes, poll the clipboard up, and
-  send keepalives while idle.
+- **Server:** one accept thread; each client gets a **writer thread**
+  that owns both sockets (the TCP transport and, through the shared UDP
+  socket, that client's datagram address) and drains a per-client
+  outbound queue. Everything the session says goes into the queue — the
+  main input loop therefore *never blocks on the network*; a wedged
+  client delays its own frames, never the input path. Each client also
+  gets a service thread with its own **lock-free reader**
+  (`Transport::reader` clones the socket — TCP is full-duplex, so reads
+  never contend with the writer). A single **UDP receiver thread**
+  learns each client's address from its first datagram, routes beacons
+  to the session (dropping stale frames), and executes any crossing a
+  beacon fires. The engine is behind a mutex that is taken *per event*,
+  so client threads (clipboard) and the GUI's poller can reach it.
+- **Client:** a single loop. The UDP socket is drained non-blocking
+  every iteration and motion frames are replayed through a pacing
+  accumulator ([`core::motion::PacedFrames`]) at the fixed cadence, so
+  a network clump never turns into a cursor jump and the client OS's
+  pointer transform sees the same per-frame deltas the server produced.
+  Ordering-critical control frames (a click, a key, control leaving)
+  flush any paced motion first, so they land after the motion that
+  preceded them. The TCP read timeout is one motion period while pacing
+  or being controlled, and 100 ms while idle (draining the outbox,
+  noticing resolution changes, polling the clipboard, keepalives).
 - **Framing in the transport:** a full frame is decoded per call and
   trailing bytes are *retained* — several frames often share one TCP
   segment, and dropping the remainder silently loses messages (a real bug

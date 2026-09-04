@@ -44,6 +44,13 @@ impl Transport {
         Ok(Self { stream, read_buf: Vec::with_capacity(4096) })
     }
 
+    /// Change the read timeout (used by the client to wake at a finer
+    /// cadence while it is pacing motion or being controlled, so buffered
+    /// motion and periodic duties are never delayed by a long block).
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
     /// A **read-only** handle sharing this connection's socket, with its
     /// own read buffer.
     ///

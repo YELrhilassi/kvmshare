@@ -1,21 +1,33 @@
 //! The client side.
 //!
-//! Connects to a server, introduces itself with a [`Message::Hello`], and
-//! then applies every incoming message to the local machine through the
-//! [`Injector`] trait. All OS-specific work (moving the real cursor,
-//! injecting keys, touching the clipboard) lives behind that trait; this
-//! module is plain message dispatch and can be tested with a fake
-//! injector.
+//! Connects to a server over **two links** (see [`crate::server`]):
+//!
+//! * **TCP** — the reliable control channel: handshake, Enter/Leave,
+//!   buttons, keys, wheel, clipboard, layout, keepalive.
+//! * **UDP** — the cursor stream: relative motion in, real-cursor
+//!   beacons out. Additive and loss-tolerant, so the cursor's latency is
+//!   never coupled to the reliable stream's buffering.
+//!
+//! Motion frames arrive over UDP in clumps (bursts, scheduling jitter).
+//! Injecting each as it lands makes the visible cursor jump in
+//! syncopation with the wire, so frames are replayed through
+//! [`PacedFrames`] at the fixed cadence — smooth under load, honest to
+//! the client OS's pointer acceleration. All OS-specific work (moving the
+//! real cursor, injecting keys, touching the clipboard) lives behind the
+//! [`Injector`] trait; this module is plain message dispatch and can be
+//! tested with a fake injector.
 
 use std::io;
-use std::net::TcpStream;
+use std::net::{TcpStream, UdpSocket};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use kvmshare_log::{log_debug, log_trace, log_warn};
 use kvmshare_protocol::message::{KeyKind, Layout, Message, ScreenInfo};
 
+use crate::motion::{PacedFrames, MOTION_PERIOD};
 use crate::transport::{RecvResult, Transport};
+use crate::udp;
 
 /// The platform hook the client calls to affect the local machine.
 ///
@@ -71,11 +83,12 @@ pub trait Injector: Send {
     }
 }
 
-
-
 /// How often the client sends a keepalive when idle.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-/// How long the read can block before the loop checks the outbox again.
+/// How long the TCP read can block while idle (nothing being paced, not
+/// controlled). While the client is pacing motion or being controlled the
+/// timeout drops to one motion period, so buffered motion and periodic
+/// duties are never delayed by a long block.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// How often the client polls its local clipboard to push changes up.
 const CLIPBOARD_INTERVAL: Duration = Duration::from_millis(500);
@@ -88,13 +101,21 @@ const BLOCK_CHECK_INTERVAL: Duration = Duration::from_millis(150);
 /// edge decisions on these (the client's OS applies its own pointer
 /// acceleration to relative motion, so the reported position is the only
 /// ground truth) — a tight cadence keeps crossings exact without
-/// flooding the wire.
+/// flooding the wire. Beacons ride UDP; a lost one is replaced by the
+/// next, which is fine — the stream is a continuous sample, not a
+/// command.
 const CURSOR_BEACON_INTERVAL: Duration = Duration::from_millis(8);
 
 /// A connected client.
 #[derive(Debug)]
 pub struct Client {
     transport: Transport,
+    /// The UDP cursor stream: relative motion in, beacons out. Connected
+    /// to the server's address; the first datagram sent is the
+    /// registration that teaches the server where to route motion.
+    udp: UdpSocket,
+    /// Sequence for outgoing beacon datagrams (registration used 0).
+    udp_seq: u32,
     /// The id this machine has in the server's layout.
     own_id: u8,
     /// The full layout as last sent by the server (includes the server's
@@ -106,13 +127,14 @@ pub struct Client {
 
 impl Client {
     /// Connect to `addr`, say hello with `name`, and wait for the server's
-    /// welcome. Returns the client ready to run.
+    /// welcome. Opens the UDP cursor stream and registers it with the
+    /// server. Returns the client ready to run.
     pub fn connect(addr: &str, name: &str, info: ScreenInfo) -> io::Result<Self> {
         let stream = TcpStream::connect(addr)?;
         let mut transport = Transport::with_read_timeout(stream, Some(READ_TIMEOUT))?;
         transport.send(&Message::Hello { version: kvmshare_protocol::VERSION, name: name.to_owned(), info })?;
 
-        match transport.recv()? {
+        let (own_id, layout) = match transport.recv()? {
             RecvResult::Msg(Message::Welcome { server_version, layout, own_screen_id }) => {
                 if server_version != kvmshare_protocol::VERSION {
                     return Err(io::Error::other(format!(
@@ -120,13 +142,24 @@ impl Client {
                         kvmshare_protocol::VERSION
                     )));
                 }
-                Ok(Self { transport, own_id: own_screen_id, layout })
+                (own_screen_id, layout)
             }
             RecvResult::Msg(Message::Error { code, text }) => Err(io::Error::other(format!(
                 "server rejected the connection ({code}): {text}"
-            ))),
-            other => Err(io::Error::other(format!("unexpected first message: {other:?}"))),
-        }
+            )))?,
+            other => return Err(io::Error::other(format!("unexpected first message: {other:?}"))),
+        };
+
+        // The cursor stream: one UDP socket, connected to the server's
+        // address, non-blocking so the loop can drain it every iteration.
+        let udp = UdpSocket::bind(("0.0.0.0", 0))?;
+        udp.set_nonblocking(true)?;
+        udp.connect(addr)?;
+        // First datagram = registration: it carries the client id, so the
+        // server learns both who we are and where to send motion.
+        udp.send(&udp::pack(own_id, 0, &Message::KeepAlive))?;
+
+        Ok(Self { transport, udp, udp_seq: 1, own_id, layout })
     }
 
     /// Run the message loop until the connection closes.
@@ -142,19 +175,77 @@ impl Client {
         let mut last_cursor_beacon = Instant::now();
         let mut blocked_reported = false;
         let mut controlled = false;
+        let mut beacon_failed = false;
+        // Motion pacing: incoming frames are replayed at the fixed
+        // cadence (see [`PacedFrames`]), so network clumps never turn
+        // into cursor jumps.
+        let mut paced = PacedFrames::default();
+        // Start as if a frame went out one period ago, so the first queued
+        // frame emits immediately.
+        let mut paced_since = Instant::now() - MOTION_PERIOD;
+        // Sequence of the newest applied cursor-stream frame (stale and
+        // duplicate datagrams are dropped).
+        let mut motion_seq: u32 = 0;
+        // Current TCP read timeout, so it is only reconfigured on change.
+        let mut timeout: Option<Duration> = Some(READ_TIMEOUT);
         loop {
+            // 1. Drain the UDP cursor stream. Only relative motion rides
+            //    it; beacons are sent below. Stale/duplicate frames are
+            //    dropped by sequence number (additive motion loses
+            //    nothing — a reordered frame is older traffic the cursor
+            //    already moved past).
+            loop {
+                let mut buf = [0u8; 512];
+                match self.udp.recv(&mut buf) {
+                    Ok(n) => {
+                        let Some(d) = udp::unpack(&buf[..n]) else { continue };
+                        if d.id != self.own_id || !udp::is_newer(d.seq, motion_seq) {
+                            continue;
+                        }
+                        motion_seq = d.seq;
+                        if let Message::MouseMoveRel { dx, dy } = d.msg {
+                            // Motion outside Enter/Leave is dropped: it can
+                            // beat the TCP Enter on the wire (different
+                            // transports), and at most a frame or two at
+                            // the seam is lost — self-correcting.
+                            if controlled {
+                                paced.push(dx, dy);
+                            }
+                        }
+                    }
+                    Err(_) => break, // WouldBlock or link error: drained
+                }
+            }
+
+            // 2. Replay paced motion at the cadence (no-op when nothing
+            //    is queued or nothing is due yet).
+            paced.flush(&mut paced_since, &mut |dx, dy| injector.move_rel(dx, dy));
+
+            // 3. Control channel: one TCP message, or a timeout. While
+            //    pacing motion or being controlled, wake at motion
+            //    cadence so clumps keep draining and beacons stay fresh
+            //    even on a quiet wire.
+            let want = if controlled || paced.has_pending() {
+                Some(MOTION_PERIOD)
+            } else {
+                Some(READ_TIMEOUT)
+            };
+            if want != timeout {
+                self.transport.set_read_timeout(want)?;
+                timeout = want;
+            }
             match self.transport.recv()? {
                 RecvResult::Msg(msg) => {
                     let entered = matches!(msg, Message::Enter { .. });
                     let left = matches!(msg, Message::Leave { .. });
-                    self.dispatch(msg, &mut *injector);
+                    self.dispatch(msg, &mut *injector, &mut paced);
                     if entered {
                         controlled = true;
                         // Control just landed: report where we are right
                         // away so the server's edge state is fresh from
                         // the first moment.
                         let (x, y) = injector.cursor_position();
-                        self.transport.send(&Message::CursorPos { x, y })?;
+                        self.send_beacon(x, y, &mut beacon_failed)?;
                         last_cursor_beacon = Instant::now();
                     } else if left {
                         controlled = false;
@@ -195,22 +286,21 @@ impl Client {
                 }
             }
 
-            // While being controlled, keep the server fed with our real
-            // cursor position (see [`CURSOR_BEACON_INTERVAL`]). Runs after
-            // every wakeup so a continuous message stream never starves
-            // it.
+            // 4. While being controlled, keep the server fed with our
+            //    real cursor position over the UDP stream (see
+            //    [`CURSOR_BEACON_INTERVAL`]). Runs after every wakeup so a
+            //    continuous message stream never starves it.
             if controlled && last_cursor_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
                 last_cursor_beacon = Instant::now();
                 let (x, y) = injector.cursor_position();
-                self.transport.send(&Message::CursorPos { x, y })?;
+                self.send_beacon(x, y, &mut beacon_failed)?;
             }
 
-            // After every wakeup (message or timeout): if the local OS is
-            // dropping our injected input (elevated / input-isolated
-            // window), tell the server so it brings control home. Without
-            // this the user would be trapped on a screen whose cursor no
-            // longer moves. Rate-limited; a latch avoids spamming the
-            // server while blocked.
+            // 5. After every wakeup (message or timeout): if the local OS
+            //    is dropping our injected input (elevated /
+            //    input-isolated window), tell the server so it brings
+            //    control home. Rate-limited; a latch avoids spamming the
+            //    server while blocked.
             if last_block_check.elapsed() >= BLOCK_CHECK_INTERVAL {
                 last_block_check = Instant::now();
                 let blocked = injector.input_blocked();
@@ -226,10 +316,45 @@ impl Client {
         Ok(())
     }
 
-    /// Apply one server message to the local machine.
-    fn dispatch(&mut self, msg: Message, injector: &mut dyn Injector) {
+    /// Send one real-cursor beacon over the UDP stream. The stream is
+    /// loss-tolerant, but a dead link is worth knowing about — log the
+    /// first failure, then stay quiet (the TCP keepalives will surface a
+    /// genuinely dead connection).
+    fn send_beacon(&mut self, x: i32, y: i32, failed: &mut bool) -> io::Result<()> {
+        let bytes = udp::pack(self.own_id, self.udp_seq, &Message::CursorPos { x, y });
+        self.udp_seq = self.udp_seq.wrapping_add(1);
+        match self.udp.send(&bytes) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if !*failed {
+                    log_warn!("cursor beacon send failed (first): {e}");
+                    *failed = true;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Apply one server message to the local machine. Ordering-critical
+    /// events flush any paced motion first, so a click, key or control
+    /// transition lands after the motion that preceded it.
+    fn dispatch(&mut self, msg: Message, injector: &mut dyn Injector, paced: &mut PacedFrames) {
         match msg {
+            Message::MouseMoveRel { dx, dy } => {
+                // Cursor-stream frames normally arrive over UDP (drained
+                // in run()); a frame that came over the control channel
+                // takes the same paced path.
+                paced.push(dx, dy);
+            }
+            Message::MouseMoveAbs { x, y } => {
+                // Absolute placement (defensive — entry placement travels
+                // in the Enter message; the session never emits absolute
+                // moves in the motion stream).
+                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
+                injector.move_cursor(x, y);
+            }
             Message::Enter { screen_id: _, x, y } => {
+                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
                 log_trace!("control entered at ({x},{y})");
                 injector.enter();
                 // Absolute placement at the entry point only — from here
@@ -237,24 +362,24 @@ impl Client {
                 injector.move_cursor(x, y);
             }
             Message::Leave { screen_id: _ } => {
+                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
                 log_trace!("control left");
                 injector.leave();
             }
-            // The motion stream is relative: the client OS applies its
-            // own pointer transform, so the cursor feels native. Absolute
-            // moves still arrive for entry placement. Both are the hot
-            // path — not even trace logs those.
-            Message::MouseMoveRel { dx, dy } => injector.move_rel(dx, dy),
-            Message::MouseMoveAbs { x, y } => injector.move_cursor(x, y),
+            // Buttons, keys and wheel are ordering-critical: they land
+            // after the motion that positioned the cursor.
             Message::MouseButton { button, pressed } => {
+                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
                 log_trace!("button {button} {}", if pressed { "down" } else { "up" });
                 injector.button(button, pressed);
             }
             Message::MouseWheel { dx, dy } => {
+                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
                 log_trace!("wheel {dx},{dy}");
                 injector.wheel(dx, dy);
             }
             Message::Key { kind, key } => {
+                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
                 log_trace!("key {kind:?} {key}");
                 injector.key(kind, key);
             }
@@ -287,7 +412,7 @@ impl Client {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, UdpSocket};
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -472,5 +597,72 @@ mod tests {
         client_thread.join().unwrap();
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok("screeninfo seen".to_string()));
     }
-}
 
+    /// The full UDP cursor path, exactly as the real server provides it:
+    /// TCP handshake + control channel, UDP socket on the same port, the
+    /// client's registration datagram teaching us where to send motion.
+    #[test]
+    fn udp_motion_stream_is_paced_and_deduped() {
+        let port = 39004;
+        let welcome = Message::Welcome {
+            server_version: kvmshare_protocol::VERSION,
+            layout: Layout { screens: vec![] },
+            own_screen_id: 7,
+        };
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        thread::spawn(move || {
+            // Control channel: handshake.
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).unwrap(); // hello
+            stream.write_all(&welcome.encode()).unwrap();
+            stream.flush().unwrap();
+            // The client registers its UDP stream; learn its address.
+            let mut reg = [0u8; 512];
+            let (n, from) = udp.recv_from(&mut reg).unwrap();
+            let d = crate::udp::unpack(&reg[..n]).expect("registration datagram");
+            assert_eq!(d.id, 7);
+            assert_eq!(d.msg, Message::KeepAlive);
+            // Take control, then feed the cursor stream.
+            thread::sleep(Duration::from_millis(30));
+            stream.write_all(&Message::Enter { screen_id: 7, x: 100, y: 100 }.encode()).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(80));
+            // A burst of three motion frames, then a stale duplicate.
+            for (seq, dx) in [(1u32, 10), (2, 20), (3, 30)] {
+                let bytes = crate::udp::pack(7, seq, &Message::MouseMoveRel { dx, dy: 0 });
+                udp.send_to(&bytes, from).unwrap();
+            }
+            let dup = crate::udp::pack(7, 2, &Message::MouseMoveRel { dx: 99, dy: 0 });
+            udp.send_to(&dup, from).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            // Tell the recorder we are done; the client keeps running
+            // until we close the TCP side.
+            drop(stream);
+        });
+
+        let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 });
+        let calls_handle = injector.calls.clone();
+        let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+        let (_tx, rx) = mpsc::channel::<Message>();
+        // The fake server closes the TCP side after ~310ms; run until EOF.
+        let _ = client.run(Box::new(injector), &rx);
+        let _ = calls;
+
+        let calls = calls_handle.lock().unwrap().clone();
+        // The burst is replayed one frame per motion period, in order —
+        // the cursor tracks the hand smoothly instead of jumping 60px at
+        // once — and the stale duplicate never re-applies.
+        let rels: Vec<&String> = calls.iter().filter(|c| c.starts_with("rel ")).collect();
+        assert_eq!(
+            rels,
+            vec![&"rel 10,0".to_string(), &"rel 20,0".to_string(), &"rel 30,0".to_string()],
+            "motion must be paced per frame with no duplicates, got {rels:?}"
+        );
+        assert!(calls.contains(&"enter".to_string()));
+        assert!(calls.iter().any(|c| c == "move 100,100"));
+    }
+}
