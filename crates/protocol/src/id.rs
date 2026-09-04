@@ -15,6 +15,12 @@ pub mod types {
     /// Client → server: the client cannot apply injected input locally
     /// (an elevated / input-isolated window is swallowing SendInput).
     pub const INPUT_BLOCKED: u8 = 0x12;
+    /// Client → server: the client's *real* cursor position while it is
+    /// being controlled (its OS applies its own pointer acceleration to
+    /// the relative motion it receives, so the real position is the only
+    /// ground truth for edge crossings — the same role the server's own
+    /// position beacons play on the local screen).
+    pub const CURSOR_POS: u8 = 0x14;
     /// Local-only (capture → session): the user pressed the escape key
     /// while the cursor was on a client. Never sent over the wire.
     pub const ESCAPE: u8 = 0x13;

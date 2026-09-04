@@ -72,6 +72,41 @@ impl X11Injector {
     }
 }
 
+/// XTest fake-input event type for a pointer motion.
+const MOTION_NOTIFY: u8 = 6;
+
+impl X11Injector {
+    /// The pointer's current position on the root window, if readable.
+    fn pointer_pos(&self) -> Option<(i32, i32)> {
+        let reply = self
+            .conn
+            .query_pointer(self.root)
+            .ok()?
+            .reply()
+            .ok()?;
+        Some((reply.root_x as i32, reply.root_y as i32))
+    }
+
+    /// Inject *relative* pointer motion with XTest. The classic XTEST
+    /// encoding for "move by dx/dy": a MotionNotify fake input whose
+    /// root is `None` (0); the server treats the coordinates as relative
+    /// deltas from the current pointer position. Relative input goes
+    /// through the desktop's normal pointer transform (acceleration), so
+    /// the client's cursor feels like its own physical mouse.
+    fn xtest_move_rel(&mut self, dx: i32, dy: i32) {
+        let _ = self.conn.xtest_fake_input(
+            MOTION_NOTIFY,
+            0,
+            x11rb::CURRENT_TIME,
+            x11rb::NONE, // root None => relative dx/dy
+            dx as i16,
+            dy as i16,
+            0,
+        );
+        let _ = self.conn.flush();
+    }
+}
+
 impl Injector for X11Injector {
     fn screen_info(&mut self) -> ScreenInfo {
         let s = self.default_screen();
@@ -79,8 +114,18 @@ impl Injector for X11Injector {
     }
 
     fn move_cursor(&mut self, x: i32, y: i32) {
+        // Absolute placement: a direct warp is exact and has no
+        // acceleration — right for entry points.
         let _ = self.conn.warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16);
         let _ = self.conn.flush();
+    }
+
+    fn move_rel(&mut self, dx: i32, dy: i32) {
+        self.xtest_move_rel(dx, dy);
+    }
+
+    fn cursor_position(&mut self) -> (i32, i32) {
+        self.pointer_pos().unwrap_or((0, 0))
     }
 
     fn button(&mut self, button: u8, pressed: bool) {
@@ -188,5 +233,45 @@ impl Injector for X11Injector {
 
     fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)> {
         self.last_remote.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The decisive encoding fact behind relative client motion: XTest
+    /// fake motion with `root = None` must move the pointer *relative*
+    /// to where it is (not teleport it to coordinates (dx, dy)). The X
+    /// server applies its own pointer transform to injected relative
+    /// motion just like a physical mouse's, so the travel distance is
+    /// profile-dependent — what matters is that it moved in the
+    /// requested direction from its current position rather than jumping
+    /// to absolute (40, 40). Verified on a live X server; skipped where
+    /// none is available. Restores the pointer afterwards.
+    #[test]
+    fn xtest_none_root_motion_is_relative() {
+        let Ok(mut inj) = X11Injector::new(None) else {
+            eprintln!("skipping: no X server available");
+            return;
+        };
+        let (sx, sy) = inj.pointer_pos().expect("pointer position");
+        let before = inj.pointer_pos().unwrap();
+        inj.xtest_move_rel(40, 0);
+        std::thread::sleep(Duration::from_millis(30));
+        let after = inj.pointer_pos().unwrap();
+        // Restore the pointer (the test ran on a real desktop).
+        inj.move_cursor(sx, sy);
+        assert!(
+            after.0 > before.0,
+            "expected relative rightward motion, went {} -> {} (root=None must be relative)",
+            before.0,
+            after.0
+        );
+        assert!(
+            after.0 != 40 || after.1 != 40,
+            "pointer teleported to absolute (40, 40) — root=None was treated as absolute"
+        );
     }
 }

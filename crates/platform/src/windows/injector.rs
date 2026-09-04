@@ -2,32 +2,29 @@
 //! buttons/keys/wheel, hide the local cursor while being controlled,
 //! read/write the clipboard. Implements [`Injector`] from the core crate.
 //!
-//! Injection uses [`SendInput`] with *scan codes* (`KEYEVENTF_SCANCODE`),
-//! the same layout-independent model as XTest on X11: the physical key
-//! identity travels, and the local keyboard layout produces the
-//! character. Mouse moves are absolute SendInput events too (see
-//! [`Injector::move_cursor`]) so buttons, moves and releases all flow
-//! through the same input queue.
+//! **Motion is relative.** The motion stream carries relative deltas and
+//! this injector forwards them as *relative* [`SendInput`] moves, so the
+//! Windows pointer transform (speed / acceleration settings) applies —
+//! the shared cursor feels exactly like a physical mouse on this machine,
+//! no matter what acceleration the server's desktop uses. Absolute moves
+//! are used only to *place* the cursor (the entry point when control
+//! arrives). Keys and buttons use scan codes (`KEYEVENTF_SCANCODE`), the
+//! layout-independent model: the physical key identity travels and the
+//! local layout produces the character.
 //!
 //! ## Blocked-input detection without false alarms
 //!
 //! Windows silently drops injected input while an elevated or
 //! input-isolated window (UAC prompt, on-screen keyboard, Task Manager)
 //! is foreground — and `SendInput` returns *success* even then, so only
-//! the real cursor tells the truth. But comparing the cursor against the
-//! *newest* injected target misreads the normal case: during any
-//! sustained motion the newest target is always a few milliseconds ahead
-//! of the cursor, so such a check reports "stuck" during perfectly fine
-//! fast movement and the server yanks control home mid-gesture.
-//!
-//! The check therefore measures *displacement* between two block checks:
-//! how much movement was requested ([`Win32Injector::last_target`]
-//! moving) versus how far the real cursor actually travelled. A blocked
-//! window leaves the cursor frozen while moves are requested — the only
-//! condition that trips. A cursor that is moving, even far behind its
-//! target under load, never looks blocked. The check runs on the client
-//! loop's block cadence only — never in the move hot path, where
-//! polling would stall the very pipeline it guards.
+//! the real cursor tells the truth. The check measures *displacement*
+//! between two block checks: how much cursor motion was requested (the
+//! relative counts injected plus any absolute jumps) versus how far the
+//! real cursor actually travelled. A blocked window leaves the cursor
+//! frozen while motion is requested — the only condition that trips. A
+//! cursor that is moving, even far behind under load, never looks
+//! blocked. Runs on the client loop's block cadence only — never in the
+//! move hot path.
 
 use std::time::{Duration, Instant};
 
@@ -50,14 +47,14 @@ use super::clipboard::Clipboard;
 /// check failing, so this trips ~0.4 s in.
 const BLOCK_LINGER: Duration = Duration::from_millis(400);
 
-/// How much cursor movement must be requested (the injected targets moved
-/// this far) between block checks for the interval to count as "trying to
-/// move". Below this the user is effectively idle or nudging in place, and
-/// a still cursor is expected — never a block.
-const BLOCK_REQ_MIN: i32 = 2;
+/// How much cursor motion must be requested (relative counts injected
+/// plus absolute jump distance) between block checks for the interval to
+/// count as "trying to move". Below this the user is effectively idle,
+/// and a still cursor is expected — never a block.
+const BLOCK_REQ_MIN: i64 = 2;
 /// How far the real cursor may travel over such an interval while still
 /// counting as frozen. A blocked window leaves it dead-still; anything
-/// moving at all — even far behind its target under load — is healthy.
+/// moving at all — even far behind under load — is healthy.
 const BLOCK_ACT_MAX: i32 = 1;
 
 /// The client-side injector over the local Windows desktop.
@@ -66,17 +63,18 @@ pub struct Win32Injector {
     /// True while we are hiding the local cursor (between `enter` and
     /// `leave`). Lets `leave` only show the cursor if we hid it.
     cursor_hidden: bool,
-    /// The last position this injector asked the OS to place the cursor
-    /// at. Moves are *unconditional* in the hot path, so the target is
-    /// remembered here instead of being read back from the OS mid-stream.
-    last_target: (i32, i32),
-    /// Snapshots from the previous block check: the injected target and
-    /// the real cursor position then. The next check measures how much
-    /// movement was requested and how far the cursor actually went
-    /// between the two.
-    check_target: (i32, i32),
+    /// The last position this injector placed the cursor at in absolute
+    /// moves (entry points). The delta to the next absolute target counts
+    /// as requested motion for the block check.
+    last_abs: (i32, i32),
+    /// Cursor motion requested since the last block check: the magnitude
+    /// of every relative move injected plus every absolute jump asked
+    /// for. A blocked window freezes the real cursor while this keeps
+    /// growing — the displacement signal.
+    req_since_check: i64,
+    /// The real cursor position at the previous block check.
     check_pos: (i32, i32),
-    /// When the cursor first failed to move while movement was requested
+    /// When the cursor first failed to move while motion was requested
     /// (or SendInput rejected an event outright). `None` while input
     /// flows. Once this has lingered past [`BLOCK_LINGER`] the core loop
     /// tells the server to bring control home.
@@ -96,8 +94,8 @@ impl Win32Injector {
         Self {
             clipboard: Clipboard::new(),
             cursor_hidden: false,
-            last_target: (0, 0),
-            check_target: (0, 0),
+            last_abs: (0, 0),
+            req_since_check: 0,
             check_pos: (0, 0),
             miss_since: None,
             keys_down: HashSet::new(),
@@ -134,53 +132,55 @@ impl Win32Injector {
         }
     }
 
-    /// One *non-blocking* displacement check, run on the client loop's
-    /// block cadence — never from the move hot path.
-    ///
-    /// Compares how far the injected targets moved since the previous
-    /// check (movement requested) against how far the real cursor moved.
-    /// A cursor that travels at all is healthy regardless of how far
-    /// behind its target it is; only a cursor that stays still while
-    /// movement is requested is stuck (elevated/input-isolated windows
-    /// swallow injected input, freezing the cursor).
-    fn check_blocked(&mut self) {
-        let (tx, ty) = self.last_target;
+    /// The real cursor position, in screen pixels.
+    fn cursor_pos() -> Option<(i32, i32)> {
         let mut pt = POINT { x: 0, y: 0 };
         // SAFETY: GetCursorPos writes one POINT into a valid buffer.
         let got = unsafe { wm::GetCursorPos(&mut pt) } != 0;
-        let requested = (tx - self.check_target.0).abs() + (ty - self.check_target.1).abs();
-        let actual = if got {
-            (pt.x - self.check_pos.0).abs() + (pt.y - self.check_pos.1).abs()
-        } else {
-            0 // no cursor to read — treat as stuck
+        got.then_some((pt.x, pt.y))
+    }
+
+    /// One *non-blocking* displacement check, run on the client loop's
+    /// block cadence — never from the move hot path.
+    ///
+    /// Compares the motion requested since the previous check against how
+    /// far the real cursor moved. A cursor that travels at all is healthy
+    /// regardless of how far behind it is; only a cursor that stays still
+    /// while motion is requested is stuck (elevated/input-isolated
+    /// windows swallow injected input, freezing the cursor).
+    fn check_blocked(&mut self) {
+        let real = Self::cursor_pos();
+        let actual = match real {
+            Some((x, y)) => (x - self.check_pos.0).abs() + (y - self.check_pos.1).abs(),
+            None => 0, // no cursor to read — treat as stuck
         };
-        if requested >= BLOCK_REQ_MIN && actual <= BLOCK_ACT_MAX {
+        if self.req_since_check >= BLOCK_REQ_MIN && actual <= BLOCK_ACT_MAX {
             self.miss_since.get_or_insert(Instant::now());
         } else {
             self.miss_since = None;
         }
-        self.check_target = (tx, ty);
-        if got {
-            self.check_pos = (pt.x, pt.y);
+        self.req_since_check = 0;
+        if let Some((x, y)) = real {
+            self.check_pos = (x, y);
         }
     }
 
     /// Start the next measurement from a clean slate: wherever the real
-    /// cursor is and wherever the injector's target is, the following
-    /// interval is measured from there. Called when control enters or
-    /// leaves this machine.
+    /// cursor is, nothing has been requested yet. Called when control
+    /// enters or leaves this machine.
     fn reset_measurement(&mut self) {
-        let mut pt = POINT { x: 0, y: 0 };
-        // SAFETY: GetCursorPos writes one POINT into a valid buffer.
-        let got = unsafe { wm::GetCursorPos(&mut pt) } != 0;
-        self.check_pos = if got { (pt.x, pt.y) } else { self.last_target };
-        self.check_target = self.last_target;
+        if let Some((x, y)) = Self::cursor_pos() {
+            self.check_pos = (x, y);
+            self.last_abs = (x, y);
+        }
+        self.req_since_check = 0;
         self.miss_since = None;
     }
 }
 
 /// Map a physical pixel coordinate to SendInput's 16-bit absolute space
-/// (0..65535 across the primary monitor), clamped to the screen.
+/// (0..65535 across the primary monitor), clamped to the screen. Used
+/// only for absolute placement (entry points).
 fn normalize(v: i32, limit: i32) -> i32 {
     let limit = limit.max(1);
     let v = v.clamp(0, limit - 1);
@@ -197,14 +197,11 @@ impl Injector for Win32Injector {
     }
 
     fn move_cursor(&mut self, x: i32, y: i32) {
-        // Moves go through SendInput as *absolute* input, not SetCursorPos.
-        // Mixing SetCursorPos (a direct cursor placement, outside the
-        // input queue) with SendInput button events makes drags and
-        // double-clicks unreliable: the OS derives those from coherent
-        // sequences of queued input. Routing every event — down, moves,
-        // up — through the same queue makes the client behave like a
-        // real device. Absolute SendInput coordinates are 0..65535 over
-        // the primary monitor's pixel space.
+        // Absolute placement (entry points, explicit positioning). Goes
+        // through SendInput as an absolute event so it stays in the same
+        // input queue as the button/key stream — mixing direct cursor
+        // placement with queued input makes drags and double-clicks
+        // unreliable. Coordinates are 0..65535 over the primary monitor.
         let (w, h) = Self::screen_size();
         let nx = normalize(x, w);
         let ny = normalize(y, h);
@@ -215,10 +212,31 @@ impl Injector for Win32Injector {
         input.Anonymous.mi.dx = nx;
         input.Anonymous.mi.dy = ny;
         self.send_input(&input);
-        // The move hot path stays pure: no polling, no waiting. Blocked
-        // detection happens on the block-check cadence in
-        // `input_blocked`.
-        self.last_target = (x, y);
+        // The jump distance counts as requested motion for the block
+        // check (a blocked entry point must be noticed).
+        self.req_since_check += (x - self.last_abs.0).abs() as i64 + (y - self.last_abs.1).abs() as i64;
+        self.last_abs = (x, y);
+    }
+
+    fn move_rel(&mut self, dx: i32, dy: i32) {
+        // Relative motion through the input queue: Windows applies its
+        // own pointer speed/acceleration to relative moves, so the cursor
+        // feels exactly like this machine's own mouse. The hot path stays
+        // pure — no polling, no screen queries, no state beyond the
+        // requested-motion counter.
+        self.req_since_check += (dx.abs() + dy.abs()) as i64;
+        // SAFETY: well-formed relative-move INPUT event (dx/dy are
+        // relative pixels when MOUSEEVENTF_ABSOLUTE is not set).
+        let mut input: km::INPUT = unsafe { std::mem::zeroed() };
+        input.r#type = km::INPUT_MOUSE;
+        input.Anonymous.mi.dwFlags = km::MOUSEEVENTF_MOVE;
+        input.Anonymous.mi.dx = dx;
+        input.Anonymous.mi.dy = dy;
+        self.send_input(&input);
+    }
+
+    fn cursor_position(&mut self) -> (i32, i32) {
+        Self::cursor_pos().unwrap_or(self.last_abs)
     }
 
     fn button(&mut self, button: u8, pressed: bool) {
@@ -297,7 +315,7 @@ impl Injector for Win32Injector {
         // One cheap, non-blocking displacement check, then test the
         // linger. Runs here — on the client loop's block cadence, never
         // in the move path. See the module docs for why displacement (not
-        // target matching) is the only signal that cannot mistake a fast
+        // target matching) is the only signal that cannot mistake a
         // moving cursor for a blocked one.
         self.check_blocked();
         self.miss_since.is_some_and(|t| t.elapsed() >= BLOCK_LINGER)

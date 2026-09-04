@@ -54,11 +54,18 @@ impl Engine for MockEngine {
 struct RecordingInjector {
     calls: Arc<Mutex<Vec<String>>>,
     info: ScreenInfo,
+    /// Tracked local cursor position, so `cursor_position` reflects the
+    /// effect of absolute moves and relative motion.
+    cursor: (i32, i32),
 }
 
 impl RecordingInjector {
     fn new(info: ScreenInfo) -> Self {
-        Self { calls: Arc::new(Mutex::new(Vec::new())), info }
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            info,
+            cursor: ((info.width / 2) as i32, (info.height / 2) as i32),
+        }
     }
 }
 
@@ -67,7 +74,16 @@ impl Injector for RecordingInjector {
         self.info
     }
     fn move_cursor(&mut self, x: i32, y: i32) {
+        self.cursor = (x, y);
         self.calls.lock().unwrap().push(format!("move {x},{y}"));
+    }
+    fn move_rel(&mut self, dx: i32, dy: i32) {
+        self.cursor.0 += dx;
+        self.cursor.1 += dy;
+        self.calls.lock().unwrap().push(format!("rel {dx},{dy}"));
+    }
+    fn cursor_position(&mut self) -> (i32, i32) {
+        self.cursor
     }
     fn button(&mut self, button: u8, pressed: bool) {
         self.calls.lock().unwrap().push(format!("button {button} {pressed}"));
@@ -188,10 +204,21 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
         "server must not warp its cursor when switching away, got {ec:?}"
     );
 
-    // -- Move around on hp: forwarded as absolute positions. --
-    feed(&h, Message::MouseMoveRel { dx: -100, dy: 0 }); // virtual -101 → hp-local 1819
+    // -- Roam around on hp: forwarded as *relative* motion. --
+    // The client's OS applies its own pointer transform to relative
+    // input, so the shared cursor feels native there. The server must
+    // never send absolute positions in the motion stream (the hidden
+    // local cursor never moves while we are away).
+    feed(&h, Message::MouseMoveRel { dx: -100, dy: 0 });
     let cc = calls(&client_calls);
-    assert!(cc.iter().any(|c| c == "move 1819,540"), "expected forwarded move, got {cc:?}");
+    assert!(
+        cc.iter().any(|c| c == "rel -100,0"),
+        "expected relative motion forwarded, got {cc:?}"
+    );
+    assert!(
+        cc.iter().all(|c| !c.starts_with("move ") || c == "move 1919,540"),
+        "only the entry move may be absolute, got {cc:?}"
+    );
 
     // -- Buttons and keys forward while on the client. --
     feed(&h, Message::MouseButton { button: 0, pressed: true });
@@ -202,8 +229,12 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     let cc = calls(&client_calls);
     assert!(cc.contains(&"key Down 4".to_string()), "key should forward, got {cc:?}");
 
-    // -- Cross back to pc: the client leaves and the server's cursor returns. --
-    feed(&h, Message::MouseMoveRel { dx: 102, dy: 0 }); // virtual 1 → past hp's right edge
+    // -- Cross back to pc. --
+    // The client's real cursor must be pinned on the shared edge (its
+    // right edge) for a crossing; first push moves it there, then the
+    // next outward push (a frame later, as in real use) crosses.
+    feed(&h, Message::MouseMoveRel { dx: 120, dy: 0 }); // roam back to the right wall
+    feed(&h, Message::MouseMoveRel { dx: 10, dy: 0 }); // keep pushing: cross home
 
     let cc = calls(&client_calls);
     assert!(cc.contains(&"leave".to_string()), "client should leave, got {cc:?}");

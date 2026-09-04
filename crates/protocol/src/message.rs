@@ -196,6 +196,10 @@ pub enum Message {
     MouseMoveAbs { x: i32, y: i32 },
     /// Relative cursor motion.
     MouseMoveRel { dx: i32, dy: i32 },
+    /// Client → server: where the client's *real* cursor currently is
+    /// (local pixels). Reported on a cadence while the client is being
+    /// controlled. See [`crate::id::types::CURSOR_POS`].
+    CursorPos { x: i32, y: i32 },
     MouseButton { button: u8, pressed: bool },
     MouseWheel { dx: i32, dy: i32 },
     /// Keyboard event. `key` is a **canonical USB HID usage id**, which is
@@ -232,6 +236,7 @@ impl Message {
             Message::Leave { .. } => types::LEAVE,
             Message::MouseMoveAbs { .. } => types::MOUSE_MOVE_ABS,
             Message::MouseMoveRel { .. } => types::MOUSE_MOVE_REL,
+            Message::CursorPos { .. } => types::CURSOR_POS,
             Message::MouseButton { .. } => types::MOUSE_BUTTON,
             Message::MouseWheel { .. } => types::MOUSE_WHEEL,
             Message::Key { .. } => types::KEY,
@@ -272,6 +277,10 @@ impl Message {
             Message::MouseMoveRel { dx, dy } => {
                 w.put_i32(*dx);
                 w.put_i32(*dy);
+            }
+            Message::CursorPos { x, y } => {
+                w.put_i32(*x);
+                w.put_i32(*y);
             }
             Message::MouseButton { button, pressed } => {
                 w.put_u8(*button);
@@ -325,6 +334,7 @@ impl Message {
             types::LEAVE => Message::Leave { screen_id: r.get_u8()? },
             types::MOUSE_MOVE_ABS => Message::MouseMoveAbs { x: r.get_i32()?, y: r.get_i32()? },
             types::MOUSE_MOVE_REL => Message::MouseMoveRel { dx: r.get_i32()?, dy: r.get_i32()? },
+            types::CURSOR_POS => Message::CursorPos { x: r.get_i32()?, y: r.get_i32()? },
             types::MOUSE_BUTTON => Message::MouseButton {
                 button: r.get_u8()?,
                 pressed: r.get_u8()? != 0,
@@ -414,6 +424,7 @@ mod tests {
     fn mouse_hot_path_roundtrip() {
         roundtrip(Message::MouseMoveAbs { x: 1234, y: -56 });
         roundtrip(Message::MouseMoveRel { dx: 12, dy: -3 });
+        roundtrip(Message::CursorPos { x: 1919, y: 540 });
         roundtrip(Message::MouseButton { button: 0, pressed: true });
         roundtrip(Message::MouseWheel { dx: 0, dy: 120 });
     }

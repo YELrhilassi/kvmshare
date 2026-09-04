@@ -26,8 +26,22 @@ pub trait Injector: Send {
     /// every loop iteration so resolution changes are noticed and
     /// reported back to the server.
     fn screen_info(&mut self) -> ScreenInfo;
-    /// Move the local cursor to local screen pixels `(x, y)`.
+    /// Move the local cursor to local screen pixels `(x, y)` (absolute
+    /// placement: used when control *enters* and for any explicit
+    /// positioning, never in the motion stream).
     fn move_cursor(&mut self, x: i32, y: i32);
+    /// Apply relative cursor motion. The client OS applies its own
+    /// pointer transform (acceleration / speed settings) to relative
+    /// input, so the shared cursor feels exactly like a physical mouse on
+    /// this machine — the model every mature KVM uses. The motion stream
+    /// is relative; absolute positioning is reserved for entry points.
+    fn move_rel(&mut self, dx: i32, dy: i32);
+    /// The cursor's *real* current position in local screen pixels (what
+    /// the OS reports, after applying its transform to the relative
+    /// motion we injected). Reported to the server on a cadence while
+    /// being controlled, so the server knows exactly where the shared
+    /// cursor sits for edge crossings.
+    fn cursor_position(&mut self) -> (i32, i32);
     fn button(&mut self, button: u8, pressed: bool);
     fn wheel(&mut self, dx: i32, dy: i32);
     /// Press/release/repeat a key, addressed by its canonical USB HID
@@ -69,6 +83,13 @@ const CLIPBOARD_INTERVAL: Duration = Duration::from_millis(500);
 /// dropped by the OS (cheap; guards against a continuous message stream
 /// starving the check).
 const BLOCK_CHECK_INTERVAL: Duration = Duration::from_millis(150);
+/// How often the client reports its real cursor position to the server
+/// while being controlled. The server anchors its virtual cursor and
+/// edge decisions on these (the client's OS applies its own pointer
+/// acceleration to relative motion, so the reported position is the only
+/// ground truth) — a tight cadence keeps crossings exact without
+/// flooding the wire.
+const CURSOR_BEACON_INTERVAL: Duration = Duration::from_millis(8);
 
 /// A connected client.
 #[derive(Debug)]
@@ -118,10 +139,27 @@ impl Client {
         let mut last_clip_check = Instant::now();
         let mut last_clip_seen: Option<(String, Vec<u8>)> = None;
         let mut last_block_check = Instant::now();
+        let mut last_cursor_beacon = Instant::now();
         let mut blocked_reported = false;
+        let mut controlled = false;
         loop {
             match self.transport.recv()? {
-                RecvResult::Msg(msg) => self.dispatch(msg, &mut *injector),
+                RecvResult::Msg(msg) => {
+                    let entered = matches!(msg, Message::Enter { .. });
+                    let left = matches!(msg, Message::Leave { .. });
+                    self.dispatch(msg, &mut *injector);
+                    if entered {
+                        controlled = true;
+                        // Control just landed: report where we are right
+                        // away so the server's edge state is fresh from
+                        // the first moment.
+                        let (x, y) = injector.cursor_position();
+                        self.transport.send(&Message::CursorPos { x, y })?;
+                        last_cursor_beacon = Instant::now();
+                    } else if left {
+                        controlled = false;
+                    }
+                }
                 RecvResult::Eof => break,
                 RecvResult::NoData => {
                     // Nothing from the server: service the outbox, notice
@@ -157,6 +195,16 @@ impl Client {
                 }
             }
 
+            // While being controlled, keep the server fed with our real
+            // cursor position (see [`CURSOR_BEACON_INTERVAL`]). Runs after
+            // every wakeup so a continuous message stream never starves
+            // it.
+            if controlled && last_cursor_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
+                last_cursor_beacon = Instant::now();
+                let (x, y) = injector.cursor_position();
+                self.transport.send(&Message::CursorPos { x, y })?;
+            }
+
             // After every wakeup (message or timeout): if the local OS is
             // dropping our injected input (elevated / input-isolated
             // window), tell the server so it brings control home. Without
@@ -184,14 +232,19 @@ impl Client {
             Message::Enter { screen_id: _, x, y } => {
                 log_trace!("control entered at ({x},{y})");
                 injector.enter();
+                // Absolute placement at the entry point only — from here
+                // on the motion stream is relative (see [`Injector::move_rel`]).
                 injector.move_cursor(x, y);
             }
             Message::Leave { screen_id: _ } => {
                 log_trace!("control left");
                 injector.leave();
             }
-            // Mouse moves are the hot path (hundreds per second) — not
-            // even trace logs those.
+            // The motion stream is relative: the client OS applies its
+            // own pointer transform, so the cursor feels native. Absolute
+            // moves still arrive for entry placement. Both are the hot
+            // path — not even trace logs those.
+            Message::MouseMoveRel { dx, dy } => injector.move_rel(dx, dy),
             Message::MouseMoveAbs { x, y } => injector.move_cursor(x, y),
             Message::MouseButton { button, pressed } => {
                 log_trace!("button {button} {}", if pressed { "down" } else { "up" });
@@ -219,7 +272,7 @@ impl Client {
             Message::Hello { .. }
             | Message::Welcome { .. }
             | Message::ScreenInfo { .. }
-            | Message::MouseMoveRel { .. }
+            | Message::CursorPos { .. }
             | Message::InputBlocked
             | Message::Escape => {}
         }
@@ -263,20 +316,31 @@ mod tests {
     /// Records calls into a shared vec so the test can inspect them after
     /// the (consuming) run loop has finished. `info` is shared too, so a
     /// test can simulate a resolution change while the loop is running.
+    /// `pos` is the simulated real cursor position: absolute moves set
+    /// it, relative moves shift it (a fake OS without acceleration).
     struct RecordingInjector {
         calls: Arc<Mutex<Vec<String>>>,
         info: Arc<Mutex<ScreenInfo>>,
+        pos: Arc<Mutex<(i32, i32)>>,
     }
 
     impl Default for RecordingInjector {
         fn default() -> Self {
-            Self { calls: Arc::new(Mutex::new(Vec::new())), info: Arc::new(Mutex::new(ScreenInfo::default())) }
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                info: Arc::new(Mutex::new(ScreenInfo::default())),
+                pos: Arc::new(Mutex::new((0, 0))),
+            }
         }
     }
 
     impl RecordingInjector {
         fn new(info: ScreenInfo) -> Self {
-            Self { calls: Arc::new(Mutex::new(Vec::new())), info: Arc::new(Mutex::new(info)) }
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                info: Arc::new(Mutex::new(info)),
+                pos: Arc::new(Mutex::new((0, 0))),
+            }
         }
     }
 
@@ -291,7 +355,18 @@ mod tests {
             None
         }
         fn move_cursor(&mut self, x: i32, y: i32) {
+            *self.pos.lock().unwrap() = (x, y);
             self.calls.lock().unwrap().push(format!("move {x},{y}"));
+        }
+        fn move_rel(&mut self, dx: i32, dy: i32) {
+            let mut pos = self.pos.lock().unwrap();
+            pos.0 += dx;
+            pos.1 += dy;
+            drop(pos);
+            self.calls.lock().unwrap().push(format!("rel {dx},{dy}"));
+        }
+        fn cursor_position(&mut self) -> (i32, i32) {
+            *self.pos.lock().unwrap()
         }
         fn button(&mut self, button: u8, pressed: bool) {
             self.calls.lock().unwrap().push(format!("button {button} {pressed}"));

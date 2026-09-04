@@ -263,9 +263,9 @@ impl Server {
             Action::Nothing => {}
             Action::Send(msg) => {
                 if let Some(id) = *self.active.lock().unwrap() {
-                    // Absolute mouse moves are the hot path (up to
+                    // Relative mouse motion is the hot path (up to
                     // hundreds per second) — not even trace logs those.
-                    if !matches!(msg, Message::MouseMoveAbs { .. }) {
+                    if !matches!(msg, Message::MouseMoveRel { .. }) {
                         log_trace!("forward {msg:?} -> client {id}");
                     }
                     self.send_to(id, &msg)?;
@@ -278,8 +278,10 @@ impl Server {
                 }
                 *self.active.lock().unwrap() = Some(to);
                 log_debug!("cursor switched to client {to} at ({x},{y})");
+                // `Enter` carries the entry point; the client places its
+                // cursor there itself (absolute placement is reserved for
+                // entry — the motion stream that follows is relative).
                 self.send_to(to, &Message::Enter { screen_id: to, x, y })?;
-                self.send_to(to, &Message::MouseMoveAbs { x, y })?;
                 // From here on, local input must only reach the client:
                 // grab the pointer+keyboard so the local desktop does not
                 // act on the same physical events being forwarded, and
@@ -419,6 +421,17 @@ impl Client {
                         if let Ok(mut engine) = engine2.lock() {
                             engine.clipboard_set(&mime, &data);
                         }
+                    }
+                    Message::CursorPos { x, y } => {
+                        // The client's *real* cursor position (its OS
+                        // reports it after applying its own pointer
+                        // transform to the relative motion we inject).
+                        // Drives remote edge crossings: only when the
+                        // beacon confirms the cursor is parked on a shared
+                        // edge do outward deltas cross. Session state is
+                        // updated here; the crossing itself fires on the
+                        // next outward delta in the main loop.
+                        session2.lock().unwrap().on_remote_beacon(c2.id, x, y);
                     }
                     Message::InputBlocked => {
                         // The client's OS is dropping our injected input
