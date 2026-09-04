@@ -188,8 +188,8 @@ make test   # cargo test --workspace + go test ./gui
 ```
 
 Rust covers the protocol round-trips, the layout/adjacency math, the
-entire switching session (including the physical-cursor edge guard and
-live layout swaps), role-lock exclusivity, and real end-to-end tests:
+entire switching session (parked hidden cursor, escape key, live layout
+swaps), role-lock exclusivity, and real end-to-end tests:
 server + client over TCP with mock input, a recording injector and a
 config hot-reload. The Go suite covers config round-trips, settings
 persistence, process start/stop + role exclusivity, instance locking,

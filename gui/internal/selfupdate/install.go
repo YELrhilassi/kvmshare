@@ -16,6 +16,12 @@ import (
 //go:embed assets/tray.png
 var trayIcon []byte
 
+// IconBytes is the Windows .ico, written next to the binaries and used as
+// the shortcut icon by the installer's desktop integration.
+//
+//go:embed assets/kvmshare.ico
+var IconBytes []byte
+
 //go:embed assets/kvmshare.desktop
 var desktopEntry []byte
 

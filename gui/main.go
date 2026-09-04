@@ -68,6 +68,10 @@ func main() {
 		Assets: application.AssetOptions{
 			Handler: application.BundledAssetFileServer(assets),
 		},
+		// App-level icon: Windows uses this for the window/taskbar icon
+		// (the exe also carries the icon as resource ID 3 via the .syso,
+		// which Wails tries first).
+		Icon:     windowIcon,
 		Logger:   logger,
 		LogLevel: level,
 	})

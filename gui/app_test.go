@@ -567,6 +567,22 @@ func TestSingleInstanceLockAndRaise(t *testing.T) {
 	}
 }
 
+func TestBinName(t *testing.T) {
+	cases := []struct {
+		base, goos, want string
+	}{
+		{"kvmshare-client", "windows", "kvmshare-client.exe"},
+		{"kvmshare-server", "windows", "kvmshare-server.exe"},
+		{"kvmshare-client", "linux", "kvmshare-client"},
+		{"kvmshare-server", "darwin", "kvmshare-server"},
+	}
+	for _, c := range cases {
+		if got := binName(c.base, c.goos); got != c.want {
+			t.Errorf("binName(%q, %q) = %q, want %q", c.base, c.goos, got, c.want)
+		}
+	}
+}
+
 func TestSingleInstanceWritesPid(t *testing.T) {
 	a, _ := newTestApp(t)
 	if _, err := a.SingleInstance(); err != nil {

@@ -290,6 +290,12 @@ func (a *App) spawn(bin, logPath string, args ...string) (*proc, error) {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = log
 	cmd.Stderr = log
+	// Pin the child to our state dir. On Windows, GUI-launched processes
+	// inherit no HOME, and the Rust role guard would otherwise fall back
+	// to a relative dir in whatever cwd we gave it (often not writable —
+	// "access is denied"). This guarantees GUI and binary always
+	// coordinate on the same lock/log files regardless of the child env.
+	cmd.Env = append(os.Environ(), "KVMSHARE_STATE="+a.stateDir)
 	cmd.SysProcAttr = processGroupAttrs()
 	if err := cmd.Start(); err != nil {
 		log.Close()

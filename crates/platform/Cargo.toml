@@ -13,6 +13,7 @@ kvmshare-log = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["allow-unsafe-code", "xinput", "xfixes", "xtest"] }
 arboard = "3.4"
+evdev = "0.13"
 [target.'cfg(windows)'.dependencies]
 # Raw Input lives directly in `Win32_UI_Input` (no separate
 # Win32_UI_Input_RawInput feature); the RI_MOUSE_*/RI_KEY_* constants

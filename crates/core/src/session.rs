@@ -14,11 +14,15 @@
 //!   of the destination screen, so absolute positions and `Enter` always
 //!   agree — no drift, no off-by-one accumulation.
 //! * While the cursor is on a remote screen, the *physical* cursor on the
-//!   server machine is hidden and parked at the local center so it has
-//!   room to roam. When it approaches the physical screen edge it is
-//!   warped back to center ([`Action::RecenterLocal`]). Because the
-//!   server reads XI2 *raw* motion (see `kvmshare-platform`), a warp is
-//!   invisible to the input stream — no phantom deltas, no oscillation.
+//!   server machine is hidden **in place** — exactly where it crossed the
+//!   shared edge — and it never moves again until control returns. Moving
+//!   a hidden cursor across the desktop fires hover/enter effects in
+//!   every local window it crosses (and moving it *before* hiding made it
+//!   visibly dash to the screen center on every crossing), so pc elements
+//!   would react while the user is working on a client. The virtual
+//!   cursor is driven entirely by XI2 *raw* motion (see
+//!   `kvmshare-platform`), which does not depend on the physical cursor's
+//!   position at all — so a static park loses nothing.
 
 use kvmshare_protocol::message::{Message, Rect};
 
@@ -34,20 +38,15 @@ pub enum Action {
     /// `(x, y)`. The caller must:
     /// 1. send `Leave` to the previous active client,
     /// 2. send `Enter` + `MouseMoveAbs` to the new one,
-    /// 3. warp the local cursor to `park` (its center) and hide it.
-    SwitchTo { to: u8, x: i32, y: i32, park: (i32, i32) },
+    /// 3. hide the local cursor **in place** — it is already exactly at
+    ///    the shared edge where it crossed, and moving it (even hidden)
+    ///    would sweep hover/enter effects across local windows.
+    SwitchTo { to: u8, x: i32, y: i32 },
     /// Switch back to the local screen, entering at its local coords.
     SwitchToLocal { x: i32, y: i32 },
-    /// Warp the hidden local physical cursor to `park` (edge guard). The
-    /// virtual cursor is unaffected — raw input has no warp feedback.
-    RecenterLocal { park: (i32, i32) },
     /// Nothing to do.
     Nothing,
 }
-
-/// How close the parked physical cursor may come to the physical screen
-/// edge before it is re-centered.
-const PHYSICAL_EDGE_MARGIN: i32 = 8;
 
 /// The cursor model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,17 +63,13 @@ pub struct Session {
     cursor: Cursor,
     /// The local screen's rectangle in virtual coordinates.
     local: Rect,
-    /// Where the *physical* cursor currently sits on the local screen
-    /// while we are on a remote screen (starts at the park point and
-    /// follows the raw deltas). Only meaningful in `Remote` mode.
-    phys: (i32, i32),
 }
 
 impl Session {
     pub fn new(layout: Layout, local_id: u8) -> Self {
         let local = layout.find(local_id).expect("local screen must be in layout").rect;
         let (cx, cy) = local.center();
-        Self { cursor: Cursor { x: cx, y: cy, mode: Mode::Local }, layout, local, phys: (cx, cy) }
+        Self { cursor: Cursor { x: cx, y: cy, mode: Mode::Local }, layout, local }
     }
 
     pub fn mode(&self) -> Mode {
@@ -121,7 +116,6 @@ impl Session {
         self.layout = layout;
         self.local = local;
         self.cursor = Cursor { x: cx, y: cy, mode: Mode::Local };
-        self.phys = (cx, cy);
         if was_remote {
             vec![Action::SwitchToLocal { x: cx, y: cy }]
         } else {
@@ -134,14 +128,46 @@ impl Session {
     pub fn on_local_event(&mut self, msg: Message) -> Vec<Action> {
         match msg {
             Message::MouseMoveRel { dx, dy } => self.on_local_motion(dx, dy),
-            Message::MouseMoveAbs { .. } => vec![], // absolute local moves carry no delta for clients
+            Message::MouseMoveAbs { x, y } => {
+                // Position beacon from the capture (real, post-acceleration
+                // pointer position in screen pixels). While on the local
+                // screen, re-anchor the virtual cursor to it: raw deltas
+                // are pre-acceleration, so without this the virtual and
+                // visible cursors drift apart and boundaries become
+                // unreliable. In Remote mode the physical cursor is
+                // hidden, parked and warped, so its position is
+                // meaningless — raw deltas rule there (they drive the
+                // client's visible cursor 1:1 and never drift).
+                if matches!(self.cursor.mode, Mode::Local) {
+                    self.cursor.x = self.local.x + x;
+                    self.cursor.y = self.local.y + y;
+                }
+                vec![]
+            }
             Message::MouseButton { button, pressed } => {
                 self.forward_while_remote(Message::MouseButton { button, pressed })
             }
             Message::MouseWheel { dx, dy } => self.forward_while_remote(Message::MouseWheel { dx, dy }),
             Message::Key { kind, key } => self.forward_while_remote(Message::Key { kind, key }),
+            // The user pressed the escape key (Scroll Lock) while the
+            // cursor was on a client: bring control home, no matter what
+            // the client is doing. This is the universal "unstick" — it
+            // works even when the client's machine cannot inject input
+            // (an elevated window, a wedged session, a dead client).
+            Message::Escape => vec![self.force_local()],
             _ => vec![],
         }
+    }
+
+    /// The user asked (via the escape key, or because the active client
+    /// reported blocked input) to return control home right now,
+    /// regardless of where the virtual cursor is. Reuses the home-entry
+    /// logic so the session, client Leave and engine state all stay
+    /// consistent.
+    pub fn force_local(&mut self) -> Action {
+        let (x, y) = self.local.center();
+        self.enter_screen(0, x, y);
+        Action::SwitchToLocal { x, y }
     }
 
     fn forward_while_remote(&mut self, msg: Message) -> Vec<Action> {
@@ -162,7 +188,7 @@ impl Session {
 
         match self.cursor.mode {
             Mode::Local => self.handle_local_motion(),
-            Mode::Remote(id) => self.handle_remote_motion(id, dx, dy),
+            Mode::Remote(id) => self.handle_remote_motion(id),
         }
     }
 
@@ -174,7 +200,7 @@ impl Session {
             Some(dir) => match self.layout.neighbor(0, dir, self.cursor.x, self.cursor.y) {
                 Some((id, x, y)) => {
                     self.enter_screen(id, x, y);
-                    vec![Action::SwitchTo { to: id, x, y, park: self.local.center() }]
+                    vec![Action::SwitchTo { to: id, x, y }]
                 }
                 None => {
                     // Dead edge: clamp the virtual cursor to the local
@@ -188,21 +214,12 @@ impl Session {
     }
 
     /// Cursor is on a remote screen and the physical mouse keeps moving.
-    /// Forward the motion; switch screens (or back home) at edges; keep
-    /// the parked physical cursor away from the physical screen edge.
-    fn handle_remote_motion(&mut self, id: u8, dx: i32, dy: i32) -> Vec<Action> {
+    /// Forward the motion; switch screens (or back home) at edges. The
+    /// hidden physical cursor never moves while we are away (it was
+    /// hidden in place at the shared edge on entry) — moving it would
+    /// sweep hover/enter effects across local windows.
+    fn handle_remote_motion(&mut self, id: u8) -> Vec<Action> {
         let mut actions = Vec::with_capacity(2);
-
-        // Edge guard: the hidden physical cursor follows the deltas; once
-        // it nears the physical screen edge, warp it back to center. The
-        // virtual cursor is untouched (raw input has no warp feedback).
-        self.phys.0 += dx;
-        self.phys.1 += dy;
-        if !inside_margin(self.phys, &self.local, PHYSICAL_EDGE_MARGIN) {
-            let park = self.local.center();
-            self.phys = park;
-            actions.push(Action::RecenterLocal { park });
-        }
 
         let rect = match self.layout.find(id) {
             Some(s) => s.rect,
@@ -229,7 +246,7 @@ impl Session {
                         actions.push(Action::SwitchToLocal { x, y });
                     } else {
                         self.enter_screen(next, x, y);
-                        actions.push(Action::SwitchTo { to: next, x, y, park: self.local.center() });
+                        actions.push(Action::SwitchTo { to: next, x, y });
                     }
                 }
                 None => {
@@ -252,11 +269,6 @@ impl Session {
         self.cursor.x = s.rect.x + x;
         self.cursor.y = s.rect.y + y;
         self.cursor.mode = if id == 0 { Mode::Local } else { Mode::Remote(id) };
-        if id != 0 {
-            // The engine parks the hidden physical cursor at the local
-            // center; mirror that here so the edge guard starts fresh.
-            self.phys = self.local.center();
-        }
     }
 
     /// Send the current cursor position in screen `id`'s local coords.
@@ -270,14 +282,6 @@ impl Session {
     fn clamp_to(&mut self, rect: &Rect) {
         self.cursor.x = self.cursor.x.clamp(rect.left(), rect.right() - 1);
         self.cursor.y = self.cursor.y.clamp(rect.top(), rect.bottom() - 1);
-    }
-
-    /// The cursor explicitly re-enters the local screen (e.g. after a
-    /// layout change or a disconnect). Warp to the local center.
-    pub fn force_local(&mut self) -> Action {
-        let (x, y) = self.local.center();
-        self.enter_screen(0, x, y);
-        Action::SwitchToLocal { x, y }
     }
 
     /// A client with the given id disconnected while active: drop back to
@@ -301,12 +305,6 @@ impl Cursor {
     fn local_pos(&self, rect: &Rect) -> (i32, i32) {
         (self.x - rect.x, self.y - rect.y)
     }
-}
-
-/// Is `(x, y)` inside `rect` with at least `margin` px of slack on every
-/// side?
-fn inside_margin((x, y): (i32, i32), rect: &Rect, margin: i32) -> bool {
-    x >= rect.left() + margin && x < rect.right() - margin && y >= rect.top() + margin && y < rect.bottom() - margin
 }
 
 #[cfg(test)]
@@ -354,11 +352,10 @@ mod tests {
         // left edge: switch.
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -1000, dy: 0 });
         match actions.as_slice() {
-            [Action::SwitchTo { to, x, y, park }] => {
+            [Action::SwitchTo { to, x, y }] => {
                 assert_eq!(*to, 1);
                 assert_eq!(*x, 1919); // hp's right edge, local coords
                 assert_eq!(*y, 540);
-                assert_eq!(*park, (960, 540));
             }
             other => panic!("expected SwitchTo, got {other:?}"),
         }
@@ -402,10 +399,30 @@ mod tests {
         s.on_local_event(Message::MouseMoveRel { dx: -1000, dy: 0 }); // on hp, virtual (-1,540)
         // Push far left past hp's left edge (virtual -1920).
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -3000, dy: 0 });
-        // Clamped to hp's left edge: hp-local x=0. (The physical cursor
-        // also drifted 3000px left, so expect a recenter too.)
-        assert_eq!(actions[0], Action::RecenterLocal { park: (960, 540) });
-        assert_eq!(actions[1], Action::Send(Message::MouseMoveAbs { x: 0, y: 540 }));
+        // Clamped to hp's left edge: hp-local x=0. Only the pinned
+        // position is re-sent — the hidden physical cursor never moves
+        // while we are away.
+        assert_eq!(actions, vec![Action::Send(Message::MouseMoveAbs { x: 0, y: 540 })]);
+    }
+
+    #[test]
+    fn escape_returns_home_even_when_remote() {
+        let mut s = two_screens();
+        // Escape while local: re-anchors to the local center (the
+        // capture only emits Escape while remote, but it must not corrupt
+        // state if it fires locally).
+        let actions = s.on_local_event(Message::Escape);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 960, y: 540 }]);
+        assert_eq!(s.mode(), Mode::Local);
+
+        // The real case: stuck on a client (even one that stopped
+        // responding) — the escape key brings control home regardless.
+        s.on_local_event(Message::MouseMoveRel { dx: -1000, dy: 0 });
+        assert_eq!(s.mode(), Mode::Remote(1));
+        let actions = s.on_local_event(Message::Escape);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 960, y: 540 }]);
+        assert_eq!(s.mode(), Mode::Local);
+        assert_eq!(s.cursor_pos(), (960, 540));
     }
 
     #[test]
@@ -425,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_to_remote_switch_keeps_park_center() {
+    fn remote_to_remote_switch_keeps_park() {
         let layout = Layout::new(vec![
             Screen { id: 0, name: "pc".into(), rect: Rect { x: 0, y: 0, w: 1920, h: 1080 } },
             Screen { id: 1, name: "hp".into(), rect: Rect { x: -1920, y: 0, w: 1920, h: 1080 } },
@@ -434,33 +451,36 @@ mod tests {
         let mut s = Session::new(layout, 0);
         // pc -> hp
         s.on_local_event(Message::MouseMoveRel { dx: -1000, dy: 0 });
-        // hp -> mac (keep moving left). A full screen-width of physical
-        // travel also trips the edge guard, so a recenter leads.
+        // hp -> mac (keep moving left): a plain screen switch.
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 });
         match actions.as_slice() {
-            [Action::RecenterLocal { .. }, Action::SwitchTo { to, x, y, park }] => {
+            [Action::SwitchTo { to, x, y }] => {
                 assert_eq!(*to, 2);
                 assert_eq!(*x, 1919); // mac's right edge
                 assert_eq!(*y, 540);
-                assert_eq!(*park, (960, 540));
             }
-            other => panic!("expected [Recenter, SwitchTo], got {other:?}"),
+            other => panic!("expected [SwitchTo], got {other:?}"),
         }
     }
 
     #[test]
-    fn recenter_keeps_remote_cursor_untouched() {
+    fn hidden_cursor_never_moves_while_remote() {
         let mut s = two_screens();
         s.on_local_event(Message::MouseMoveRel { dx: -1000, dy: 0 }); // on hp
-        // Push left until the parked physical cursor hits the local edge
-        // (960 - 968 = -8 <= margin) — recenter fires, hp cursor keeps
-        // moving.
-        let actions = s.on_local_event(Message::MouseMoveRel { dx: -970, dy: 0 });
-        assert_eq!(actions[0], Action::RecenterLocal { park: (960, 540) });
-        assert_eq!(actions[1], Action::Send(Message::MouseMoveAbs { x: 949, y: 540 }));
-        // A small push right after the recenter must NOT recenter again.
-        let actions = s.on_local_event(Message::MouseMoveRel { dx: 5, dy: 0 });
-        assert_eq!(actions, vec![Action::Send(Message::MouseMoveAbs { x: 954, y: 540 })]);
+        // Roam the full width of hp and back (hp is 1920 wide, entered
+        // at its right edge). The session must only ever send cursor
+        // positions — never a warp or recenter of the local physical
+        // cursor: moving the hidden cursor would sweep hover/enter
+        // effects across local windows.
+        for dx in [-1000, -900, 1900, -1000] {
+            let actions = s.on_local_event(Message::MouseMoveRel { dx, dy: 0 });
+            for a in &actions {
+                assert!(
+                    matches!(a, Action::Send(Message::MouseMoveAbs { .. })),
+                    "remote motion must only send positions, got {a:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -495,6 +515,58 @@ mod tests {
         assert_eq!(actions, vec![Action::SwitchToLocal { x: 1280, y: 720 }]);
         assert_eq!(s.mode(), Mode::Local);
         assert_eq!(s.cursor_pos(), (1280, 720));
+    }
+
+    #[test]
+    fn beacon_resyncs_the_virtual_cursor_to_the_real_position() {
+        let mut s = two_screens();
+        // The virtual cursor drifted far from the real one (say the
+        // server started while the mouse sat near the right edge): a
+        // beacon snaps it to the real position, and motion then moves
+        // from there.
+        assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 1500, y: 540 }), vec![]);
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: 10, dy: 0 });
+        assert_eq!(actions, vec![]);
+        assert_eq!(s.cursor_pos(), (1510, 540)); // 1500 (real) + delta
+        // Leftward motion from mid-screen stays local too.
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -700, dy: 0 });
+        assert_eq!(actions, vec![]);
+        assert_eq!(s.cursor_pos(), (810, 540));
+    }
+
+    #[test]
+    fn beacon_crosses_when_pinned_at_the_wall() {
+        let mut s = two_screens();
+        // The OS clamps the real pointer at the left screen edge: the
+        // last beacon says x=0, and the raw deltas of the continued
+        // outward push arrive anyway, so the virtual cursor crosses the
+        // boundary — the switch fires exactly when the cursor is visibly
+        // jammed against the edge.
+        assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 }), vec![]);
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -5, dy: 0 });
+        match actions.as_slice() {
+            [Action::SwitchTo { to, x, y, .. }] => {
+                assert_eq!(*to, 1);
+                assert_eq!(*x, 1919); // hp's right edge
+                assert_eq!(*y, 540);
+            }
+            other => panic!("expected SwitchTo, got {other:?}"),
+        }
+        assert_eq!(s.mode(), Mode::Remote(1));
+    }
+
+    #[test]
+    fn beacon_is_ignored_while_remote() {
+        let mut s = two_screens();
+        s.on_local_event(Message::MouseMoveRel { dx: -1000, dy: 0 }); // on hp, virtual (-1, 540)
+        // While remote the beacon is the hidden parked cursor
+        // (meaningless): deltas must rule, not the resync.
+        let actions = s.on_local_event(Message::MouseMoveAbs { x: 50, y: 60 });
+        assert_eq!(actions, vec![]);
+        assert_eq!(s.cursor_pos(), (-1, 540)); // untouched
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: 5, dy: 0 });
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(s.mode(), Mode::Local);
     }
 
     #[test]

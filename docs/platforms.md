@@ -74,9 +74,8 @@ HID key model, same message flow:
 | DPI              | n/a (X11 pixels)            | per-monitor DPI aware at startup; `GetDpiForSystem` for the scale report |
 
 Because `SetCursorPos` never generates raw input (same property as XI2
-raw events), the anti-oscillation design carries over unchanged: the
-hidden server cursor can be parked/re-centered without feeding phantom
-motion into the session.
+raw events), the anti-oscillation design carries over unchanged: parking
+the hidden server cursor can never feed phantom motion into the session.
 
 ### What remains before Windows is "real"
 

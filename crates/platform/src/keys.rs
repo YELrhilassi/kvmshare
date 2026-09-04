@@ -44,6 +44,17 @@ pub fn hid_from_scancode(scan: u16, extended: bool) -> Option<u32> {
     HID_TO_SCAN.iter().find(|(_, s, e)| *s == scan && *e == extended).map(|(h, _, _)| *h)
 }
 
+/// HID usage of Scroll Lock — the escape key. While the cursor is on a
+/// client, a Scroll Lock press hands control back to this machine
+/// immediately, even if the client has stopped responding (elevated
+/// window swallowing its input, a wedged session, a dead client). The
+/// classic KVM "unstick", matching synergy/barrier muscle memory.
+/// Scroll Lock is deliberately chosen: no application depends on it, and
+/// it is only intercepted while the cursor is *away* — at home it passes
+/// through untouched. Shared by every capture backend (X11 raw events
+/// and evdev).
+pub const ESCAPE_KEY_HID: u32 = 0x47;
+
 fn lookup<A: Copy + PartialEq, B: Copy>(table: &[(A, B)], needle: A) -> Option<B> {
     // Tiny table, linear scan is fine (keys are ~10/s, this is negligible).
     table.iter().find(|(a, _)| *a == needle).map(|(_, b)| *b)

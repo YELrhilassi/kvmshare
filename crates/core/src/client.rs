@@ -46,6 +46,15 @@ pub trait Injector: Send {
     /// [`Injector::clipboard`]). Clipboard pollers compare against this
     /// so content that arrived from the server is never echoed back.
     fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)>;
+    /// Whether the local OS is dropping injected input right now (e.g. an
+    /// elevated or input-isolated window on Windows swallows SendInput).
+    /// The client loop reports this to the server, which brings control
+    /// home so the user is never trapped on a screen that cannot move.
+    /// Defaults to `false`; platforms that cannot detect this simply
+    /// never report it.
+    fn input_blocked(&mut self) -> bool {
+        false
+    }
 }
 
 
@@ -56,6 +65,10 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// How often the client polls its local clipboard to push changes up.
 const CLIPBOARD_INTERVAL: Duration = Duration::from_millis(500);
+/// How often the client re-checks whether local input injection is being
+/// dropped by the OS (cheap; guards against a continuous message stream
+/// starving the check).
+const BLOCK_CHECK_INTERVAL: Duration = Duration::from_millis(150);
 
 /// A connected client.
 #[derive(Debug)]
@@ -104,6 +117,8 @@ impl Client {
         let mut last_keepalive = Instant::now();
         let mut last_clip_check = Instant::now();
         let mut last_clip_seen: Option<(String, Vec<u8>)> = None;
+        let mut last_block_check = Instant::now();
+        let mut blocked_reported = false;
         loop {
             match self.transport.recv()? {
                 RecvResult::Msg(msg) => self.dispatch(msg, &mut *injector),
@@ -139,6 +154,24 @@ impl Client {
                         self.transport.send(&Message::KeepAlive)?;
                         last_keepalive = Instant::now();
                     }
+                }
+            }
+
+            // After every wakeup (message or timeout): if the local OS is
+            // dropping our injected input (elevated / input-isolated
+            // window), tell the server so it brings control home. Without
+            // this the user would be trapped on a screen whose cursor no
+            // longer moves. Rate-limited; a latch avoids spamming the
+            // server while blocked.
+            if last_block_check.elapsed() >= BLOCK_CHECK_INTERVAL {
+                last_block_check = Instant::now();
+                let blocked = injector.input_blocked();
+                if blocked && !blocked_reported {
+                    blocked_reported = true;
+                    log_warn!("local input injection blocked — asking the server to return control");
+                    self.transport.send(&Message::InputBlocked)?;
+                } else if !blocked {
+                    blocked_reported = false;
                 }
             }
         }
@@ -183,7 +216,12 @@ impl Client {
             Message::KeepAlive => {}
             Message::Error { code, text } => log_warn!("server error ({code}): {text}"),
             // Not valid client-side traffic; ignore defensively.
-            Message::Hello { .. } | Message::Welcome { .. } | Message::ScreenInfo { .. } | Message::MouseMoveRel { .. } => {}
+            Message::Hello { .. }
+            | Message::Welcome { .. }
+            | Message::ScreenInfo { .. }
+            | Message::MouseMoveRel { .. }
+            | Message::InputBlocked
+            | Message::Escape => {}
         }
     }
 

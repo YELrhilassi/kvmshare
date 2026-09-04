@@ -12,6 +12,12 @@ pub mod types {
     pub const LAYOUT: u8 = 0x04;
     pub const ENTER: u8 = 0x10;
     pub const LEAVE: u8 = 0x11;
+    /// Client → server: the client cannot apply injected input locally
+    /// (an elevated / input-isolated window is swallowing SendInput).
+    pub const INPUT_BLOCKED: u8 = 0x12;
+    /// Local-only (capture → session): the user pressed the escape key
+    /// while the cursor was on a client. Never sent over the wire.
+    pub const ESCAPE: u8 = 0x13;
     pub const MOUSE_MOVE_ABS: u8 = 0x20;
     pub const MOUSE_MOVE_REL: u8 = 0x21;
     pub const MOUSE_BUTTON: u8 = 0x22;

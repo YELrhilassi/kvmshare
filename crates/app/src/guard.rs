@@ -26,17 +26,41 @@ pub struct RoleGuard {
 }
 
 /// Where per-machine state lives. `KVMSHARE_STATE` overrides it (tests,
-/// unusual installs); otherwise XDG's default `~/.local/state/kvmshare`.
+/// unusual installs, or the GUI pinning its children to its own dir);
+/// otherwise the user's home (XDG default `~/.local/state/kvmshare`).
+///
+/// The last-resort relative `.kvmshare-state` is a *real* failure mode on
+/// Windows: GUI-launched children and scheduled tasks usually have no
+/// `HOME`, and if the cwd is not writable (e.g. `C:\Windows\System32`)
+/// creating it fails with "access is denied". So before giving up we try
+/// `USERPROFILE` / `LOCALAPPDATA`, which are set in those contexts and
+/// always point at a writable per-user directory. The GUI resolves its
+/// state dir the same way (from the user profile), so both sides always
+/// coordinate on the same lock files.
 pub fn state_dir() -> PathBuf {
     if let Ok(p) = std::env::var("KVMSHARE_STATE") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => PathBuf::from(home).join(".local/state/kvmshare"),
-        _ => PathBuf::from(".kvmshare-state"),
+    // HOME (Unix, shells) then USERPROFILE (Windows; also matches the
+    // GUI's os.UserHomeDir resolution).
+    for var in ["HOME", "USERPROFILE"] {
+        if let Some(home) = std::env::var_os(var) {
+            if !home.is_empty() {
+                return PathBuf::from(home).join(".local/state/kvmshare");
+            }
+        }
     }
+    // Windows without a profile env at all: LOCALAPPDATA is per-user and
+    // writable even in scheduled-task contexts.
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        if !local.is_empty() {
+            return PathBuf::from(local).join("kvmshare");
+        }
+    }
+    PathBuf::from(".kvmshare-state")
 }
 
 /// Take the role lock for `role`. Errors when this role is already

@@ -35,6 +35,9 @@ impl Engine for MockEngine {
     fn warp_local(&mut self, x: i32, y: i32) {
         self.calls.lock().unwrap().push(format!("warp {x},{y}"));
     }
+    fn grab_input(&mut self, grabbed: bool) {
+        self.calls.lock().unwrap().push(format!("grab {grabbed}"));
+    }
     fn show_local_cursor(&mut self, visible: bool) {
         self.calls.lock().unwrap().push(format!("cursor {visible}"));
     }
@@ -173,7 +176,14 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
 
     let ec = calls(&h.engine_calls);
     assert!(ec.iter().any(|c| c == "cursor false"), "server should hide its cursor, got {ec:?}");
-    assert!(ec.iter().any(|c| c == "warp 960,540"), "server should park its cursor, got {ec:?}");
+    // The hidden cursor must stay exactly where it crossed — the server
+    // must NOT warp it (a warp would sweep hover/enter effects across
+    // the local desktop, and a visible one would dash the cursor to the
+    // screen center on every crossing).
+    assert!(
+        !ec.iter().any(|c| c.starts_with("warp ")),
+        "server must not warp its cursor when switching away, got {ec:?}"
+    );
 
     // -- Move around on hp: forwarded as absolute positions. --
     feed(&h, Message::MouseMoveRel { dx: -100, dy: 0 }); // virtual -101 → hp-local 1819

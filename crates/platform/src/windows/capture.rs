@@ -9,7 +9,7 @@
 //! Raw input has the same two properties the X11 backend gets from XI2
 //! raw events:
 //!
-//! * **No warp feedback** — programmatic `SetCursorPos` (park/recenter)
+//! * **No warp feedback** — programmatic `SetCursorPos` (park/warp)
 //!   does not generate raw input, so the hidden local cursor can roam
 //!   without feeding phantom motion into the session.
 //! * **Hardware deltas** — relative motion arrives as the device's own

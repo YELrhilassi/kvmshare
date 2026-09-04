@@ -29,6 +29,15 @@ use kvmshare_protocol::message::Message;
 pub mod keys;
 pub mod unsupported;
 
+// Linux-only capture internals: shared motion rate-limiting, and the
+// evdev reader that isolates/reads physical devices while the cursor is
+// on a client. `evdev_reader` is X-free by design so a future Wayland
+// backend reuses it unchanged.
+#[cfg(target_os = "linux")]
+pub mod motion;
+#[cfg(target_os = "linux")]
+pub mod evdev_reader;
+
 // Per-OS backends. Each implements the same Engine/Injector contracts;
 // the key table in `keys` is shared so the wire identity is identical
 // everywhere.

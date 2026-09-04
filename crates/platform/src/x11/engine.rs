@@ -1,13 +1,19 @@
 //! The server's control over its own screen: cursor warp, cursor
-//! hide/show, clipboard. Implements [`Engine`] from the core crate.
-
-use x11rb::connection::{Connection, RequestConnection};
-use x11rb::protocol::xfixes::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::ConnectionExt as _;
-use x11rb::rust_connection::RustConnection;
+//! hide/show, input grab, clipboard. Implements [`Engine`] from the core
+//! crate.
+//!
+//! Cursor *control* (warp, hide/show, grab) is delegated to the capture
+//! thread over [`CaptureCommand`]s — every action on the physical cursor
+//! must run on the connection that holds the pointer grab, or the X
+//! server would ignore warps issued by a different client. The clipboard
+//! is reached through `arboard`, which manages its own selection
+//! connection, so this engine holds no X connection of its own (the
+//! capture connection validates XFixes at startup).
 
 use kvmshare_core::server::Engine;
 use kvmshare_log::log_warn;
+
+use super::capture::CaptureCommand;
 
 /// Clipboard access. `arboard` is a separate object because it manages
 /// its own X selection state.
@@ -23,8 +29,9 @@ fn new_clipboard(display: Option<&str>) -> Option<arboard::Clipboard> {
 
 /// Server-side engine over an X display.
 pub struct X11Engine {
-    conn: RustConnection,
-    root: x11rb::protocol::xproto::Window,
+    /// Where cursor-control commands go (the capture thread executes them
+    /// on its own connection — see the module docs).
+    cmd_tx: std::sync::mpsc::Sender<CaptureCommand>,
     clipboard: Option<arboard::Clipboard>,
     /// Last clipboard content applied from a client; pollers skip it to
     /// avoid echoing remote content back.
@@ -32,33 +39,37 @@ pub struct X11Engine {
 }
 
 impl X11Engine {
-    pub fn new(display: Option<&str>) -> Result<Self, String> {
-        let (conn, screen_num) = RustConnection::connect(display).map_err(|e| format!("X11 connect: {e}"))?;
-        let root = conn.setup().roots[screen_num].root;
-
-        // XFixes >= 2.0 is required for hide/show cursor.
-        if conn.extension_information(xfixes::X11_EXTENSION_NAME).map_err(|e| format!("XFixes query: {e}"))?.is_none() {
-            return Err("XFixes extension not available".into());
-        }
-        conn.xfixes_query_version(5, 0).map_err(|e| format!("XFixes version: {e}"))?;
-
+    pub fn new(
+        display: Option<&str>,
+        cmd_tx: std::sync::mpsc::Sender<CaptureCommand>,
+    ) -> Result<Self, String> {
         let clipboard = new_clipboard(display);
-        Ok(Self { conn, root, clipboard, last_remote: None })
+        Ok(Self { cmd_tx, clipboard, last_remote: None })
     }
 }
 
 impl Engine for X11Engine {
     fn warp_local(&mut self, x: i32, y: i32) {
-        // src_win = NONE warps from the current position.
-        let _ = self.conn.warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16);
-        let _ = self.conn.flush();
+        // Executed on the capture connection (the grab owner).
+        let _ = self.cmd_tx.send(CaptureCommand::Warp(x, y));
+    }
+
+    fn grab_input(&mut self, grabbed: bool) {
+        // Pointer/keyboard grab lives on the capture connection so that
+        // connection can keep warping the cursor while it holds the grab.
+        let _ = self.cmd_tx.send(CaptureCommand::Grab(grabbed));
+    }
+
+    fn isolate_input(&mut self, isolated: bool) {
+        // Kernel-level device isolation (evdev reader) — see
+        // `CaptureCommand::IsolateRemote`. Best-effort on the capture
+        // connection like every other cursor control.
+        let _ = self.cmd_tx.send(CaptureCommand::IsolateRemote(isolated));
     }
 
     fn show_local_cursor(&mut self, visible: bool) {
-        let res = if visible { xfixes::show_cursor(&self.conn, self.root) } else { xfixes::hide_cursor(&self.conn, self.root) };
-        if res.is_ok() {
-            let _ = self.conn.flush();
-        }
+        // Also executed on the capture connection (same reason as warp).
+        let _ = self.cmd_tx.send(CaptureCommand::CursorVisible(visible));
     }
 
     fn clipboard_set(&mut self, mime: &str, data: &[u8]) {

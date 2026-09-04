@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -112,11 +113,11 @@ func NewApp() *App {
 
 	serverPath := firstNonEmpty(os.Getenv("KVMSHARE_SERVER"))
 	if serverPath == "" {
-		serverPath = lookPathElse("kvmshare-server", filepath.Join(dir, "kvmshare-server"))
+		serverPath = lookPathElse("kvmshare-server", filepath.Join(dir, binName("kvmshare-server", runtime.GOOS)))
 	}
 	clientPath := firstNonEmpty(os.Getenv("KVMSHARE_CLIENT"))
 	if clientPath == "" {
-		clientPath = lookPathElse("kvmshare-client", filepath.Join(dir, "kvmshare-client"))
+		clientPath = lookPathElse("kvmshare-client", filepath.Join(dir, binName("kvmshare-client", runtime.GOOS)))
 	}
 
 	stateDir := filepath.Join(home, ".local", "state", "kvmshare")
@@ -188,6 +189,17 @@ func lookPathElse(name, fallback string) string {
 		return p
 	}
 	return fallback
+}
+
+// binName returns the executable file name for `base` on `goos`:
+// Windows binaries carry .exe, elsewhere they are bare. Used for the
+// "next to the GUI" fallback, so an installed Windows GUI finds the
+// role binaries installed beside it in %LOCALAPPDATA%\kvmshare.
+func binName(base, goos string) string {
+	if goos == "windows" {
+		return base + ".exe"
+	}
+	return base
 }
 
 func hostnameOr(fallback string) string {

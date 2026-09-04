@@ -15,7 +15,7 @@
 //!   buttons/keys/wheel (scan-code mode — layout independent), clipboard.
 //!
 //! The engine and injector use *programmatic* cursor warps only, which
-//! never generate raw input — so the server's park/recenter can't feed
+//! never generate raw input — so the server's park/warp can't feed
 //! phantom motion into the session, exactly like the X11 raw-event
 //! design.
 

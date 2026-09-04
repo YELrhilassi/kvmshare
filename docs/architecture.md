@@ -51,13 +51,14 @@ desktop. When the cursor crosses an edge, it is snapped exactly to the
 destination screen's entry point, so absolute positions and `Enter`
 always agree — no off-by-one drift accumulates over hours of use.
 
-**3. The hidden server cursor has an edge guard.** While the user is on a
-client, the server's own cursor is hidden and parked at its screen center
-so it has room to roam. If it approaches the physical screen edge, the
-session emits `Action::RecenterLocal` and the engine warps it back to
-center — invisible to the raw input stream, so the remote cursor never
-stops at "halfway across the client screen" (the bug the deskflow
-debugging session hit, and the fix that resolved it).
+**3. The hidden server cursor is parked and stays put.** While the user
+is on a client, the server's own cursor is hidden and parked at its
+screen center — and never moves again until control returns. Moving a
+hidden cursor would sweep hover/enter effects across every local window
+it crossed (pc elements visibly reacting while the user works on a
+client), so the session never emits warps while remote. The virtual
+cursor is driven entirely by raw input, which does not depend on the
+physical cursor's position at all.
 
 ## Keys: one identity across every OS
 

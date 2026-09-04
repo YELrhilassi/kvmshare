@@ -45,13 +45,13 @@ CLIENT_BIN := target/release/kvmshare-client
 GUI_BIN    := gui/kvmshare-gui
 
 # Windows cross-compile target for the Rust binaries. Linking the Rust
-# side needs mingw-w64 (x86_64-w64-mingw32-gcc) on this host; without it
-# the release ships Linux assets only (the Windows GUI/installer are pure
-# Go and always build).
-WIN_TARGET := x86_64-pc-windows-msvc
+# side needs mingw-w64 (x86_64-w64-mingw32-gcc) on this host plus the
+# matching rustup target; without them the release ships Linux assets only
+# (the Windows GUI/installer are pure Go and always build).
+WIN_TARGET := x86_64-pc-windows-gnu
 MINGW      := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
 
-.PHONY: build install dev test clean uninstall release publish
+.PHONY: build install dev test clean uninstall release publish winres
 
 ## Compile everything.
 build:
@@ -93,7 +93,7 @@ release:
 	cd gui/frontend && npm install --no-audit --no-fund >/dev/null && npm run build
 	cd gui && $(GO_ENV) $(GO) build -tags production -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-gui .
 	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install ./cmd/kvmshare-install
-	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-gui.exe .
+	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "-H windowsgui $(VERSION_LDFLAGS)" -o kvmshare-gui.exe .
 	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install.exe ./cmd/kvmshare-install
 	@rm -rf dist
 	@mkdir -p dist/kvmshare_$(VERSION)_linux_amd64 dist/kvmshare_$(VERSION)_windows_amd64
@@ -104,7 +104,7 @@ release:
 		echo "mingw-w64 found — building Windows binaries"; \
 		$(CARGO) build --release --target $(WIN_TARGET); \
 		cp target/$(WIN_TARGET)/release/kvmshare-server.exe target/$(WIN_TARGET)/release/kvmshare-client.exe gui/kvmshare-gui.exe gui/kvmshare-install.exe dist/kvmshare_$(VERSION)_windows_amd64/; \
-		cd dist && zip -qr kvmshare_$(VERSION)_windows_amd64.zip kvmshare_$(VERSION)_windows_amd64; \
+		( cd dist && zip -qr kvmshare_$(VERSION)_windows_amd64.zip kvmshare_$(VERSION)_windows_amd64 ); \
 		cp gui/kvmshare-install.exe dist/kvmshare-install_$(VERSION)_windows_amd64.exe; \
 	else \
 		echo "note: x86_64-w64-mingw32-gcc not found — Windows server/client binaries omitted (install mingw-w64, then make release includes them)"; \
@@ -130,6 +130,14 @@ publish: release
 		--title "kvmshare $(VERSION)" \
 		--notes "Portable kvmshare release. Download the installer for your platform (or the full archive) and run it — it fetches and verifies everything itself."
 	@echo "published $(VERSION): https://github.com/YELrhilassi/kvmshare/releases/tag/$(VERSION)"
+
+## Regenerate the Windows icon/version resource (gui/rsrc_windows_amd64.syso)
+## from gui/winres/winres.json + gui/assets/kvmshare.ico. Needs network for
+## the go-winres tool the first time. The generated .syso is committed, so
+## normal builds don't need this.
+winres:
+	cd gui && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres/winres.json --arch amd64
+	@echo "  regenerated gui/rsrc_windows_amd64.syso"
 
 ## Remove build artifacts.
 clean:

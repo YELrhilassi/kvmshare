@@ -80,13 +80,52 @@ impl Layout {
     }
 }
 
+/// Maximum slack (px) between two screen edges for them to still count as
+/// connected.
+///
+/// GUI-built layouts routinely land a couple of pixels off exact contact
+/// (drag rounding, scaled canvas coordinates, aspect-ratio offsets — the
+/// real layouts that broke this feature had 2 px and 4 px gaps). An
+/// unreachable screen edge because of a tiny gap is far worse than
+/// tolerating a small one: the cursor would hit a *dead edge* and refuse
+/// to cross in either direction.
+const EDGE_TOLERANCE: i32 = 16;
+
+/// Are `a` and `b` adjacent across `dir`, within [`EDGE_TOLERANCE`]?
+///
+/// The facing edges must be near each other (touching, overlapping, or
+/// within the tolerance) **and** the perpendicular spans must overlap
+/// (with the same slack) — that is what makes the two screens share an
+/// edge region the cursor can travel along.
 fn adjacent(a: &Screen, b: &Screen, dir: Direction) -> bool {
+    let tol = EDGE_TOLERANCE;
     match dir {
-        Direction::Left => b.rect.right() == a.rect.left() && a.overlaps_vertically(b),
-        Direction::Right => b.rect.left() == a.rect.right() && a.overlaps_vertically(b),
-        Direction::Top => b.rect.bottom() == a.rect.top() && a.overlaps_horizontally(b),
-        Direction::Bottom => b.rect.top() == a.rect.bottom() && a.overlaps_horizontally(b),
+        Direction::Left => {
+            near(a.rect.left(), b.rect.right(), tol) && spans_overlap(a.rect.top(), a.rect.bottom(), b.rect.top(), b.rect.bottom(), tol)
+        }
+        Direction::Right => {
+            near(a.rect.right(), b.rect.left(), tol) && spans_overlap(a.rect.top(), a.rect.bottom(), b.rect.top(), b.rect.bottom(), tol)
+        }
+        Direction::Top => {
+            near(a.rect.top(), b.rect.bottom(), tol) && spans_overlap(a.rect.left(), a.rect.right(), b.rect.left(), b.rect.right(), tol)
+        }
+        Direction::Bottom => {
+            near(a.rect.bottom(), b.rect.top(), tol) && spans_overlap(a.rect.left(), a.rect.right(), b.rect.left(), b.rect.right(), tol)
+        }
     }
+}
+
+/// Are two facing edges within `tol` px of each other (touching counts)?
+fn near(edge_a: i32, edge_b: i32, tol: i32) -> bool {
+    (edge_a - edge_b).abs() <= tol
+}
+
+/// Do two 1-D spans `[a_lo, a_hi)` and `[b_lo, b_hi)` overlap, allowing
+/// `tol` px of slack at the ends? Two screens whose spans nearly meet
+/// (small perpendicular offset) still share an edge region to travel
+/// along; the entry clamp pulls the cursor inside.
+fn spans_overlap(a_lo: i32, a_hi: i32, b_lo: i32, b_hi: i32, tol: i32) -> bool {
+    a_lo - tol < b_hi && b_lo - tol < a_hi
 }
 
 fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
@@ -145,6 +184,31 @@ mod tests {
         let l = two_screen_layout();
         let (_, _, y) = l.neighbor(0, Direction::Left, 0, 99999).unwrap();
         assert_eq!(y, 1079);
+    }
+
+    #[test]
+    fn small_gap_still_connects() {
+        // Exactly the geometry that broke real layouts: pc sits 2 px
+        // right of where hp's edge ends (and 4 px higher). The screens
+        // must still connect across both directions.
+        let l = Layout::new(vec![screen(0, 2, 0, 1920, 1080), screen(1, -1920, -4, 1920, 1080)]);
+        let (id, x, y) = l.neighbor(0, Direction::Left, 2, 300).unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(x, 1919); // hp's right edge
+        assert_eq!(y, 304); // hp is 4 px higher, so pc row 300 maps to hp row 304
+        // And back: hp -> pc (virtual row 300 maps straight across).
+        let (id, x, y) = l.neighbor(1, Direction::Right, -1, 300).unwrap();
+        assert_eq!(id, 0);
+        assert_eq!(x, 0); // pc's left edge
+        assert_eq!(y, 300);
+    }
+
+    #[test]
+    fn big_gap_stays_disconnected() {
+        // A real gap (280 px) must not connect — dead edges stay dead
+        // only when the user actually left a large hole in the layout.
+        let l = Layout::new(vec![screen(0, 0, 0, 1920, 1080), screen(1, -2200, 0, 1920, 1080)]);
+        assert!(l.neighbor(0, Direction::Left, 0, 300).is_none());
     }
 
     #[test]

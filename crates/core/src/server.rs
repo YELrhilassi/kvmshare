@@ -25,6 +25,21 @@ use crate::transport::{RecvResult, Transport};
 pub trait Engine: Send {
     /// Warp the local cursor to a local-screen position.
     fn warp_local(&mut self, x: i32, y: i32);
+    /// Take (or release) exclusive ownership of the local keyboard and
+    /// pointer while the cursor is on a client screen. Without it, the
+    /// same physical input would act on the local desktop *and* be
+    /// forwarded — clicks and typing would land on both machines at
+    /// once. A best-effort call: platforms that cannot grab (yet) simply
+    /// do nothing.
+    fn grab_input(&mut self, grabbed: bool);
+    /// Isolate (or release) the physical input devices from the local
+    /// desktop entirely while the cursor is on a client — stronger than
+    /// [`Engine::grab_input`], because it also stops *raw* event
+    /// delivery to apps that read it directly (browsers, smooth-scroll
+    /// terminals), which no grab can suppress. Best-effort: platforms
+    /// without kernel device isolation do nothing.
+    fn isolate_input(&mut self, _isolated: bool) {}
+
     /// Hide/show the local cursor while away / at home.
     fn show_local_cursor(&mut self, visible: bool);
     /// Put `data` into the local clipboard (copied on a client).
@@ -132,6 +147,12 @@ impl Server {
         loop {
             match input.recv_timeout(CONTROL_POLL) {
                 Ok(msg) => {
+                    // Every message (motion deltas + position beacons from
+                    // the capture) goes straight to the session. Nothing
+                    // here touches the engine: the platform feeds the
+                    // real pointer position through its own beacons, and
+                    // per-event X round-trips would stall the cursor the
+                    // moment the local desktop gets busy.
                     let actions = { self.session.lock().unwrap().on_local_event(msg) };
                     let mut engine = engine.lock().unwrap();
                     for action in actions {
@@ -250,7 +271,7 @@ impl Server {
                     self.send_to(id, &msg)?;
                 }
             }
-            Action::SwitchTo { to, x, y, park } => {
+            Action::SwitchTo { to, x, y } => {
                 // Leave whatever screen we are on.
                 if let Some(old) = self.active.lock().unwrap().take() {
                     self.send_to(old, &Message::Leave { screen_id: old })?;
@@ -259,9 +280,19 @@ impl Server {
                 log_debug!("cursor switched to client {to} at ({x},{y})");
                 self.send_to(to, &Message::Enter { screen_id: to, x, y })?;
                 self.send_to(to, &Message::MouseMoveAbs { x, y })?;
-                // Park the hidden local cursor at its center so it has
-                // room to roam.
-                engine.warp_local(park.0, park.1);
+                // From here on, local input must only reach the client:
+                // grab the pointer+keyboard so the local desktop does not
+                // act on the same physical events being forwarded, and
+                // isolate the physical devices at the kernel so even
+                // raw-reading apps (browsers, terminals) see nothing.
+                engine.grab_input(true);
+                engine.isolate_input(true);
+                // Hide the local cursor **in place** — it is already at
+                // the shared edge where it crossed. Warping it (even
+                // hidden) would sweep hover/enter effects across local
+                // windows; warping it *before* hiding, as an earlier
+                // design did, visibly dashed the cursor to the screen
+                // center on every crossing.
                 engine.show_local_cursor(false);
             }
             Action::SwitchToLocal { x, y } => {
@@ -269,13 +300,13 @@ impl Server {
                     self.send_to(old, &Message::Leave { screen_id: old })?;
                 }
                 log_debug!("cursor back to local screen at ({x},{y})");
+                // Control is home: local input belongs to the local
+                // desktop again. Release the kernel isolation first so
+                // the warp below reaches the desktop.
+                engine.isolate_input(false);
+                engine.grab_input(false);
                 engine.warp_local(x, y);
                 engine.show_local_cursor(true);
-            }
-            Action::RecenterLocal { park } => {
-                // Edge guard for the hidden physical cursor. The virtual
-                // cursor is unaffected (raw input has no warp feedback).
-                engine.warp_local(park.0, park.1);
             }
         }
         Ok(())
@@ -389,6 +420,36 @@ impl Client {
                             engine.clipboard_set(&mime, &data);
                         }
                     }
+                    Message::InputBlocked => {
+                        // The client's OS is dropping our injected input
+                        // (on Windows: an elevated or input-isolated
+                        // window — UAC prompt, on-screen keyboard, an
+                        // admin tool — swallows SendInput). The cursor is
+                        // frozen there and the local grab would keep the
+                        // keyboard from the user, so bring control home.
+                        // Mirrors `Action::SwitchToLocal` in `execute`;
+                        // the client thread has no `Server` handle, only
+                        // the shared state.
+                        let was_active = *active2.lock().unwrap() == Some(c2.id);
+                        if !was_active {
+                            continue;
+                        }
+                        log_warn!(
+                            "{}: local input blocked (elevated window?) — returning control home",
+                            c2.name
+                        );
+                        let action = session2.lock().unwrap().force_local();
+                        if let Action::SwitchToLocal { x, y } = action {
+                            if let Ok(mut engine) = engine2.lock() {
+                                *active2.lock().unwrap() = None;
+                                let _ = c2.transport.lock().unwrap().send(&Message::Leave { screen_id: c2.id });
+                                engine.isolate_input(false);
+                                engine.grab_input(false);
+                                engine.warp_local(x, y);
+                                engine.show_local_cursor(true);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -404,11 +465,12 @@ impl Client {
                 }
             }
             // If the cursor was on this client, drop back to the local
-            // screen and apply the engine side (warp + show cursor). This
-            // mirrors `Action::SwitchToLocal` in `execute`.
+            // screen and apply the engine side (ungrab + warp + show
+            // cursor). This mirrors `Action::SwitchToLocal` in `execute`.
             let action = session2.lock().unwrap().on_client_disconnected(c2.id);
             if let Action::SwitchToLocal { x, y } = action {
                 if let Ok(mut engine) = engine2.lock() {
+                    engine.grab_input(false);
                     engine.warp_local(x, y);
                     engine.show_local_cursor(true);
                 }
