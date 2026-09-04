@@ -304,10 +304,17 @@ func (a *App) SetSettings(s Settings) error {
 	a.writeLogCtlLocked(roleClient)
 	if changed {
 		// Switching roles: the old role's instance is no longer wanted.
+		// A role that refuses to stop (e.g. an elevated process outranking
+		// the GUI) must surface as an error — otherwise the new role's
+		// start would fail against its lock with no explanation.
+		var err error
 		if s.Mode == ModeClient {
-			a.stopRoleLocked(roleServer)
+			err = a.stopRoleLocked(roleServer)
 		} else {
-			a.stopRoleLocked(roleClient)
+			err = a.stopRoleLocked(roleClient)
+		}
+		if err != nil {
+			return err
 		}
 		// Becoming the server means input isolation applies: make sure
 		// the system grant exists (silent once granted).

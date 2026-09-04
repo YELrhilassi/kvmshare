@@ -6,6 +6,7 @@
 //! server → wire → client → injector, plus the engine actions the server
 //! takes on its own machine.
 
+use std::net::{TcpStream, UdpSocket};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,7 +16,10 @@ use kvmshare_core::client::{Client, Injector};
 use kvmshare_core::layout::Layout;
 use kvmshare_core::server::{Control, Engine, Server};
 use kvmshare_core::session::Session;
+use kvmshare_core::transport::{RecvResult, Transport};
+use kvmshare_core::udp;
 use kvmshare_protocol::message::{KeyKind, Message, Rect, Screen, ScreenInfo};
+use kvmshare_protocol::VERSION;
 
 /// The classic layout from the deskflow debugging sessions: pc (server)
 /// on the right, hp (client) to its left.
@@ -211,10 +215,21 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     // local cursor never moves while we are away).
     feed(&h, Message::MouseMoveRel { dx: -100, dy: 0 });
     let cc = calls(&client_calls);
-    assert!(
-        cc.iter().any(|c| c == "rel -100,0"),
-        "expected relative motion forwarded, got {cc:?}"
-    );
+    // Under the closed-loop model the -100 frame is fed forward
+    // immediately (half a frame) and the damped corrections deliver the
+    // rest against the read-back cursor — what must hold is that the
+    // command trajectory is honored exactly: the recorded relative
+    // stream totals -100 px on x, nothing on y.
+    let (rel_x, rel_y): (i64, i64) = cc
+        .iter()
+        .filter_map(|c| c.strip_prefix("rel "))
+        .map(|r| {
+            let (x, y) = r.split_once(',').unwrap();
+            (x.parse::<i64>().unwrap(), y.parse::<i64>().unwrap())
+        })
+        .fold((0, 0), |(ax, ay), (x, y)| (ax + x, ay + y));
+    assert_eq!(rel_x, -100, "motion must deliver the full -100 px command, got {cc:?}");
+    assert_eq!(rel_y, 0, "no motion outside the command axis, got {cc:?}");
     assert!(
         cc.iter().all(|c| !c.starts_with("move ") || c == "move 1919,540"),
         "only the entry move may be absolute, got {cc:?}"
@@ -240,6 +255,81 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     assert!(cc.contains(&"leave".to_string()), "client should leave, got {cc:?}");
     let ec = calls(&h.engine_calls);
     assert!(ec.iter().any(|c| c == "cursor true"), "server should restore its cursor, got {ec:?}");
+}
+
+/// A raw peer that speaks just enough of the protocol to register as a
+/// client, flood the server's UDP beacon stream with `n` cursor
+/// beacons, then vanish. Used to simulate a previous client session whose
+/// UDP sequence counter reached `n` before it disconnected — the
+/// reconnect must not inherit that state (stale beacons must never
+/// deafen a fresh peer).
+fn raw_beacon_client(port: u16, n: u32) {
+    let mut tcp = Transport::new(TcpStream::connect(("127.0.0.1", port)).unwrap()).unwrap();
+    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    tcp.send(&Message::Hello { version: VERSION, name: "hp".into(), info }).unwrap();
+    let id = match tcp.recv().unwrap() {
+        RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => own_screen_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    // A UDP stream to the same server port, like the real client's.
+    let udp_sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    udp_sock.connect(("127.0.0.1", port)).unwrap();
+    for seq in 1..=n {
+        udp_sock
+            .send(&udp::pack(id, seq, &Message::CursorPos { x: 500, y: 540 }))
+            .unwrap();
+    }
+    // Give the server a moment to drain the datagrams, then vanish.
+    thread::sleep(Duration::from_millis(50));
+}
+
+#[test]
+fn client_reconnect_is_not_deafened_by_stale_udp_sequences() {
+    let h = start_server();
+
+    // A previous "hp" session ran long enough that the server's UDP
+    // sequence tracker for its screen id climbed high, then it
+    // disconnected. (The tracker must be cleared on disconnect — a fresh
+    // session starts its own sequence at 1.)
+    raw_beacon_client(h.port, 500);
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 0, "old session should have disconnected");
+
+    // The real client reconnects (same screen id) and must work normally:
+    // beacons from sequence 1 on are fresh and drive the crossing back.
+    let (client, injector, client_calls, out_rx) = connect_client(h.port);
+    thread::spawn(move || client.run(Box::new(injector), &out_rx).unwrap());
+    h.wait_for_clients(1);
+
+    // Cross onto hp.
+    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+    let cc = calls(&client_calls);
+    assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
+    assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
+
+    // Cross back: the client's real cursor is parked on the shared edge;
+    // its (fresh) beacons arm it and the outward push fires the crossing.
+    feed(&h, Message::MouseMoveRel { dx: 10, dy: 0 });
+
+    let mut cc = calls(&client_calls);
+    for _ in 0..50 {
+        if cc.contains(&"leave".to_string()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+        cc = calls(&client_calls);
+    }
+    assert!(cc.contains(&"leave".to_string()), "reconnected client should cross back, got {cc:?}");
+    assert!(
+        calls(&h.engine_calls).iter().any(|c| c == "cursor true"),
+        "server cursor should be restored after the return crossing"
+    );
 }
 
 #[test]

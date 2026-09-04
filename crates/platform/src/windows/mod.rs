@@ -24,6 +24,8 @@ mod capture;
 mod clipboard;
 mod engine;
 mod injector;
+mod isolation;
+mod timer;
 
 use std::sync::mpsc::Receiver;
 
@@ -57,6 +59,10 @@ impl Server {
     /// meaningless on Windows and ignored (kept for a uniform signature).
     pub fn start(_display: Option<&str>) -> Result<Self, String> {
         set_dpi_aware();
+        // 1 ms timer resolution: the capture and session loops are paced
+        // in milliseconds, and Windows' coarse default timer would turn
+        // them into ~15 ms clumps (see [`timer`]).
+        timer::HighResTimer::engage_forever();
         let input = capture::start()?;
         let engine = Box::new(engine::Win32Engine::new());
         Ok(Self { input, engine })
@@ -66,5 +72,8 @@ impl Server {
 /// The client-side Windows platform: an input injector.
 pub fn client_injector(_display: Option<&str>) -> Result<Box<dyn Injector>, String> {
     set_dpi_aware();
+    // 1 ms timer resolution for the motion tick and beacon cadence (see
+    // [`timer`] and [`Server::start`]).
+    timer::HighResTimer::engage_forever();
     Ok(Box::new(injector::Win32Injector::new()))
 }

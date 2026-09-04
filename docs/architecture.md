@@ -155,16 +155,21 @@ and stalls under load in earlier designs.
   to the session (dropping stale frames), and executes any crossing a
   beacon fires. The engine is behind a mutex that is taken *per event*,
   so client threads (clipboard) and the GUI's poller can reach it.
-- **Client:** a single loop. The UDP socket is drained non-blocking
-  every iteration and motion frames are replayed through a pacing
-  accumulator ([`core::motion::PacedFrames`]) at the fixed cadence, so
-  a network clump never turns into a cursor jump and the client OS's
-  pointer transform sees the same per-frame deltas the server produced.
+- **Client:** a single loop steering the cursor in **closed loop**
+  ([`core::motion::PositionFollower`]). The UDP socket is drained
+  non-blocking every iteration; each accepted motion frame advances a
+  commanded position and is injected verbatim (feedforward — zero added
+  latency), and every tick the real cursor is read back and corrected
+  toward the command with a damped move. There is no replay queue, so a
+  backlog can never form and the client OS's own pointer transform
+  (acceleration) cannot make the cursor run away from the hand: an
+  over-moving OS is corrected back, a lost frame is pushed forward.
   Ordering-critical control frames (a click, a key, control leaving)
-  flush any paced motion first, so they land after the motion that
-  preceded them. The TCP read timeout is one motion period while pacing
-  or being controlled, and 100 ms while idle (draining the outbox,
-  noticing resolution changes, polling the clipboard, keepalives).
+  flush the follower's residual first, so they land where the motion
+  pointed. The TCP read timeout is one motion period while controlled,
+  and 100 ms while idle; periodic duties (outbox, resolution changes,
+  clipboard polling, keepalives) run at a fixed cadence so they never
+  crowd the motion tick.
 - **Framing in the transport:** a full frame is decoded per call and
   trailing bytes are *retained* — several frames often share one TCP
   segment, and dropping the remainder silently loses messages (a real bug

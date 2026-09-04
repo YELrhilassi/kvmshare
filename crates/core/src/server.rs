@@ -124,6 +124,12 @@ pub struct Server {
     /// App-layer control messages (hot reload). `None` disables them.
     /// In a `Mutex` so `Server` stays `Sync` (the channel itself is not).
     control: Mutex<Option<Receiver<Control>>>,
+    /// Measures the server's pointer transform (px per device count)
+    /// from the capture stream; the session scales forwarded motion by
+    /// it so the client's cursor mirrors the server's (see [`GainTracker`]).
+    /// In an `Arc<Mutex>` so `run(&self)` can feed it (the main loop is
+    /// the only writer).
+    gain: Arc<std::sync::Mutex<crate::motion::GainTracker>>,
 }
 
 impl Server {
@@ -152,6 +158,7 @@ impl Server {
             udp_addrs: Arc::new(Mutex::new(HashMap::new())),
             udp_seqs: Arc::new(Mutex::new(HashMap::new())),
             control: Mutex::new(control),
+            gain: Arc::new(std::sync::Mutex::new(crate::motion::GainTracker::new())),
         })
     }
 
@@ -180,6 +187,7 @@ impl Server {
         );
         let udp_accept = self.udp.clone();
         let addrs_accept = self.udp_addrs.clone();
+        let seqs_accept = self.udp_seqs.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
@@ -193,6 +201,7 @@ impl Server {
                             engine_accept.clone(),
                             udp_accept.clone(),
                             addrs_accept.clone(),
+                            seqs_accept.clone(),
                         ) {
                             log_warn!("client {addr}: {e}");
                         }
@@ -229,6 +238,20 @@ impl Server {
                     // real pointer position through its own beacons, and
                     // per-event X round-trips would stall the cursor the
                     // moment the local desktop gets busy.
+                    //
+                    // First, feed the pointer-gain measurement: raw
+                    // deltas vs the real-position beacons give the
+                    // server's own px-per-count, which the session
+                    // applies to forwarded motion so the client's cursor
+                    // mirrors the server's.
+                    match &msg {
+                        Message::MouseMoveRel { dx, dy } => self.gain.lock().unwrap().on_delta(*dx, *dy),
+                        Message::MouseMoveAbs { x, y } => {
+                            let g = self.gain.lock().unwrap().on_beacon(*x, *y);
+                            self.session.lock().unwrap().set_gain(g);
+                        }
+                        _ => {}
+                    }
                     let actions = { self.session.lock().unwrap().on_local_event(msg) };
                     let mut engine = engine.lock().unwrap();
                     for action in actions {
@@ -509,6 +532,7 @@ impl Client {
         engine: Arc<Mutex<Box<dyn Engine>>>,
         udp: Arc<UdpSocket>,
         addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
+        seqs: Arc<Mutex<HashMap<u8, u32>>>,
     ) -> io::Result<()> {
         let mut transport = Transport::new(stream)?;
 
@@ -560,6 +584,10 @@ impl Client {
         })?;
         let mut reader = transport.reader()?;
         let (out_tx, out_rx) = mpsc::channel::<Outbound>();
+        // The reader thread owns teardown, so it needs the UDP routing
+        // state too (the writer gets the originals).
+        let addrs2 = addrs.clone();
+        let seqs2 = seqs.clone();
         spawn_writer(id, transport, udp, addrs, out_rx);
         let client = Arc::new(Client { id, name, out: out_tx });
         clients.lock().unwrap().insert(id, client.clone());
@@ -638,8 +666,13 @@ impl Client {
             // Unregister and give the session a chance to return home if
             // this was the active client. Dropping the last `Sender` of
             // the outbound queue ends the writer thread (its channel
-            // closes and the socket goes with it).
+            // closes and the socket goes with it). The UDP routing state
+            // goes too — a later reconnect re-registers its (fresh)
+            // address and sequence space.
             clients2.lock().unwrap().remove(&c2.id);
+            addrs2.lock().unwrap().remove(&c2.id);
+            seqs2.lock().unwrap().remove(&c2.id);
+
             {
                 let mut act = active2.lock().unwrap();
                 if *act == Some(c2.id) {

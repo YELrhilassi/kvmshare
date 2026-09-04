@@ -42,6 +42,12 @@ func signalPid(pid int) error {
 	return syscall.Kill(pid, syscall.SIGTERM)
 }
 
+// forceKillPid is the last-resort kill for a process that ignored the
+// graceful signal.
+func forceKillPid(pid int) error {
+	return syscall.Kill(pid, syscall.SIGKILL)
+}
+
 // raiseSignal is the "show your window" signal between GUI instances.
 //
 // Deliberately NOT SIGUSR1: JavaScriptCore (WebKit's JS engine) uses

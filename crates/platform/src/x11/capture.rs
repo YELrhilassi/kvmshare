@@ -50,13 +50,24 @@
 //!   what the eye can follow.
 //! * **Raw deltas are pre-acceleration.** The *visible* cursor moves by
 //!   accelerated deltas, so the two drift apart on the local screen. The
-//!   capture also selects ordinary XI motion events (the ones carrying
-//!   the real, post-acceleration position) and forwards each as a
-//!   [`Message::MouseMoveAbs`] *beacon*. The session re-anchors its
-//!   virtual cursor to the beacon while on the local screen — zero X
-//!   round-trips, purely event-driven. At the screen edge the OS pins the
-//!   pointer, motion events stop and raw deltas keep flowing, which is
-//!   exactly the outward-push signal that triggers a screen switch.
+//!   capture therefore reads the real, post-acceleration pointer
+//!   position and forwards each change as a [`Message::MouseMoveAbs`]
+//!   *beacon*. The session re-anchors its virtual cursor to the beacon
+//!   while on the local screen. Two sources feed the beacon:
+//!
+//!   * **A core `QueryPointer` poll** at [`REAL_POLL_PERIOD`] — the
+//!     authoritative source. Some X servers never deliver ordinary XI
+//!     motion events to selectors (raw events arrive, buttons arrive,
+//!     motion does not), and event delivery also stops under grabs and
+//!     at the pinned screen edge. Polling is immune to all of that and
+//!     costs one cheap local round-trip per period.
+//!   * **Ordinary XI motion events** (still selected, still forwarded) as
+//!     a zero-latency fast path on servers that do deliver them — same
+//!     position, same beacon, whichever arrives first.
+//!
+//!   At the screen edge the OS pins the pointer and raw deltas keep
+//!   flowing, which is exactly the outward-push signal that triggers a
+//!   screen switch.
 //!
 //! ## Wheel
 //!
@@ -76,7 +87,7 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::protocol::Event as XEvent;
 use x11rb::rust_connection::RustConnection;
 
-use kvmshare_log::{log_debug, log_error, log_info, log_warn};
+use kvmshare_log::{log_debug, log_error, log_info, log_trace, log_warn};
 use kvmshare_protocol::message::{KeyKind, Message};
 
 use super::buttons::{self, XButton};
@@ -104,10 +115,10 @@ const REPEAT_INTERVAL: Duration = Duration::from_millis(33); // ≈ 30/s
 /// 2 ms is far below human perception and keeps idle CPU negligible.
 const POLL_PAUSE: Duration = Duration::from_millis(2);
 
-/// Minimum gap between forwarded position beacons. Ordinary XI motion
-/// events arrive at the device's report rate (up to 1000 Hz on a modern
-/// mouse); forwarding every one floods the wire and the session channel
-/// with near-identical positions, and under load the backlog makes every
+/// Minimum gap between forwarded position beacons. The real pointer
+/// position is sampled at device rate (up to 1000 Hz on a modern mouse);
+/// forwarding every sample floods the wire and the session channel with
+/// near-identical positions, and under load the backlog makes every
 /// beacon *stale* — the session then re-anchors to old positions, which
 /// delays the edge-park confirmation and makes crossings hesitate.
 /// Beacons are therefore coalesced like motion: only the newest position
@@ -115,6 +126,14 @@ const POLL_PAUSE: Duration = Duration::from_millis(2);
 /// period plus the poll pause, and the stream costs a few frames per
 /// second instead of a thousand.
 const BEACON_PERIOD: Duration = Duration::from_millis(6);
+
+/// How often the real pointer position is polled with a core
+/// `QueryPointer`. Every poll is one cheap local round-trip; this
+/// cadence keeps the beacon (and with it the session's wall-arm) at most
+/// one period stale while the pointer moves — the same latency budget as
+/// [`BEACON_PERIOD`] itself. Faster would add round-trips for no
+/// perceptible gain; slower would make crossings hesitate by that much.
+const REAL_POLL_PERIOD: Duration = Duration::from_millis(4);
 
 /// A control action the engine wants performed on the local cursor.
 ///
@@ -239,6 +258,18 @@ struct InputCapture {
     beacon: Option<(i32, i32)>,
     /// When the last beacon was sent (rate limiter).
     last_beacon: Option<Instant>,
+    /// When the real pointer position was last polled (rate limiter for
+    /// [`REAL_POLL_PERIOD`]).
+    real_poll_at: Instant,
+    /// Motion telemetry (trace): forwarded raw counts vs pc's own real
+    /// (post-acceleration) pointer travel — the px-per-count reference
+    /// the client's feel should match. Fed at the send points and
+    /// sampled on the poll cadence (see [`MotionProbe`]).
+    probe: kvmshare_core::motion::MotionProbe,
+    /// The last real pointer position the probe sampled at (kept so a
+    /// window is measured against the position where the previous window
+    /// ended, even when XI motion events pause between samples).
+    probe_last_real: Option<(i32, i32)>,
     /// Keys the device has pressed but not yet released (HID usage → state).
     held: HashMap<u32, Held>,
     /// Whether *we* currently hold the pointer+keyboard grab.
@@ -285,6 +316,9 @@ pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<
         motion: PendingMotion::default(),
         beacon: None,
         last_beacon: None,
+        real_poll_at: Instant::now(),
+        probe: kvmshare_core::motion::MotionProbe::default(),
+        probe_last_real: None,
         held: HashMap::new(),
         grabbed: false,
         evdev,
@@ -315,10 +349,50 @@ impl InputCapture {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 self.apply(cmd);
             }
+            self.poll_real_pointer();
             self.flush_motion();
             self.flush_beacon();
             self.tick_repeats();
+            self.sample_probe();
             thread::sleep(POLL_PAUSE);
+        }
+    }
+
+    /// Sample the real pointer position with a core `QueryPointer` at
+    /// [`REAL_POLL_PERIOD`], and feed the coalesced beacon and the
+    /// telemetry anchor.
+    ///
+    /// The XI motion fast path ([`Self::on_event`]) stays, but polling is
+    /// the source that always works: some X servers never deliver XI
+    /// motion events to selectors at all, and even on healthy ones the
+    /// stream stops under grabs and at the pinned screen edge — the exact
+    /// moments the real position matters most. Polling reports the
+    /// server-side pointer state and is immune to both. Ordering is
+    /// identical to the event path: any raw motion accrued since the last
+    /// send is forwarded *first*, then the position is kept for the
+    /// beacon — the session applies deltas and re-anchors in that order.
+    fn poll_real_pointer(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.real_poll_at) < REAL_POLL_PERIOD {
+            return;
+        }
+        self.real_poll_at = now;
+        let Ok(cookie) = self.conn.query_pointer(self.root) else { return };
+        let Ok(reply) = cookie.reply() else { return };
+        let (x, y) = (reply.root_x as i32, reply.root_y as i32);
+        if self.probe_last_real == Some((x, y)) {
+            // Unchanged since the last sample: no new beacon, and the
+            // motion flush below already ran on the last change.
+            return;
+        }
+        self.flush_motion();
+        self.probe_last_real = Some((x, y));
+        // The real position only means something while the local pointer
+        // is free; while remote it is grabbed and parked (or pinned by
+        // isolation), so its position would report the seam, not the
+        // user's intent.
+        if !self.grabbed {
+            self.beacon = Some((x, y));
         }
     }
 
@@ -337,7 +411,10 @@ impl InputCapture {
                 self.flush_motion();
                 let x = (e.root_x >> 16) as i32;
                 let y = (e.root_y >> 16) as i32;
-                self.beacon = Some((x, y));
+                self.probe_last_real = Some((x, y));
+                if !self.grabbed {
+                    self.beacon = Some((x, y));
+                }
             }
             XEvent::XinputRawButtonPress(e) => self.on_button(e.detail, true),
             XEvent::XinputRawButtonRelease(e) => self.on_button(e.detail, false),
@@ -399,7 +476,27 @@ impl InputCapture {
     fn flush_motion(&mut self) {
         let tx = &self.tx;
         self.motion.flush(&mut |dx, dy| {
+            self.probe.requested(dx, dy);
             let _ = tx.send(Message::MouseMoveRel { dx, dy });
+        });
+    }
+
+    /// Sample pc's own motion telemetry at the probe cadence (trace):
+    /// raw counts forwarded vs pc's real post-acceleration pointer
+    /// travel over the same window. The ratio is pc's px-per-count — the
+    /// reference the client's feel must match. Skipped while the pointer
+    /// is remote (grabbed and isolated: XI motion events stop, and
+    /// comparing against a pinned cursor would report a bogus zero).
+    fn sample_probe(&mut self) {
+        // Local only: while the cursor is on a client the local pointer
+        // is grabbed and pinned, and comparing against it would report a
+        // bogus zero travel.
+        if self.grabbed || !self.probe.due() {
+            return;
+        }
+        let Some(real) = self.probe_last_real else { return };
+        self.probe.sample(real, &mut |rx, ry, ax, ay, ex, ey, gx, gy| {
+            log_trace!("motion req=({rx},{ry}) act=({ax},{ay}) exp=({ex},{ey}) real=({gx},{gy})");
         });
     }
 

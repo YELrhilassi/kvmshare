@@ -8,14 +8,17 @@
 //!   beacons out. Additive and loss-tolerant, so the cursor's latency is
 //!   never coupled to the reliable stream's buffering.
 //!
-//! Motion frames arrive over UDP in clumps (bursts, scheduling jitter).
-//! Injecting each as it lands makes the visible cursor jump in
-//! syncopation with the wire, so frames are replayed through
-//! [`PacedFrames`] at the fixed cadence — smooth under load, honest to
-//! the client OS's pointer acceleration. All OS-specific work (moving the
-//! real cursor, injecting keys, touching the clipboard) lives behind the
-//! [`Injector`] trait; this module is plain message dispatch and can be
-//! tested with a fake injector.
+//! The cursor on the client is steered by a **closed loop**
+//! ([`PositionFollower`]): every received motion frame advances a
+//! commanded position and is injected verbatim (zero added latency on a
+//! healthy wire), and every loop tick the real cursor is compared
+//! against the command — any residual (the OS's pointer acceleration
+//! over-moving, a lost frame under-moving, a stall) is corrected with a
+//! damped injection. There is no replay queue, so no backlog can ever
+//! form. All OS-specific work (moving the real cursor, injecting keys,
+//! touching the clipboard) lives behind the [`Injector`] trait; this
+//! module is plain message dispatch and can be tested with a fake
+//! injector.
 
 use std::io;
 use std::net::{TcpStream, UdpSocket};
@@ -25,7 +28,7 @@ use std::time::{Duration, Instant};
 use kvmshare_log::{log_debug, log_trace, log_warn};
 use kvmshare_protocol::message::{KeyKind, Layout, Message, ScreenInfo};
 
-use crate::motion::{PacedFrames, MOTION_PERIOD};
+use crate::motion::{MotionProbe, PositionFollower, MOTION_PERIOD};
 use crate::transport::{RecvResult, Transport};
 use crate::udp;
 
@@ -48,6 +51,21 @@ pub trait Injector: Send {
     /// this machine — the model every mature KVM uses. The motion stream
     /// is relative; absolute positioning is reserved for entry points.
     fn move_rel(&mut self, dx: i32, dy: i32);
+    /// Whether this backend places the cursor **absolutely** for motion
+    /// (each `move_rel` delta accumulated and the cursor set exactly)
+    /// rather than forwarding relative input for the OS to transform.
+    ///
+    /// Absolute placement bypasses the client OS's pointer acceleration
+    /// entirely: the shared cursor lands exactly where commanded, the
+    /// OS can never over-run the hand, and a lost frame self-heals (the
+    /// next set lands the whole command). Backends that return `true`
+    /// skip the closed-loop follower — the placement *is* the loop. The
+    /// server compensates for its own pointer transform by scaling the
+    /// counts it sends (see `GainTracker`), so the client cursor mirrors
+    /// the server cursor pixel-for-pixel.
+    fn absolute_motion(&self) -> bool {
+        false
+    }
     /// The cursor's *real* current position in local screen pixels (what
     /// the OS reports, after applying its transform to the relative
     /// motion we injected). Reported to the server on a cadence while
@@ -85,10 +103,9 @@ pub trait Injector: Send {
 
 /// How often the client sends a keepalive when idle.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-/// How long the TCP read can block while idle (nothing being paced, not
-/// controlled). While the client is pacing motion or being controlled the
-/// timeout drops to one motion period, so buffered motion and periodic
-/// duties are never delayed by a long block.
+/// How long the TCP read can block while idle (not controlled). While
+/// being controlled the timeout drops to one motion period, so the
+/// closed-loop tick and beacons stay fresh even on a quiet wire.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// How often the client polls its local clipboard to push changes up.
 const CLIPBOARD_INTERVAL: Duration = Duration::from_millis(500);
@@ -176,24 +193,34 @@ impl Client {
         let mut blocked_reported = false;
         let mut controlled = false;
         let mut beacon_failed = false;
-        // Motion pacing: incoming frames are replayed at the fixed
-        // cadence (see [`PacedFrames`]), so network clumps never turn
-        // into cursor jumps.
-        let mut paced = PacedFrames::default();
-        // Start as if a frame went out one period ago, so the first queued
-        // frame emits immediately.
-        let mut paced_since = Instant::now() - MOTION_PERIOD;
+        // The cursor is steered by a closed loop (see
+        // [`PositionFollower`]): received frames advance the command and
+        // are injected verbatim; each tick the real cursor is corrected
+        // toward the command. No queue — no backlog can form.
+        let mut follower = PositionFollower::default();
         // Sequence of the newest applied cursor-stream frame (stale and
         // duplicate datagrams are dropped).
         let mut motion_seq: u32 = 0;
+        // Motion telemetry (trace): the commanded trajectory (entry point
+        // plus every received frame) vs where the real cursor actually
+        // is — the residual gap is exactly the lag a windowed magnitude
+        // probe cannot see. See [`MotionProbe`].
+        let mut probe = MotionProbe::default();
         // Current TCP read timeout, so it is only reconfigured on change.
         let mut timeout: Option<Duration> = Some(READ_TIMEOUT);
+        // Periodic duties (resolution check, clipboard, keepalive) only
+        // run at this cadence while controlled — they must never crowd
+        // the motion tick.
+        let mut last_duty = Instant::now();
+        let duty_interval = CLIPBOARD_INTERVAL;
         loop {
             // 1. Drain the UDP cursor stream. Only relative motion rides
             //    it; beacons are sent below. Stale/duplicate frames are
-            //    dropped by sequence number (additive motion loses
-            //    nothing — a reordered frame is older traffic the cursor
-            //    already moved past).
+            //    dropped by sequence number (a reordered frame is older
+            //    traffic the cursor already moved past). Each accepted
+            //    frame advances the commanded position and is injected
+            //    verbatim (feedforward — the wire cadence *is* the
+            //    cursor cadence).
             loop {
                 let mut buf = [0u8; 512];
                 match self.udp.recv(&mut buf) {
@@ -209,7 +236,7 @@ impl Client {
                             // transports), and at most a frame or two at
                             // the seam is lost — self-correcting.
                             if controlled {
-                                paced.push(dx, dy);
+                                Self::apply_motion(dx, dy, &mut *injector, &mut follower, &mut probe);
                             }
                         }
                     }
@@ -217,19 +244,10 @@ impl Client {
                 }
             }
 
-            // 2. Replay paced motion at the cadence (no-op when nothing
-            //    is queued or nothing is due yet).
-            paced.flush(&mut paced_since, &mut |dx, dy| injector.move_rel(dx, dy));
-
-            // 3. Control channel: one TCP message, or a timeout. While
-            //    pacing motion or being controlled, wake at motion
-            //    cadence so clumps keep draining and beacons stay fresh
-            //    even on a quiet wire.
-            let want = if controlled || paced.has_pending() {
-                Some(MOTION_PERIOD)
-            } else {
-                Some(READ_TIMEOUT)
-            };
+            // 2. Control channel: one TCP message, or a timeout. While
+            //    being controlled, wake at motion cadence so corrections
+            //    and beacons stay fresh even on a quiet wire.
+            let want = if controlled { Some(MOTION_PERIOD) } else { Some(READ_TIMEOUT) };
             if want != timeout {
                 self.transport.set_read_timeout(want)?;
                 timeout = want;
@@ -238,7 +256,7 @@ impl Client {
                 RecvResult::Msg(msg) => {
                     let entered = matches!(msg, Message::Enter { .. });
                     let left = matches!(msg, Message::Leave { .. });
-                    self.dispatch(msg, &mut *injector, &mut paced);
+                    self.dispatch(msg, &mut *injector, &mut follower, &mut probe);
                     if entered {
                         controlled = true;
                         // Control just landed: report where we are right
@@ -253,47 +271,83 @@ impl Client {
                 }
                 RecvResult::Eof => break,
                 RecvResult::NoData => {
-                    // Nothing from the server: service the outbox, notice
-                    // resolution changes, push clipboard changes up, and
-                    // keep the link warm.
-                    while let Ok(msg) = outbox.try_recv() {
-                        self.transport.send(&msg)?;
-                    }
-                    let info = injector.screen_info();
-                    if info != last_info {
-                        self.transport.send(&Message::ScreenInfo { info })?;
-                        last_info = info;
-                    }
-                    if last_clip_check.elapsed() >= CLIPBOARD_INTERVAL {
-                        last_clip_check = Instant::now();
-                        let cur = injector.clipboard_get();
-                        // Skip content we just applied from the server, and
-                        // content we have already sent.
-                        if let Some(cur) = cur {
-                            if last_clip_seen.as_ref() != Some(&cur)
-                                && injector.clipboard_last_injected().as_ref() != Some(&cur)
-                            {
-                                let (mime, data) = cur.clone();
-                                self.transport.send(&Message::Clipboard { mime, data })?;
-                                last_clip_seen = Some(cur);
+                    // Periodic duties run at a cadence, never on every
+                    // wakeup: a slow clipboard read or a monitor query
+                    // must not crowd the motion tick while controlled.
+                    if last_duty.elapsed() >= duty_interval {
+                        last_duty = Instant::now();
+                        // Service the outbox, notice resolution changes,
+                        // push clipboard changes up, keep the link warm.
+                        while let Ok(msg) = outbox.try_recv() {
+                            self.transport.send(&msg)?;
+                        }
+                        let info = injector.screen_info();
+                        if info != last_info {
+                            self.transport.send(&Message::ScreenInfo { info })?;
+                            last_info = info;
+                        }
+                        if last_clip_check.elapsed() >= CLIPBOARD_INTERVAL {
+                            last_clip_check = Instant::now();
+                            let cur = injector.clipboard_get();
+                            // Skip content we just applied from the
+                            // server, and content we have already sent.
+                            if let Some(cur) = cur {
+                                if last_clip_seen.as_ref() != Some(&cur)
+                                    && injector.clipboard_last_injected().as_ref() != Some(&cur)
+                                {
+                                    let (mime, data) = cur.clone();
+                                    self.transport.send(&Message::Clipboard { mime, data })?;
+                                    last_clip_seen = Some(cur);
+                                }
                             }
                         }
-                    }
-                    if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
-                        self.transport.send(&Message::KeepAlive)?;
-                        last_keepalive = Instant::now();
+                        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+                            self.transport.send(&Message::KeepAlive)?;
+                            last_keepalive = Instant::now();
+                        }
                     }
                 }
             }
 
-            // 4. While being controlled, keep the server fed with our
-            //    real cursor position over the UDP stream (see
-            //    [`CURSOR_BEACON_INTERVAL`]). Runs after every wakeup so a
-            //    continuous message stream never starves it.
-            if controlled && last_cursor_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
-                last_cursor_beacon = Instant::now();
-                let (x, y) = injector.cursor_position();
-                self.send_beacon(x, y, &mut beacon_failed)?;
+            // 3. The closed-loop tick while being controlled: steer the
+            //    cursor, read the real position once, beacon it to the
+            //    server (edge crossings depend on it), and sample
+            //    telemetry — all from the same fresh position.
+            if controlled {
+                if injector.absolute_motion() {
+                    // Absolute backends place the cursor exactly at the
+                    // commanded position once per tick. Every frame that
+                    // arrived since the last tick is represented, so the
+                    // cursor moves once — evenly, at the loop's cadence
+                    // — and a burst of UDP datagrams can never clump it
+                    // into visible steps. (The placement is skipped when
+                    // the cursor is already there: an idle cursor costs
+                    // nothing, and a stray native move is re-placed —
+                    // self-healing.)
+                    let (rx, ry) = injector.cursor_position();
+                    let (cx, cy) = follower.command();
+                    if (cx, cy) != (rx, ry) {
+                        injector.move_cursor(cx, cy);
+                    }
+                } else {
+                    let (rx, ry) = injector.cursor_position();
+                    if let Some((cx, cy)) = follower.correct((rx, ry)) {
+                        injector.move_rel(cx, cy);
+                    }
+                }
+                let (rx, ry) = injector.cursor_position();
+                if last_cursor_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
+                    last_cursor_beacon = Instant::now();
+                    self.send_beacon(rx, ry, &mut beacon_failed)?;
+                }
+                if probe.due() {
+                    let (ex, ey) = follower.error((rx, ry));
+                    probe.sample((rx, ry), &mut |rx, ry, ax, ay, _ex, _ey, gx, gy| {
+                        log_trace!(
+                            "motion req=({rx},{ry}) act=({ax},{ay}) err=({ex},{ey}) real=({gx},{gy})"
+                        );
+                    });
+                }
             }
 
             // 5. After every wakeup (message or timeout): if the local OS
@@ -335,51 +389,107 @@ impl Client {
         }
     }
 
-    /// Apply one server message to the local machine. Ordering-critical
-    /// events flush any paced motion first, so a click, key or control
-    /// transition lands after the motion that preceded it.
-    fn dispatch(&mut self, msg: Message, injector: &mut dyn Injector, paced: &mut PacedFrames) {
+    /// Apply one motion frame to the local machine. Relative backends
+    /// get the follower's feedforward portion (the closed loop delivers
+    /// the rest). Absolute backends only advance the command — the
+    /// cursor itself is placed at the command on the loop tick (see the
+    /// run loop), so the wire cadence never reaches the cursor directly
+    /// and a burst of datagrams cannot clump it. Either way the command
+    /// (and hence the telemetry) tracks the full frame.
+    fn apply_motion(
+        dx: i32,
+        dy: i32,
+        injector: &mut dyn Injector,
+        follower: &mut PositionFollower,
+        probe: &mut MotionProbe,
+    ) {
+        if injector.absolute_motion() {
+            follower.advance(dx, dy);
+        } else {
+            let (dx, dy) = follower.push(dx, dy);
+            injector.move_rel(dx, dy);
+        }
+        probe.requested(dx, dy);
+    }
+
+    /// Before an ordering-critical event (button, key, wheel) the cursor
+    /// must sit on the command point. Absolute backends place it there
+    /// exactly — the placement is the loop, and the command is the only
+    /// truth. Relative backends flush the follower's residual as one
+    /// capped move, so a click lands where the motion pointed without a
+    /// wedged cursor dragging it across the screen.
+    fn flush_before_event(injector: &mut dyn Injector, follower: &mut PositionFollower) {
+        if injector.absolute_motion() {
+            let (cx, cy) = follower.command();
+            injector.move_cursor(cx, cy);
+            return;
+        }
+        let (rx, ry) = injector.cursor_position();
+        if let Some((cx, cy)) = follower.flush((rx, ry)) {
+            injector.move_rel(cx, cy);
+        }
+    }
+
+    /// Apply one server message to the local machine. Motion advances
+    /// the [`PositionFollower`] command (and is injected verbatim);
+    /// ordering-critical events first flush the follower's residual so a
+    /// click, key or wheel lands where the motion pointed.
+    fn dispatch(
+        &mut self,
+        msg: Message,
+        injector: &mut dyn Injector,
+        follower: &mut PositionFollower,
+        probe: &mut MotionProbe,
+    ) {
         match msg {
             Message::MouseMoveRel { dx, dy } => {
-                // Cursor-stream frames normally arrive over UDP (drained
-                // in run()); a frame that came over the control channel
-                // takes the same paced path.
-                paced.push(dx, dy);
+                // Defensive: motion normally arrives over UDP (drained in
+                // run()); a frame on the control channel follows the same
+                // path.
+                Self::apply_motion(dx, dy, injector, follower, probe);
             }
             Message::MouseMoveAbs { x, y } => {
                 // Absolute placement (defensive — entry placement travels
                 // in the Enter message; the session never emits absolute
-                // moves in the motion stream).
-                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
+                // moves in the motion stream). The command follows the
+                // placed point.
                 injector.move_cursor(x, y);
+                follower.reanchor(x, y);
             }
             Message::Enter { screen_id: _, x, y } => {
-                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
                 log_trace!("control entered at ({x},{y})");
+                follower.enter(x, y);
                 injector.enter();
                 // Absolute placement at the entry point only — from here
-                // on the motion stream is relative (see [`Injector::move_rel`]).
+                // on the motion stream is relative (see
+                // [`Injector::move_rel`]). Anchor the command and the
+                // telemetry at where the cursor actually ended up (read
+                // back, so placement rounding never shows up as drift).
                 injector.move_cursor(x, y);
+                let (rx, ry) = injector.cursor_position();
+                follower.reanchor(rx, ry);
+                probe.enter((rx, ry));
             }
             Message::Leave { screen_id: _ } => {
-                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
                 log_trace!("control left");
+                follower.leave();
+                probe.leave();
                 injector.leave();
             }
-            // Buttons, keys and wheel are ordering-critical: they land
-            // after the motion that positioned the cursor.
+            // Buttons, keys and wheel are ordering-critical: the cursor
+            // must sit on the command point before the event fires.
             Message::MouseButton { button, pressed } => {
-                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
+                Self::flush_before_event(injector, follower);
                 log_trace!("button {button} {}", if pressed { "down" } else { "up" });
                 injector.button(button, pressed);
             }
             Message::MouseWheel { dx, dy } => {
-                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
+                Self::flush_before_event(injector, follower);
                 log_trace!("wheel {dx},{dy}");
                 injector.wheel(dx, dy);
             }
             Message::Key { kind, key } => {
-                paced.drain_now(&mut |dx, dy| injector.move_rel(dx, dy));
+                Self::flush_before_event(injector, follower);
                 log_trace!("key {kind:?} {key}");
                 injector.key(kind, key);
             }
@@ -443,10 +553,13 @@ mod tests {
     /// test can simulate a resolution change while the loop is running.
     /// `pos` is the simulated real cursor position: absolute moves set
     /// it, relative moves shift it (a fake OS without acceleration).
+    /// `abs` simulates an absolute-placement backend (SetCursorPos-style):
+    /// each relative move lands the whole delta exactly.
     struct RecordingInjector {
         calls: Arc<Mutex<Vec<String>>>,
         info: Arc<Mutex<ScreenInfo>>,
         pos: Arc<Mutex<(i32, i32)>>,
+        abs: bool,
     }
 
     impl Default for RecordingInjector {
@@ -455,6 +568,7 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 info: Arc::new(Mutex::new(ScreenInfo::default())),
                 pos: Arc::new(Mutex::new((0, 0))),
+                abs: false,
             }
         }
     }
@@ -465,11 +579,19 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 info: Arc::new(Mutex::new(info)),
                 pos: Arc::new(Mutex::new((0, 0))),
+                abs: false,
             }
+        }
+        fn absolute(mut self) -> Self {
+            self.abs = true;
+            self
         }
     }
 
     impl Injector for RecordingInjector {
+        fn absolute_motion(&self) -> bool {
+            self.abs
+        }
         fn screen_info(&mut self) -> ScreenInfo {
             *self.info.lock().unwrap()
         }
@@ -601,8 +723,15 @@ mod tests {
     /// The full UDP cursor path, exactly as the real server provides it:
     /// TCP handshake + control channel, UDP socket on the same port, the
     /// client's registration datagram teaching us where to send motion.
+    ///
+    /// Under the closed-loop model the frames are *not* injected verbatim:
+    /// half is fed forward immediately and the damped corrections deliver
+    /// the rest against the read-back real cursor. What must hold is that
+    /// the command trajectory is honored **exactly** — total injected
+    /// motion equals the sum of the received frames, in order, with the
+    /// stale duplicate never re-applied.
     #[test]
-    fn udp_motion_stream_is_paced_and_deduped() {
+    fn udp_motion_stream_reaches_the_command_exactly_and_dedupes() {
         let port = 39004;
         let welcome = Message::Welcome {
             server_version: kvmshare_protocol::VERSION,
@@ -646,6 +775,7 @@ mod tests {
 
         let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 });
         let calls_handle = injector.calls.clone();
+        let pos_handle = injector.pos.clone();
         let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
         let (_tx, rx) = mpsc::channel::<Message>();
         // The fake server closes the TCP side after ~310ms; run until EOF.
@@ -653,14 +783,92 @@ mod tests {
         let _ = calls;
 
         let calls = calls_handle.lock().unwrap().clone();
-        // The burst is replayed one frame per motion period, in order —
-        // the cursor tracks the hand smoothly instead of jumping 60px at
-        // once — and the stale duplicate never re-applies.
+        // The command trajectory is honored exactly: entry at (100,100)
+        // plus the received frames (10+20+30, 0) — no frame lost to the
+        // wire, none duplicated by the stale re-send, and the closed-loop
+        // corrections settle on the command rather than overshooting it.
+        assert_eq!(*pos_handle.lock().unwrap(), (160, 100), "command trajectory honored exactly");
         let rels: Vec<&String> = calls.iter().filter(|c| c.starts_with("rel ")).collect();
-        assert_eq!(
-            rels,
-            vec![&"rel 10,0".to_string(), &"rel 20,0".to_string(), &"rel 30,0".to_string()],
-            "motion must be paced per frame with no duplicates, got {rels:?}"
+        let total_x: i64 = rels
+            .iter()
+            .filter_map(|c| c.split_once(' ').and_then(|(_, r)| r.split_once(',')))
+            .map(|(x, _)| x.parse::<i64>().unwrap())
+            .sum();
+        assert_eq!(total_x, 60, "total injected motion equals the command sum");
+        assert!(
+            rels.iter().all(|c| !c.contains("99")),
+            "stale duplicate (seq 2, dx 99) must never be applied, got {rels:?}"
+        );
+        assert!(
+            rels.iter().all(|c| c.ends_with(",0")),
+            "no motion outside the command axis, got {rels:?}"
+        );
+        assert!(calls.contains(&"enter".to_string()));
+        assert!(calls.iter().any(|c| c == "move 100,100"));
+    }
+
+    /// An absolute-placement backend (SetCursorPos-style) must land the
+    /// cursor **exactly on the command trajectory**: every received frame
+    /// advances the command (the stale duplicate never re-applies), and
+    /// the per-tick placement puts the cursor at the command — once,
+    /// evenly, never one clump per datagram burst.
+    #[test]
+    fn absolute_backends_land_exactly_on_the_command_via_tick_placement() {
+        let port = 39005;
+        let welcome = Message::Welcome {
+            server_version: kvmshare_protocol::VERSION,
+            layout: Layout { screens: vec![] },
+            own_screen_id: 7,
+        };
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).unwrap(); // hello
+            stream.write_all(&welcome.encode()).unwrap();
+            stream.flush().unwrap();
+            let mut reg = [0u8; 512];
+            let (n, from) = udp.recv_from(&mut reg).unwrap();
+            let d = crate::udp::unpack(&reg[..n]).expect("registration datagram");
+            assert_eq!(d.id, 7);
+            thread::sleep(Duration::from_millis(30));
+            stream.write_all(&Message::Enter { screen_id: 7, x: 100, y: 100 }.encode()).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(80));
+            for (seq, dx) in [(1u32, 10), (2, 20), (3, 30)] {
+                let bytes = crate::udp::pack(7, seq, &Message::MouseMoveRel { dx, dy: 0 });
+                udp.send_to(&bytes, from).unwrap();
+            }
+            let dup = crate::udp::pack(7, 2, &Message::MouseMoveRel { dx: 99, dy: 0 });
+            udp.send_to(&dup, from).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+
+        let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 }).absolute();
+        let calls_handle = injector.calls.clone();
+        let pos_handle = injector.pos.clone();
+        let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+        let (_tx, rx) = mpsc::channel::<Message>();
+        let _ = client.run(Box::new(injector), &rx);
+
+        let calls = calls_handle.lock().unwrap().clone();
+        // Nothing is injected per datagram — the tick places the whole
+        // command. The cursor lands exactly on the command trajectory.
+        assert!(
+            calls.iter().all(|c| !c.starts_with("rel ")),
+            "no per-datagram injection for absolute backends, got {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "move 160,100"),
+            "tick placement lands on the command, got {calls:?}"
+        );
+        assert_eq!(*pos_handle.lock().unwrap(), (160, 100), "cursor lands exactly on the command");
+        assert!(
+            calls.iter().all(|c| !c.contains("99")),
+            "stale duplicate (seq 2, dx 99) must never be applied, got {calls:?}"
         );
         assert!(calls.contains(&"enter".to_string()));
         assert!(calls.iter().any(|c| c == "move 100,100"));

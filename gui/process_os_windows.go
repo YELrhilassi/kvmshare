@@ -10,6 +10,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/windows"
@@ -64,6 +67,21 @@ func terminateProcess(pid int) error {
 	}
 	defer windows.CloseHandle(h)
 	return windows.TerminateProcess(h, 1)
+}
+
+// forceKillPid kills a process that rejected a direct handle: the
+// graceful path first, then `taskkill /F` (which walks up to the
+// process's own privilege level the way a plain OpenProcess cannot — an
+// elevated target under a non-elevated GUI, for instance).
+func forceKillPid(pid int) error {
+	if err := terminateProcess(pid); err == nil {
+		return nil
+	}
+	out, err := exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("taskkill %d: %v (%s)", pid, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // tryLockFile takes a non-blocking exclusive byte-range lock on the whole

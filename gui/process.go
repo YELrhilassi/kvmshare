@@ -153,7 +153,11 @@ const roleClient = "client"
 // stopRoleLocked stops the role's instance whether we spawned it or not:
 // our child first, then whoever still holds the lock (signalled via the
 // pid recorded in the lock file). Callers hold a.mu.
-func (a *App) stopRoleLocked(role string) {
+//
+// Returns an error when the role is still holding its lock after the
+// grace period — a stop that silently did nothing would leave the other
+// role refusing to start ("X is already running") with no explanation.
+func (a *App) stopRoleLocked(role string) error {
 	if role == roleServer {
 		a.serverProc = stopProc(a.serverProc)
 	} else {
@@ -162,24 +166,32 @@ func (a *App) stopRoleLocked(role string) {
 	deadline := time.Now().Add(4 * time.Second)
 	for a.roleActive(role) && time.Now().Before(deadline) {
 		if pid := a.pidFromLock(role); pid > 0 {
-			_ = signalPid(pid)
+			// Graceful first; when that is refused (typically an
+			// elevated process and a non-elevated controller), fall
+			// back to the platform's hard kill (SIGKILL on Unix,
+			// taskkill on Windows).
+			if err := signalPid(pid); err != nil {
+				_ = forceKillPid(pid)
+			}
 		}
 		time.Sleep(120 * time.Millisecond)
 	}
+	if a.roleActive(role) {
+		return fmt.Errorf("could not stop the running %s (pid %d): it is still holding its lock", role, a.pidFromLock(role))
+	}
+	return nil
 }
 
 func (a *App) ServerStop() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.stopRoleLocked(roleServer)
-	return nil
+	return a.stopRoleLocked(roleServer)
 }
 
 func (a *App) ClientStop() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.stopRoleLocked(roleClient)
-	return nil
+	return a.stopRoleLocked(roleClient)
 }
 
 func (a *App) ServerStart() (bool, error) {
@@ -189,8 +201,13 @@ func (a *App) ServerStart() (bool, error) {
 	if a.serverProc.running() || a.roleActive(roleServer) {
 		return true, nil // already running (adopt the background instance)
 	}
-	// One role per machine: stop any client first.
-	a.stopRoleLocked(roleClient)
+	// One role per machine: stop any client first. A client that cannot
+	// be stopped (e.g. an elevated process outranking the GUI) must
+	// surface as a clear error here — starting would fail anyway when
+	// the server binary refuses its role lock.
+	if err := a.stopRoleLocked(roleClient); err != nil {
+		return false, err
+	}
 
 	if _, err := os.Stat(a.serverPath); err != nil {
 		return false, fmt.Errorf("server binary not found at %s (run make install)", a.serverPath)
@@ -217,8 +234,11 @@ func (a *App) ClientStart() (bool, error) {
 	if a.clientProc.running() || a.roleActive(roleClient) {
 		return true, nil // already running (adopt the background instance)
 	}
-	// One role per machine: stop any server first.
-	a.stopRoleLocked(roleServer)
+	// One role per machine: stop any server first (see ServerStart for
+	// why a failed stop aborts the start).
+	if err := a.stopRoleLocked(roleServer); err != nil {
+		return false, err
+	}
 
 	if _, err := os.Stat(a.clientPath); err != nil {
 		return false, fmt.Errorf("client binary not found at %s (run make install)", a.clientPath)

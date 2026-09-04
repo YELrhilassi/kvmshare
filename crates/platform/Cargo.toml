@@ -21,6 +21,7 @@ evdev = "0.13"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi", # WNDCLASSW / RegisterClassW are gated behind this
+  "Win32_Media", # timeBeginPeriod/timeEndPeriod for 1 ms timer resolution
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",

@@ -2,15 +2,17 @@
 //! buttons/keys/wheel, hide the local cursor while being controlled,
 //! read/write the clipboard. Implements [`Injector`] from the core crate.
 //!
-//! **Motion is relative.** The motion stream carries relative deltas and
-//! this injector forwards them as *relative* [`SendInput`] moves, so the
-//! Windows pointer transform (speed / acceleration settings) applies —
-//! the shared cursor feels exactly like a physical mouse on this machine,
-//! no matter what acceleration the server's desktop uses. Absolute moves
-//! are used only to *place* the cursor (the entry point when control
-//! arrives). Keys and buttons use scan codes (`KEYEVENTF_SCANCODE`), the
-//! layout-independent model: the physical key identity travels and the
-//! local layout produces the character.
+//! **Motion is absolute.** The motion stream carries deltas and this
+//! injector accumulates them and places the cursor exactly with
+//! [`SetCursorPos`] — Windows' pointer acceleration (EPP) never applies
+//! to absolute placement, so the shared cursor lands precisely where the
+//! server commanded: no OS-curve overshoot, no correction lag, and a
+//! dropped placement self-heals. The server compensates for its *own*
+//! pointer transform by scaling the counts it sends (its measured
+//! px-per-count), so this cursor mirrors the server's cursor
+//! pixel-for-pixel. Keys and buttons use scan codes
+//! (`KEYEVENTF_SCANCODE`), the layout-independent model: the physical
+//! key identity travels and the local layout produces the character.
 //!
 //! ## Blocked-input detection without false alarms
 //!
@@ -19,13 +21,14 @@
 //! is foreground — and `SendInput` returns *success* even then, so only
 //! the real cursor tells the truth. The check measures *displacement*
 //! between two block checks: how much cursor motion was requested (the
-//! relative counts injected plus any absolute jumps) versus how far the
-//! real cursor actually travelled. A blocked window leaves the cursor
+//! absolute placements made) versus how far the real cursor actually
+//! travelled. A blocked window leaves the cursor
 //! frozen while motion is requested — the only condition that trips. A
 //! cursor that is moving, even far behind under load, never looks
 //! blocked. Runs on the client loop's block cadence only — never in the
 //! move hot path.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::POINT;
@@ -40,6 +43,7 @@ use kvmshare_protocol::message::{KeyKind, ScreenInfo};
 
 use super::buttons;
 use super::clipboard::Clipboard;
+use super::isolation::NativeIsolation;
 
 /// How long injected input must keep failing before the client reports
 /// itself blocked. One dropped event (a queue hiccup) must not yank
@@ -67,6 +71,11 @@ pub struct Win32Injector {
     /// moves (entry points). The delta to the next absolute target counts
     /// as requested motion for the block check.
     last_abs: (i32, i32),
+    /// The absolute cursor position this injector is steering. Motion is
+    /// **absolute**: every `move_rel` delta accumulates here and the
+    /// cursor is placed exactly, so Windows' pointer acceleration never
+    /// applies to the shared cursor (see [`Win32Injector::move_rel`]).
+    pos: (i32, i32),
     /// Cursor motion requested since the last block check: the magnitude
     /// of every relative move injected plus every absolute jump asked
     /// for. A blocked window freezes the real cursor while this keeps
@@ -87,6 +96,11 @@ pub struct Win32Injector {
     /// Buttons injected as down and not yet released (same contract as
     /// [`Win32Injector::keys_down`]).
     buttons_down: HashSet<u8>,
+    /// Silences this machine's own hardware (touchpad, keyboard, mouse)
+    /// while its cursor is controlled remotely — the Windows equivalent
+    /// of the server's device grab. Process-wide singleton, shared by
+    /// every injector (see [`isolation`]).
+    isolation: Arc<NativeIsolation>,
 }
 
 impl Win32Injector {
@@ -95,11 +109,13 @@ impl Win32Injector {
             clipboard: Clipboard::new(),
             cursor_hidden: false,
             last_abs: (0, 0),
+            pos: (0, 0),
             req_since_check: 0,
             check_pos: (0, 0),
             miss_since: None,
             keys_down: HashSet::new(),
             buttons_down: HashSet::new(),
+            isolation: NativeIsolation::global(),
         }
     }
 
@@ -130,6 +146,19 @@ impl Win32Injector {
             let h = wm::GetSystemMetrics(wm::SM_CYSCREEN);
             (w, h)
         }
+    }
+
+    /// Clamp a screen position to the physical desktop (primary
+    /// monitor — the same bounds `screen_info` reports). The OS pins the
+    /// visible cursor here, so the commanded position must never leave
+    /// it. Degenerate zero-size bounds clamp to (0, 0) instead of
+    /// panicking.
+    fn clamp(x: i32, y: i32) -> (i32, i32) {
+        let (w, h) = Self::screen_size();
+        (
+            x.clamp(0, (w - 1).max(0)),
+            y.clamp(0, (h - 1).max(0)),
+        )
     }
 
     /// The real cursor position, in screen pixels.
@@ -178,15 +207,6 @@ impl Win32Injector {
     }
 }
 
-/// Map a physical pixel coordinate to SendInput's 16-bit absolute space
-/// (0..65535 across the primary monitor), clamped to the screen. Used
-/// only for absolute placement (entry points).
-fn normalize(v: i32, limit: i32) -> i32 {
-    let limit = limit.max(1);
-    let v = v.clamp(0, limit - 1);
-    ((v as u64 * 65535) / (limit - 1) as u64) as i32
-}
-
 impl Injector for Win32Injector {
     fn screen_info(&mut self) -> ScreenInfo {
         let (w, h) = Self::screen_size();
@@ -197,46 +217,62 @@ impl Injector for Win32Injector {
     }
 
     fn move_cursor(&mut self, x: i32, y: i32) {
-        // Absolute placement (entry points, explicit positioning). Goes
-        // through SendInput as an absolute event so it stays in the same
-        // input queue as the button/key stream — mixing direct cursor
-        // placement with queued input makes drags and double-clicks
-        // unreliable. Coordinates are 0..65535 over the primary monitor.
-        let (w, h) = Self::screen_size();
-        let nx = normalize(x, w);
-        let ny = normalize(y, h);
-        // SAFETY: well-formed absolute-move INPUT event.
-        let mut input: km::INPUT = unsafe { std::mem::zeroed() };
-        input.r#type = km::INPUT_MOUSE;
-        input.Anonymous.mi.dwFlags = km::MOUSEEVENTF_MOVE | km::MOUSEEVENTF_ABSOLUTE;
-        input.Anonymous.mi.dx = nx;
-        input.Anonymous.mi.dy = ny;
-        self.send_input(&input);
+        // Absolute placement (entry points, explicit positioning). Direct
+        // `SetCursorPos`: exact, and immune to UIPI drops that SendInput
+        // is subject to (an elevated foreground window silently eats
+        // injected events — the failure mode that froze the shared
+        // cursor — while SetCursorPos keeps working). Motion and
+        // placement share the same mechanism, so nothing is ever "more
+        // or less reliable" between entry and stream.
+        let (lx, ly) = self.last_abs;
+        let (x, y) = Self::clamp(x, y);
+        self.pos = (x, y);
+        self.last_abs = (x, y);
+        // SAFETY: SetCursorPos takes screen pixels; hp's cursor follows.
+        unsafe {
+            wm::SetCursorPos(x, y);
+        }
         // The jump distance counts as requested motion for the block
         // check (a blocked entry point must be noticed).
-        self.req_since_check += (x - self.last_abs.0).abs() as i64 + (y - self.last_abs.1).abs() as i64;
-        self.last_abs = (x, y);
+        self.req_since_check += (x - lx).abs() as i64 + (y - ly).abs() as i64;
     }
 
     fn move_rel(&mut self, dx: i32, dy: i32) {
-        // Relative motion through the input queue: Windows applies its
-        // own pointer speed/acceleration to relative moves, so the cursor
-        // feels exactly like this machine's own mouse. The hot path stays
-        // pure — no polling, no screen queries, no state beyond the
-        // requested-motion counter.
-        self.req_since_check += (dx.abs() + dy.abs()) as i64;
-        // SAFETY: well-formed relative-move INPUT event (dx/dy are
-        // relative pixels when MOUSEEVENTF_ABSOLUTE is not set).
-        let mut input: km::INPUT = unsafe { std::mem::zeroed() };
-        input.r#type = km::INPUT_MOUSE;
-        input.Anonymous.mi.dwFlags = km::MOUSEEVENTF_MOVE;
-        input.Anonymous.mi.dx = dx;
-        input.Anonymous.mi.dy = dy;
-        self.send_input(&input);
+        // Absolute motion: accumulate the delta and place the cursor
+        // exactly. `SetCursorPos` bypasses Windows' pointer
+        // acceleration (EPP never applies to absolute placement), so the
+        // shared cursor lands precisely where the server commanded — no
+        // overshoot from the OS curve, no correction lag, and a dropped
+        // placement self-heals (the next set lands the whole command).
+        // The server compensates for its own pointer transform by
+        // scaling the counts it sends, so this cursor mirrors the
+        // server's cursor pixel-for-pixel.
+        //
+        // The command is clamped to the screen: the OS pins the visible
+        // cursor at the edge, and an unclamped accumulator would keep
+        // running off-screen — the user would then have to retrace the
+        // whole overshoot before the cursor moved again. Clamping keeps
+        // the command where the cursor can actually be, so reversing at
+        // an edge moves immediately. Only the *post-clamp* delta counts
+        // as requested motion for the block check: pushing against an
+        // edge legitimately moves nothing, and must not look like
+        // blocked input (which would yank control home).
+        let (nx, ny) = Self::clamp(self.pos.0 + dx, self.pos.1 + dy);
+        self.req_since_check += (nx - self.pos.0).abs() as i64 + (ny - self.pos.1).abs() as i64;
+        self.pos = (nx, ny);
+        // SAFETY: SetCursorPos takes screen pixels; the accumulated
+        // position is the command.
+        unsafe {
+            wm::SetCursorPos(nx, ny);
+        }
+    }
+
+    fn absolute_motion(&self) -> bool {
+        true
     }
 
     fn cursor_position(&mut self) -> (i32, i32) {
-        Self::cursor_pos().unwrap_or(self.last_abs)
+        Self::cursor_pos().unwrap_or(self.pos)
     }
 
     fn button(&mut self, button: u8, pressed: bool) {
@@ -328,6 +364,9 @@ impl Injector for Win32Injector {
         // cursor has now been placed by the server, so a stale miss must
         // not immediately yank control home.
         self.reset_measurement();
+        // This machine is now driven remotely: its own hardware must not
+        // fight the injected stream (see [`isolation`] for the why).
+        self.isolation.set_isolating(true);
         if !self.cursor_hidden {
             // SAFETY: ShowCursor(0) decrements the display count.
             unsafe {
@@ -338,6 +377,9 @@ impl Injector for Win32Injector {
     }
 
     fn leave(&mut self) {
+        // Control is home again: restore this machine's own hardware
+        // first, so nothing native is swallowed while we clean up.
+        self.isolation.set_isolating(false);
         if self.cursor_hidden {
             // SAFETY: balances the hide above.
             unsafe {
@@ -375,21 +417,4 @@ impl Injector for Win32Injector {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn normalize_maps_pixels_to_16bit_space() {
-        // 1920x1080 screen: the corners and midpoints land where
-        // SendInput expects them.
-        assert_eq!(normalize(0, 1920), 0);
-        assert_eq!(normalize(1919, 1920), 65535);
-        assert_eq!(normalize(960, 1920), 32768);
-        assert_eq!(normalize(540, 1080), 32768);
-        // Out of range clamps, never wraps.
-        assert_eq!(normalize(-50, 1920), 0);
-        assert_eq!(normalize(5000, 1920), 65535);
-        assert_eq!(normalize(0, 1), 0); // degenerate screen
-    }
-}

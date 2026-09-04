@@ -248,6 +248,17 @@ pub struct Session {
     remote_beacon_at: Option<Instant>,
     remote_last_out: Option<Push>,
     remote_pushing: Option<Pushing>,
+
+    /// The server's measured pointer gain (pixels of real cursor travel
+    /// per raw device count), applied to forwarded remote motion so the
+    /// client's cursor travels exactly like the server's own would.
+    /// Updated by the server loop from its [`GainTracker`]; defaults to
+    /// 1.0 (counts map 1:1) before the first measurement.
+    gain: f64,
+    /// Fractional carry of the gain-scaled motion (sub-pixel remainders
+    /// accumulate and flush as whole pixels, so a 0.5 px/count gain never
+    /// truncates slow motion away and never biases it upward).
+    gain_rem: (f64, f64),
 }
 
 impl Session {
@@ -265,7 +276,16 @@ impl Session {
             remote_beacon_at: None,
             remote_last_out: None,
             remote_pushing: None,
+            gain: 1.0,
+            gain_rem: (0.0, 0.0),
         }
+    }
+
+    /// Update the pointer-gain estimate (see the field docs). Called by
+    /// the server loop whenever a local motion window closes; affects
+    /// only future *remote* motion.
+    pub fn set_gain(&mut self, gain: f64) {
+        self.gain = gain.clamp(0.25, 3.0);
     }
 
     pub fn mode(&self) -> Mode {
@@ -379,13 +399,37 @@ impl Session {
     /// anywhere. Returns the actions that keep the virtual cursor on the
     /// right screen.
     fn on_local_motion(&mut self, dx: i32, dy: i32) -> Vec<Action> {
+        // While the cursor is on a client, raw device counts are scaled
+        // by the server's measured pointer gain ([`Self::set_gain`]) so
+        // the virtual cursor — and the motion forwarded to the client —
+        // moves exactly like the server's own visible cursor would for
+        // the same hand motion. Local motion stays raw: the server's
+        // real-position beacons re-anchor the virtual cursor anyway.
+        let (sx, sy) = match self.cursor.mode {
+            Mode::Remote(_) => {
+                let g = self.gain;
+                // Scaled with a fractional carry: truncation toward zero
+                // (like the capture's PendingMotion) keeps slow motion
+                // symmetric in both directions instead of rounding every
+                // half-pixel frame up (a 0.5 gain would otherwise turn
+                // 1-count frames into 1 px each — a 2x bias).
+                let rx = dx as f64 * g + self.gain_rem.0;
+                let ry = dy as f64 * g + self.gain_rem.1;
+                let sx = rx.trunc() as i32;
+                let sy = ry.trunc() as i32;
+                self.gain_rem = (rx - sx as f64, ry - sy as f64);
+                (sx, sy)
+            }
+            Mode::Local => (dx, dy),
+        };
+
         // Track the virtual position regardless of mode.
-        self.cursor.x += dx;
-        self.cursor.y += dy;
+        self.cursor.x += sx;
+        self.cursor.y += sy;
 
         match self.cursor.mode {
             Mode::Local => self.handle_local_motion(dx, dy),
-            Mode::Remote(id) => self.handle_remote_motion(id, dx, dy),
+            Mode::Remote(id) => self.handle_remote_motion(id, sx, sy),
         }
     }
 
@@ -871,6 +915,44 @@ mod tests {
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -10, dy: 0 });
         assert_eq!(actions, vec![Action::Send(Message::MouseMoveRel { dx: -10, dy: 0 })]);
         assert_eq!(s.mode(), Mode::Remote(1));
+    }
+
+    #[test]
+    fn remote_motion_is_scaled_by_the_measured_pointer_gain() {
+        // The server measures its own px-per-count (e.g. libinput's 0.5
+        // at slow speeds) and scales forwarded motion by it, so a client
+        // that places its cursor absolutely (1:1) mirrors the server's
+        // cursor exactly. Default gain 1.0 leaves motion untouched; a
+        // measured gain of 0.5 halves the forwarded counts and the
+        // virtual cursor advance — both, so the client's landing spot
+        // and the boundary state stay consistent.
+        let mut s = two_screens();
+        cross_to_hp(&mut s);
+        // Gain 1.0 (default / not yet measured): forwarded verbatim.
+        assert_eq!(
+            s.on_local_event(Message::MouseMoveRel { dx: -10, dy: 0 }),
+            vec![Action::Send(Message::MouseMoveRel { dx: -10, dy: 0 })]
+        );
+        // The server measured 0.5 px/count (its cursor travels half the
+        // raw counts): forwarded motion — and the virtual advance — are
+        // halved (rounded per frame).
+        s.set_gain(0.5);
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -10, dy: 0 });
+        assert_eq!(actions, vec![Action::Send(Message::MouseMoveRel { dx: -5, dy: 0 })]);
+        // Sub-pixel frames round; the average stays 0.5.
+        let sum: i64 = (0..20)
+            .map(|_| {
+                match s.on_local_event(Message::MouseMoveRel { dx: 1, dy: 0 }).first().unwrap() {
+                    Action::Send(Message::MouseMoveRel { dx, .. }) => *dx as i64,
+                    other => panic!("unexpected {other:?}"),
+                }
+            })
+            .sum();
+        assert!((5..=15).contains(&sum), "20 x 1 count at 0.5 gain should sum near 10, got {sum}");
+        // Local motion is never scaled (beacons re-anchor the virtual
+        // cursor there).
+        s.force_local();
+        assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: 10, dy: 0 }), vec![]);
     }
 
     #[test]
