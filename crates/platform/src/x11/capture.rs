@@ -104,6 +104,18 @@ const REPEAT_INTERVAL: Duration = Duration::from_millis(33); // ≈ 30/s
 /// 2 ms is far below human perception and keeps idle CPU negligible.
 const POLL_PAUSE: Duration = Duration::from_millis(2);
 
+/// Minimum gap between forwarded position beacons. Ordinary XI motion
+/// events arrive at the device's report rate (up to 1000 Hz on a modern
+/// mouse); forwarding every one floods the wire and the session channel
+/// with near-identical positions, and under load the backlog makes every
+/// beacon *stale* — the session then re-anchors to old positions, which
+/// delays the edge-park confirmation and makes crossings hesitate.
+/// Beacons are therefore coalesced like motion: only the newest position
+/// is kept and sent at this cadence, so a beacon is never older than one
+/// period plus the poll pause, and the stream costs a few frames per
+/// second instead of a thousand.
+const BEACON_PERIOD: Duration = Duration::from_millis(6);
+
 /// A control action the engine wants performed on the local cursor.
 ///
 /// These arrive over a channel and are executed on the *capture*
@@ -222,6 +234,11 @@ struct InputCapture {
     tx: Sender<Message>,
     cmd_rx: Receiver<CaptureCommand>,
     motion: PendingMotion,
+    /// The newest real pointer position seen but not yet forwarded as a
+    /// beacon (coalesced to [`BEACON_PERIOD`]; see the const docs).
+    beacon: Option<(i32, i32)>,
+    /// When the last beacon was sent (rate limiter).
+    last_beacon: Option<Instant>,
     /// Keys the device has pressed but not yet released (HID usage → state).
     held: HashMap<u32, Held>,
     /// Whether *we* currently hold the pointer+keyboard grab.
@@ -260,7 +277,18 @@ pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<
     // kernel the moment they become readable. Until then the server runs
     // grab-only (raw-reading apps may react to forwarded input).
     let evdev = EvdevReader::start(tx.clone());
-    let capture = InputCapture { conn, root, tx, cmd_rx, motion: PendingMotion::default(), held: HashMap::new(), grabbed: false, evdev };
+    let capture = InputCapture {
+        conn,
+        root,
+        tx,
+        cmd_rx,
+        motion: PendingMotion::default(),
+        beacon: None,
+        last_beacon: None,
+        held: HashMap::new(),
+        grabbed: false,
+        evdev,
+    };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {
             log_error!("input capture stopped: {e}");
@@ -288,6 +316,7 @@ impl InputCapture {
                 self.apply(cmd);
             }
             self.flush_motion();
+            self.flush_beacon();
             self.tick_repeats();
             thread::sleep(POLL_PAUSE);
         }
@@ -301,12 +330,14 @@ impl InputCapture {
             }
             XEvent::XinputMotion(e) => {
                 // Real (post-acceleration) pointer position: forward any
-                // motion accrued since the last send first, then emit the
-                // beacon so the session can re-anchor while local.
+                // motion accrued since the last send first, then keep
+                // only the newest position for the coalesced beacon (see
+                // [`BEACON_PERIOD`]) — motion first, resync after, so the
+                // session applies deltas then re-anchors, in order.
                 self.flush_motion();
                 let x = (e.root_x >> 16) as i32;
                 let y = (e.root_y >> 16) as i32;
-                self.send(Message::MouseMoveAbs { x, y });
+                self.beacon = Some((x, y));
             }
             XEvent::XinputRawButtonPress(e) => self.on_button(e.detail, true),
             XEvent::XinputRawButtonRelease(e) => self.on_button(e.detail, false),
@@ -474,6 +505,26 @@ impl InputCapture {
     /// Synthesize auto-repeat for physically held keys. Raw events carry
     /// no repeats (they are device transitions only), so clients would
     /// otherwise see a single press for a held key.
+    /// Forward the coalesced position beacon at [`BEACON_PERIOD`]
+    /// cadence, if one is pending. Called from the poll loop, so a beacon
+    /// is never delayed longer than one period after the pointer stops
+    /// (the loop wakes every [`POLL_PAUSE`]) — edge parks are confirmed
+    /// to the session within ~8 ms even under load.
+    fn flush_beacon(&mut self) {
+        let Some((x, y)) = self.beacon else { return };
+        let now = Instant::now();
+        let due = match self.last_beacon {
+            Some(t) => now.duration_since(t) >= BEACON_PERIOD,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_beacon = Some(now);
+        self.beacon = None;
+        self.send(Message::MouseMoveAbs { x, y });
+    }
+
     fn tick_repeats(&mut self) {
         if self.held.is_empty() {
             return;

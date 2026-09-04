@@ -9,14 +9,25 @@
 //! [`Injector::move_cursor`]) so buttons, moves and releases all flow
 //! through the same input queue.
 //!
-//! Blocked-input detection (elevated/input-isolated windows such as Task
-//! Manager or the on-screen keyboard silently drop injected input) never
-//! runs in the move hot path. Moves are injected unconditionally and the
-//! client loop asks [`Injector::input_blocked`] on its own slow cadence;
-//! that one call does a single non-blocking cursor-position check
-//! against the latest injected target — SendInput returns success even
-//! when UIPI drops the event, so the real cursor is the only truthful
-//! signal.
+//! ## Blocked-input detection without false alarms
+//!
+//! Windows silently drops injected input while an elevated or
+//! input-isolated window (UAC prompt, on-screen keyboard, Task Manager)
+//! is foreground — and `SendInput` returns *success* even then, so only
+//! the real cursor tells the truth. But comparing the cursor against the
+//! *newest* injected target misreads the normal case: during any
+//! sustained motion the newest target is always a few milliseconds ahead
+//! of the cursor, so such a check reports "stuck" during perfectly fine
+//! fast movement and the server yanks control home mid-gesture.
+//!
+//! The check therefore measures *displacement* between two block checks:
+//! how much movement was requested ([`Win32Injector::last_target`]
+//! moving) versus how far the real cursor actually travelled. A blocked
+//! window leaves the cursor frozen while moves are requested — the only
+//! condition that trips. A cursor that is moving, even far behind its
+//! target under load, never looks blocked. The check runs on the client
+//! loop's block cadence only — never in the move hot path, where
+//! polling would stall the very pipeline it guards.
 
 use std::time::{Duration, Instant};
 
@@ -39,9 +50,15 @@ use super::clipboard::Clipboard;
 /// check failing, so this trips ~0.4 s in.
 const BLOCK_LINGER: Duration = Duration::from_millis(400);
 
-/// How far the real cursor may be from the requested position and still
-/// count as arrived (polling jitter, rounding in the 0..65535 mapping).
-const VERIFY_TOLERANCE: i32 = 3;
+/// How much cursor movement must be requested (the injected targets moved
+/// this far) between block checks for the interval to count as "trying to
+/// move". Below this the user is effectively idle or nudging in place, and
+/// a still cursor is expected — never a block.
+const BLOCK_REQ_MIN: i32 = 2;
+/// How far the real cursor may travel over such an interval while still
+/// counting as frozen. A blocked window leaves it dead-still; anything
+/// moving at all — even far behind its target under load — is healthy.
+const BLOCK_ACT_MAX: i32 = 1;
 
 /// The client-side injector over the local Windows desktop.
 pub struct Win32Injector {
@@ -50,16 +67,19 @@ pub struct Win32Injector {
     /// `leave`). Lets `leave` only show the cursor if we hid it.
     cursor_hidden: bool,
     /// The last position this injector asked the OS to place the cursor
-    /// at. [`Win32Injector::check_cursor_position`] compares the real
-    /// cursor against it. Moves are *unconditional* in the hot path, so
-    /// the target is remembered here instead of being read back from the
-    /// OS mid-stream.
+    /// at. Moves are *unconditional* in the hot path, so the target is
+    /// remembered here instead of being read back from the OS mid-stream.
     last_target: (i32, i32),
-    /// When the cursor first failed to arrive where we asked (or
-    /// SendInput rejected an event outright). `None` while input flows.
-    /// A blocking window keeps every check failing, so once this has
-    /// lingered past [`BLOCK_LINGER`] the core loop tells the server to
-    /// bring control home.
+    /// Snapshots from the previous block check: the injected target and
+    /// the real cursor position then. The next check measures how much
+    /// movement was requested and how far the cursor actually went
+    /// between the two.
+    check_target: (i32, i32),
+    check_pos: (i32, i32),
+    /// When the cursor first failed to move while movement was requested
+    /// (or SendInput rejected an event outright). `None` while input
+    /// flows. Once this has lingered past [`BLOCK_LINGER`] the core loop
+    /// tells the server to bring control home.
     miss_since: Option<Instant>,
     /// Keys (HID usages) injected as down and not yet released. `leave`
     /// releases everything still held: the server may never deliver the
@@ -77,6 +97,8 @@ impl Win32Injector {
             clipboard: Clipboard::new(),
             cursor_hidden: false,
             last_target: (0, 0),
+            check_target: (0, 0),
+            check_pos: (0, 0),
             miss_since: None,
             keys_down: HashSet::new(),
             buttons_down: HashSet::new(),
@@ -87,10 +109,10 @@ impl Win32Injector {
     ///
     /// [`SendInput`](km::SendInput) returning 0 means the OS rejected
     /// injected input outright (rare); its return value cannot detect
-    /// UIPI-dropped delivery, so the cursor-position check in
+    /// UIPI-dropped delivery, so the displacement check in
     /// [`Win32Injector::input_blocked`] is the real signal. A rejection
     /// is treated as an immediate miss so recovery is not blocked on the
-    /// next position check.
+    /// next check.
     fn send_input(&mut self, input: &km::INPUT) {
         // SAFETY: callers build a well-formed INPUT for SendInput.
         let accepted =
@@ -112,23 +134,48 @@ impl Win32Injector {
         }
     }
 
-    /// One *non-blocking* check of whether the real cursor is where the
-    /// last injected move asked it to be, updating [`Win32Injector::miss_since`].
+    /// One *non-blocking* displacement check, run on the client loop's
+    /// block cadence — never from the move hot path.
     ///
-    /// Runs only from [`Win32Injector::input_blocked`], on the client
-    /// loop's block cadence — never from the move hot path, where
-    /// polling or waiting would stall the whole input pipeline.
-    fn check_cursor_position(&mut self) {
-        let (x, y) = self.last_target;
+    /// Compares how far the injected targets moved since the previous
+    /// check (movement requested) against how far the real cursor moved.
+    /// A cursor that travels at all is healthy regardless of how far
+    /// behind its target it is; only a cursor that stays still while
+    /// movement is requested is stuck (elevated/input-isolated windows
+    /// swallow injected input, freezing the cursor).
+    fn check_blocked(&mut self) {
+        let (tx, ty) = self.last_target;
         let mut pt = POINT { x: 0, y: 0 };
         // SAFETY: GetCursorPos writes one POINT into a valid buffer.
         let got = unsafe { wm::GetCursorPos(&mut pt) } != 0;
-        let arrived = got && (pt.x - x).abs() <= VERIFY_TOLERANCE && (pt.y - y).abs() <= VERIFY_TOLERANCE;
-        if arrived {
-            self.miss_since = None;
+        let requested = (tx - self.check_target.0).abs() + (ty - self.check_target.1).abs();
+        let actual = if got {
+            (pt.x - self.check_pos.0).abs() + (pt.y - self.check_pos.1).abs()
         } else {
+            0 // no cursor to read — treat as stuck
+        };
+        if requested >= BLOCK_REQ_MIN && actual <= BLOCK_ACT_MAX {
             self.miss_since.get_or_insert(Instant::now());
+        } else {
+            self.miss_since = None;
         }
+        self.check_target = (tx, ty);
+        if got {
+            self.check_pos = (pt.x, pt.y);
+        }
+    }
+
+    /// Start the next measurement from a clean slate: wherever the real
+    /// cursor is and wherever the injector's target is, the following
+    /// interval is measured from there. Called when control enters or
+    /// leaves this machine.
+    fn reset_measurement(&mut self) {
+        let mut pt = POINT { x: 0, y: 0 };
+        // SAFETY: GetCursorPos writes one POINT into a valid buffer.
+        let got = unsafe { wm::GetCursorPos(&mut pt) } != 0;
+        self.check_pos = if got { (pt.x, pt.y) } else { self.last_target };
+        self.check_target = self.last_target;
+        self.miss_since = None;
     }
 }
 
@@ -247,13 +294,12 @@ impl Injector for Win32Injector {
     }
 
     fn input_blocked(&mut self) -> bool {
-        // One cheap, non-blocking position check against the latest
-        // injected target, then test the linger. SendInput returns
-        // success even when UIPI drops the input at delivery
-        // (elevated/input-isolated windows), so only the cursor itself
-        // tells the truth. Runs here — on the client loop's block
-        // cadence, never in the move path.
-        self.check_cursor_position();
+        // One cheap, non-blocking displacement check, then test the
+        // linger. Runs here — on the client loop's block cadence, never
+        // in the move path. See the module docs for why displacement (not
+        // target matching) is the only signal that cannot mistake a fast
+        // moving cursor for a blocked one.
+        self.check_blocked();
         self.miss_since.is_some_and(|t| t.elapsed() >= BLOCK_LINGER)
     }
 
@@ -263,7 +309,7 @@ impl Injector for Win32Injector {
         // Control starts clean: whatever happened before `enter`, the
         // cursor has now been placed by the server, so a stale miss must
         // not immediately yank control home.
-        self.miss_since = None;
+        self.reset_measurement();
         if !self.cursor_hidden {
             // SAFETY: ShowCursor(0) decrements the display count.
             unsafe {
@@ -281,7 +327,7 @@ impl Injector for Win32Injector {
             }
             self.cursor_hidden = false;
         }
-        self.miss_since = None;
+        self.reset_measurement();
         // Control left this machine: release every key and button we
         // injected and never saw released — the user may have crossed
         // back mid-hold, so the matching ups will never arrive. Without

@@ -69,6 +69,16 @@ struct Cursor {
 /// own.
 const EDGE_PUSH_FALLBACK: Duration = Duration::from_millis(150);
 
+/// How recent an outward push must be for a beacon that parks the real
+/// cursor at the shared edge to complete the crossing immediately.
+/// Crossing on the *next* delta after the park beacon adds one motion
+/// frame of dead time at the exact moment a crossing should feel
+/// seamless — but a beacon alone (the user merely resting at the edge)
+/// must never cross, so only a push within this window counts as intent.
+/// Far shorter than a hover, long enough to cover the beacon lag between
+/// the last delta and the park confirmation.
+const EDGE_PUSH_FRESH: Duration = Duration::from_millis(60);
+
 /// The switching brain.
 pub struct Session {
     layout: Layout,
@@ -178,11 +188,26 @@ impl Session {
                     // is. Remember whether it sits exactly on a screen
                     // edge — only then can outward motion mean "cross".
                     self.at_edge = edge_direction(&self.local, vx, vy);
-                    if self.at_edge.is_none() {
-                        // The real cursor is back inside: any edge-push
-                        // attempt was a transient overshoot, and it is
-                        // over.
-                        self.edge_pushing_since = None;
+                    match self.at_edge {
+                        Some(dir) => {
+                            // The real cursor just parked on an edge
+                            // while the user is mid-push: cross now, on
+                            // the park itself, instead of waiting for the
+                            // next delta. A beacon alone — the user
+                            // resting at the edge — never crosses.
+                            let pushing = self
+                                .edge_pushing_since
+                                .is_some_and(|t| t.elapsed() < EDGE_PUSH_FRESH);
+                            if pushing {
+                                return self.switch_out(dir);
+                            }
+                        }
+                        None => {
+                            // The real cursor is back inside: any edge-
+                            // push attempt was a transient overshoot, and
+                            // it is over.
+                            self.edge_pushing_since = None;
+                        }
                     }
                 }
                 vec![]
@@ -264,6 +289,14 @@ impl Session {
             self.edge_pushing_since.get_or_insert(Instant::now());
             return vec![];
         }
+        self.switch_out(dir)
+    }
+
+    /// Leave the local screen through `dir`: switch to the neighbor in
+    /// that direction. Resets the edge/push state and snaps the virtual
+    /// cursor to the neighbor's entry point. Returns nothing on a dead
+    /// edge (the cursor stays clamped).
+    fn switch_out(&mut self, dir: Direction) -> Vec<Action> {
         match self.layout.neighbor(0, dir, self.cursor.x, self.cursor.y) {
             Some((id, x, y)) => {
                 self.at_edge = None;
@@ -664,6 +697,51 @@ mod tests {
         // Continuing from there stays local.
         assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: -10, dy: 0 }), vec![]);
         assert_eq!(s.mode(), Mode::Local);
+    }
+
+    #[test]
+    fn beacon_park_crosses_immediately_during_a_fresh_push() {
+        let mut s = two_screens();
+        // A fast approach overshoots the boundary via raw deltas (no
+        // beacon has confirmed anything yet — the cursor may still be
+        // mid-screen).
+        assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }), vec![]);
+        assert_eq!(s.mode(), Mode::Local);
+        // The beacon then reports the real cursor parked on the shared
+        // edge while the user is still pushing: the crossing must fire
+        // on the park itself — not on a later delta — so a fast crossing
+        // has no dead frame at the boundary.
+        let actions = s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 });
+        match actions.as_slice() {
+            [Action::SwitchTo { to, x, y, .. }] => {
+                assert_eq!(*to, 1);
+                assert_eq!(*x, 1919); // hp's right edge, local coords
+                assert_eq!(*y, 540);
+            }
+            other => panic!("expected immediate SwitchTo on park-during-push, got {other:?}"),
+        }
+        assert_eq!(s.mode(), Mode::Remote(1));
+    }
+
+    #[test]
+    fn resting_at_the_edge_never_crosses_without_a_fresh_push() {
+        let mut s = two_screens();
+        // A flick ends with the cursor pushed against the left edge, then
+        // the user stops: the outward deltas are no longer fresh.
+        assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: -2000, dy: 0 }), vec![]);
+        std::thread::sleep(EDGE_PUSH_FRESH + Duration::from_millis(20));
+        // A beacon shows the real cursor parked on the edge, but nothing
+        // has pushed outward recently: resting there must not cross.
+        assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 }), vec![]);
+        assert_eq!(s.mode(), Mode::Local);
+        // A fresh push while parked crosses immediately (confirmed by the
+        // beacon).
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -5, dy: 0 });
+        match actions.as_slice() {
+            [Action::SwitchTo { to, .. }] => assert_eq!(*to, 1),
+            other => panic!("expected SwitchTo after a fresh push at the parked edge, got {other:?}"),
+        }
+        assert_eq!(s.mode(), Mode::Remote(1));
     }
 
     #[test]
