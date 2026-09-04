@@ -290,9 +290,13 @@ impl Drop for EvdevReader {
 }
 
 /// The reader loop. Waits for the remote flag; on each transition grabs
-/// (or releases) every device; while remote drains and forwards events;
-/// always re-enumerates on a cadence so late-granted access and
-/// hot-plugged devices are picked up live.
+/// (or releases) every device. **Devices are drained in both modes** —
+/// the kernel ring buffer would otherwise replay events that happened
+/// while the cursor was local (a mute tap, a Win+E, a click) to the
+/// client the moment forwarding starts. Drain-and-discard while local,
+/// drain-and-forward while remote, so a boundary crossing never carries
+/// stale events across it. Re-enumerates on a cadence so late-granted
+/// access and hot-plugged devices are picked up live.
 fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
     let (mut devices, mut denied) = open_devices();
     let mut was_remote = false;
@@ -305,7 +309,14 @@ fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
         let is_remote = remote.load(Ordering::Relaxed);
         if is_remote != was_remote {
             set_grabbed(&mut devices, is_remote);
-            if !is_remote {
+            if is_remote {
+                // Events that landed in the ring buffers in the moments
+                // before the grab belong to the local side (the buffer is
+                // normally drained continuously, but the last instant can
+                // slip through): purge them so the crossing never
+                // replays them on the client.
+                purge(&mut devices);
+            } else {
                 // Local again: the X capture owns input; any press state
                 // this reader accumulated belongs to the past.
                 press = PressState::new();
@@ -323,10 +334,9 @@ fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
             log_presence(&devices, denied, &mut logged);
             last_enum = Instant::now();
         }
-        if !is_remote {
-            thread::sleep(LOCAL_PAUSE);
-            continue;
-        }
+        // Drain every device. Forward only while remote; while local the
+        // events belong to the X capture and are discarded here — but
+        // they must be *read* so they never replay later.
         let mut saw_event = false;
         let mut dead: Vec<usize> = Vec::new();
         for (i, d) in devices.iter_mut().enumerate() {
@@ -334,9 +344,11 @@ fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
                 Ok(events) => {
                     for ev in events {
                         saw_event = true;
-                        handle_event(&ev, &mut motion, &mut press, &mut |m| {
-                            let _ = tx.send(m);
-                        });
+                        if is_remote {
+                            handle_event(&ev, &mut motion, &mut press, &mut |m| {
+                                let _ = tx.send(m);
+                            });
+                        }
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -349,11 +361,32 @@ fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
         for i in dead.into_iter().rev() {
             devices.remove(i);
         }
-        motion.flush(&mut |dx, dy| {
-            let _ = tx.send(Message::MouseMoveRel { dx, dy });
-        });
+        if is_remote {
+            motion.flush(&mut |dx, dy| {
+                let _ = tx.send(Message::MouseMoveRel { dx, dy });
+            });
+        }
         if !saw_event {
-            thread::sleep(REMOTE_POLL_PAUSE);
+            // Idle: pause a tick. While local the pause is longer (the
+            // X capture owns input; we only keep the buffers drained).
+            thread::sleep(if is_remote { REMOTE_POLL_PAUSE } else { LOCAL_PAUSE });
+        }
+    }
+}
+
+/// Drain and discard everything currently buffered on every device
+/// (nonblocking). Used at the moment forwarding starts so events from
+/// just before the crossing are never replayed on the client.
+fn purge(devices: &mut [Opened]) {
+    for d in devices.iter_mut() {
+        loop {
+            match d.dev.fetch_events() {
+                Ok(events) => {
+                    for _ in events {}
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
         }
     }
 }

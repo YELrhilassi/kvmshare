@@ -6,8 +6,13 @@ package main
 // no-ops. Windows is handled by integrate_windows.go, Linux (input-device
 // access) by integrate_linux.go.
 
+import "fmt"
+
 // integrateDesktop is a no-op outside Windows/Linux.
 func integrateDesktop(string) error { return nil }
+
+// ensureInputAccess is unsupported outside Linux.
+func ensureInputAccess() error { return fmt.Errorf("--input-access is Linux-only") }
 
 // removeDesktopIntegration is a no-op outside Windows/Linux.
 func removeDesktopIntegration(string) error { return nil }

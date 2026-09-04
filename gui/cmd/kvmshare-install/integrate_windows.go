@@ -54,6 +54,9 @@ func removeDesktopIntegration(dir string) error {
 	return nil
 }
 
+// ensureInputAccess is unsupported on Windows.
+func ensureInputAccess() error { return fmt.Errorf("--input-access is Linux-only") }
+
 // launchGUI starts the installed GUI detached from this process. The GUI is
 // a windowsgui (no console) binary, so nothing flashes on screen.
 func launchGUI(dir string) error {

@@ -8,6 +8,15 @@
 //! character. Mouse moves are absolute SendInput events too (see
 //! [`Injector::move_cursor`]) so buttons, moves and releases all flow
 //! through the same input queue.
+//!
+//! Blocked-input detection (elevated/input-isolated windows such as Task
+//! Manager or the on-screen keyboard silently drop injected input) never
+//! runs in the move hot path. Moves are injected unconditionally and the
+//! client loop asks [`Injector::input_blocked`] on its own slow cadence;
+//! that one call does a single non-blocking cursor-position check
+//! against the latest injected target — SendInput returns success even
+//! when UIPI drops the event, so the real cursor is the only truthful
+//! signal.
 
 use std::time::{Duration, Instant};
 
@@ -27,19 +36,8 @@ use super::clipboard::Clipboard;
 /// How long injected input must keep failing before the client reports
 /// itself blocked. One dropped event (a queue hiccup) must not yank
 /// control home; a blocking window that stays foreground keeps every
-/// event failing, so this trips ~0.4 s in.
+/// check failing, so this trips ~0.4 s in.
 const BLOCK_LINGER: Duration = Duration::from_millis(400);
-
-/// Every Nth injected cursor move is verified against the real cursor
-/// position. [`SendInput`](km::SendInput) reports *success* even when
-/// Windows drops the input at delivery (UIPI: an elevated or
-/// input-isolated window — Task Manager, an on-screen keyboard, a UAC
-/// prompt — filters injected input silently), so its return value cannot
-/// detect a freeze. Only the cursor itself tells the truth: if it stops
-/// arriving at the requested position, input is blocked. At ~250 moves/s
-/// this verifies ~20x per second — a couple of ms of polling amortized
-/// over the batch.
-const VERIFY_EVERY: u32 = 12;
 
 /// How far the real cursor may be from the requested position and still
 /// count as arrived (polling jitter, rounding in the 0..65535 mapping).
@@ -51,16 +49,18 @@ pub struct Win32Injector {
     /// True while we are hiding the local cursor (between `enter` and
     /// `leave`). Lets `leave` only show the cursor if we hid it.
     cursor_hidden: bool,
-    /// When the OS last refused to move the cursor to where we asked
-    /// (see [`Win32Injector::verify_cursor`]). `None` while input flows.
-    /// Windows drops injected input while an elevated or input-isolated
-    /// window (UAC prompt, on-screen keyboard, Task Manager, an admin
-    /// tool) is foreground — the cursor freezes and the user would be
-    /// trapped, so this feeds [`Injector::input_blocked`] and the server
-    /// brings control home.
-    blocked_since: Option<Instant>,
-    /// Moves injected since the last position verification.
-    moves_since_verify: u32,
+    /// The last position this injector asked the OS to place the cursor
+    /// at. [`Win32Injector::check_cursor_position`] compares the real
+    /// cursor against it. Moves are *unconditional* in the hot path, so
+    /// the target is remembered here instead of being read back from the
+    /// OS mid-stream.
+    last_target: (i32, i32),
+    /// When the cursor first failed to arrive where we asked (or
+    /// SendInput rejected an event outright). `None` while input flows.
+    /// A blocking window keeps every check failing, so once this has
+    /// lingered past [`BLOCK_LINGER`] the core loop tells the server to
+    /// bring control home.
+    miss_since: Option<Instant>,
     /// Keys (HID usages) injected as down and not yet released. `leave`
     /// releases everything still held: the server may never deliver the
     /// matching ups (the user crossed back mid-hold), and the OS must
@@ -76,32 +76,27 @@ impl Win32Injector {
         Self {
             clipboard: Clipboard::new(),
             cursor_hidden: false,
-            blocked_since: None,
-            moves_since_verify: 0,
+            last_target: (0, 0),
+            miss_since: None,
             keys_down: HashSet::new(),
             buttons_down: HashSet::new(),
         }
     }
 
-    /// Inject one event, tracking whether the OS accepted it.
+    /// Inject one event.
     ///
-    /// [`SendInput`](km::SendInput) returns the number of events it
-    /// inserted; 0 means the foreground window (or the session) rejected
-    /// injected input — on Windows that happens with elevated or
-    /// input-isolated windows (UIPI), e.g. an on-screen keyboard or an
-    /// admin tool. Any accepted event clears the tracker, and since
-    /// cursor moves arrive at up to ~250/s while the user moves, input
-    /// is detected as flowing again almost the instant the blocking
-    /// window stops being foreground.
+    /// [`SendInput`](km::SendInput) returning 0 means the OS rejected
+    /// injected input outright (rare); its return value cannot detect
+    /// UIPI-dropped delivery, so the cursor-position check in
+    /// [`Win32Injector::input_blocked`] is the real signal. A rejection
+    /// is treated as an immediate miss so recovery is not blocked on the
+    /// next position check.
     fn send_input(&mut self, input: &km::INPUT) {
         // SAFETY: callers build a well-formed INPUT for SendInput.
         let accepted =
             unsafe { km::SendInput(1, input, std::mem::size_of::<km::INPUT>() as i32) } == 1;
-        let now = Instant::now();
-        if accepted {
-            self.blocked_since = None;
-        } else {
-            self.blocked_since.get_or_insert(now);
+        if !accepted {
+            self.miss_since.get_or_insert(Instant::now());
         }
     }
 
@@ -117,38 +112,22 @@ impl Win32Injector {
         }
     }
 
-    /// Confirm the real cursor arrived where the last injected move asked
-    /// it to be.
+    /// One *non-blocking* check of whether the real cursor is where the
+    /// last injected move asked it to be, updating [`Win32Injector::miss_since`].
     ///
-    /// SendInput succeeds even when UIPI will drop the event, so the only
-    /// reliable signal is the cursor itself. Poll the real position for a
-    /// few milliseconds (the OS may land the cursor a moment after the
-    /// call); if it never arrives, the injector is blocked and the core
-    /// loop will tell the server to bring control home.
-    fn verify_cursor(&mut self, x: i32, y: i32) {
-        let deadline = Instant::now() + Duration::from_millis(4);
-        let mut arrived = false;
-        loop {
-            let mut pt = POINT { x: 0, y: 0 };
-            // SAFETY: GetCursorPos writes one POINT into a valid buffer.
-            let got = unsafe { wm::GetCursorPos(&mut pt) } != 0;
-            if !got {
-                break; // no cursor to move — treat as blocked
-            }
-            if (pt.x - x).abs() <= VERIFY_TOLERANCE && (pt.y - y).abs() <= VERIFY_TOLERANCE {
-                arrived = true;
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let now = Instant::now();
+    /// Runs only from [`Win32Injector::input_blocked`], on the client
+    /// loop's block cadence — never from the move hot path, where
+    /// polling or waiting would stall the whole input pipeline.
+    fn check_cursor_position(&mut self) {
+        let (x, y) = self.last_target;
+        let mut pt = POINT { x: 0, y: 0 };
+        // SAFETY: GetCursorPos writes one POINT into a valid buffer.
+        let got = unsafe { wm::GetCursorPos(&mut pt) } != 0;
+        let arrived = got && (pt.x - x).abs() <= VERIFY_TOLERANCE && (pt.y - y).abs() <= VERIFY_TOLERANCE;
         if arrived {
-            self.blocked_since = None;
+            self.miss_since = None;
         } else {
-            self.blocked_since.get_or_insert(now);
+            self.miss_since.get_or_insert(Instant::now());
         }
     }
 }
@@ -189,14 +168,10 @@ impl Injector for Win32Injector {
         input.Anonymous.mi.dx = nx;
         input.Anonymous.mi.dy = ny;
         self.send_input(&input);
-        // Verify every Nth move (see [`VERIFY_EVERY`]). SendInput's return
-        // value cannot detect UIPI-dropped input, so we check the real
-        // cursor position on a cadence instead.
-        self.moves_since_verify += 1;
-        if self.moves_since_verify >= VERIFY_EVERY {
-            self.moves_since_verify = 0;
-            self.verify_cursor(x, y);
-        }
+        // The move hot path stays pure: no polling, no waiting. Blocked
+        // detection happens on the block-check cadence in
+        // `input_blocked`.
+        self.last_target = (x, y);
     }
 
     fn button(&mut self, button: u8, pressed: bool) {
@@ -272,12 +247,23 @@ impl Injector for Win32Injector {
     }
 
     fn input_blocked(&mut self) -> bool {
-        self.blocked_since.is_some_and(|t| t.elapsed() >= BLOCK_LINGER)
+        // One cheap, non-blocking position check against the latest
+        // injected target, then test the linger. SendInput returns
+        // success even when UIPI drops the input at delivery
+        // (elevated/input-isolated windows), so only the cursor itself
+        // tells the truth. Runs here — on the client loop's block
+        // cadence, never in the move path.
+        self.check_cursor_position();
+        self.miss_since.is_some_and(|t| t.elapsed() >= BLOCK_LINGER)
     }
 
     fn enter(&mut self) {
         // Hide our own cursor so the server's stream is the only visible
         // one — the classic KVM "leftover cursor" fix, same as X11.
+        // Control starts clean: whatever happened before `enter`, the
+        // cursor has now been placed by the server, so a stale miss must
+        // not immediately yank control home.
+        self.miss_since = None;
         if !self.cursor_hidden {
             // SAFETY: ShowCursor(0) decrements the display count.
             unsafe {
@@ -295,6 +281,7 @@ impl Injector for Win32Injector {
             }
             self.cursor_hidden = false;
         }
+        self.miss_since = None;
         // Control left this machine: release every key and button we
         // injected and never saw released — the user may have crossed
         // back mid-hold, so the matching ups will never arrive. Without

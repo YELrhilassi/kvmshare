@@ -309,6 +309,11 @@ func (a *App) SetSettings(s Settings) error {
 		} else {
 			a.stopRoleLocked(roleClient)
 		}
+		// Becoming the server means input isolation applies: make sure
+		// the system grant exists (silent once granted).
+		if s.Mode == ModeServer {
+			a.ensureInputAccess()
+		}
 	}
 	return nil
 }

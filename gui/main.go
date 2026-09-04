@@ -46,6 +46,11 @@ func main() {
 		return // the running instance is now in front
 	}
 
+	// Input isolation (Linux server) needs a one-time system grant. The
+	// sibling installer handles it silently — at most one privilege
+	// prompt, never again after. Runs in the background.
+	core.ensureInputAccess()
+
 	assets, err := fs.Sub(dist, "frontend/dist")
 	if err != nil {
 		log.Fatalf("kvmshare: embedded frontend: %v", err)

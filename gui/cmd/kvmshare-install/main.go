@@ -41,16 +41,14 @@ func main() {
 	flag.Parse()
 
 	// Privileged subcommand: invoked by this same binary through pkexec
-	// after a normal install (see integrate_linux.go).
+	// after a normal install (see integrate_linux.go on Linux). Grant-
+	// only-if-missing so callers (install, update, GUI startup, make
+	// install) can invoke it unconditionally without ever re-prompting
+	// once granted.
 	if *inputAccess {
-		if os.Geteuid() != 0 {
-			fmt.Fprintln(os.Stderr, "kvmshare-install: --input-access must run as root (pkexec does this automatically)")
-			os.Exit(1)
-		}
-		if err := integrateInputAccess(); err != nil {
+		if err := ensureInputAccess(); err != nil {
 			fatal(err)
 		}
-		fmt.Println("kvmshare-install: input access granted")
 		return
 	}
 

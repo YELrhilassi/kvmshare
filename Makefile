@@ -72,15 +72,39 @@ install: build
 		echo "  config already present, keeping $(CONFIG_DIR)/kvmshare-server.toml"; \
 	fi
 	install -m644 packaging/kvmshare.desktop $(APPS_DIR)/kvmshare.desktop
-	@if [ "$$(id -u)" = "0" ]; then \
-		$(MAKE) --no-print-directory input-access; \
-	else \
-		echo "  note: input isolation needs system access — run \"sudo make input-access\" once (the portable installer does it automatically)"; \
-	fi
+	$(MAKE) --no-print-directory ensure-input-access
 	@echo "installed:"
 	@echo "  $(BINDIR)/kvmshare-server"
 	@echo "  $(BINDIR)/kvmshare-client"
 	@echo "  $(BINDIR)/kvmshare-gui"
+
+## Grant input-device access when it is missing — no action needed when it
+## already works. Runs the installer's own root step (one privilege prompt
+## via pkexec the very first time; silent forever after).
+.PHONY: ensure-input-access
+ensure-input-access:
+	@if [ "$$(id -u)" = "0" ]; then \
+		$(MAKE) --no-print-directory input-access; \
+	else \
+		ok=1; for d in /dev/input/event*; do \
+			[ -e "$$d" ] || continue; \
+			if [ ! -r "$$d" ]; then ok=0; break; fi; \
+		done; \
+		if [ "$$ok" = "1" ]; then \
+			echo "  input access already granted"; \
+		else \
+			echo "  granting input-device access (one privilege prompt)..."; \
+			$(MAKE) --no-print-directory input-access || echo "  warning: grant declined — input isolation will stay limited until granted"; \
+		fi; \
+	fi
+
+## Grant the desktop user read access to physical input devices so the
+## server can isolate them while the cursor is on a client. Self-elevates
+## through pkexec (works as root directly, e.g. sudo make input-access).
+input-access:
+	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install ./cmd/kvmshare-install
+	cd gui && ./kvmshare-install --input-access
+	@echo "input access granted — isolation engages without a restart"
 
 ## Grant the desktop user read access to physical input devices so the
 ## server can isolate them while the cursor is on a client. Installs a
