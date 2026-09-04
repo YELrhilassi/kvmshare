@@ -226,9 +226,10 @@ struct InputCapture {
     held: HashMap<u32, Held>,
     /// Whether *we* currently hold the pointer+keyboard grab.
     grabbed: bool,
-    /// Kernel-level device isolation while the cursor is on a client
-    /// (`None` when `/dev/input` is not readable — grab-only fallback).
-    evdev: Option<EvdevReader>,
+    /// Kernel-level device isolation while the cursor is on a client.
+    /// Always present; it engages the moment `/dev/input` becomes
+    /// readable (grab-only until then).
+    evdev: EvdevReader,
 }
 
 /// Open the X display (`None` = `$DISPLAY`), select XI2 raw events on the
@@ -255,16 +256,10 @@ pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<
     log_info!("input capture started (XI2 raw events)");
 
     let (tx, rx) = mpsc::channel();
-    // Best-effort: without /dev/input access the server falls back to
-    // grab-only (raw-event leaks to raw-reading apps remain, everything
-    // else still works).
-    let evdev = match EvdevReader::start(tx.clone()) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            log_warn!("input isolation unavailable: {e} — raw-reading apps may react to forwarded input");
-            None
-        }
-    };
+    // The evdev reader is always started; it isolates the devices at the
+    // kernel the moment they become readable. Until then the server runs
+    // grab-only (raw-reading apps may react to forwarded input).
+    let evdev = EvdevReader::start(tx.clone());
     let capture = InputCapture { conn, root, tx, cmd_rx, motion: PendingMotion::default(), held: HashMap::new(), grabbed: false, evdev };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {
@@ -409,9 +404,15 @@ impl InputCapture {
                 // The evdev reader grabs the physical devices at the
                 // kernel (X goes fully silent) and starts forwarding;
                 // releasing does the reverse and X capture resumes.
-                if let Some(evdev) = &self.evdev {
-                    evdev.set_remote(remote);
-                }
+                // Also clear the held-key state: once the devices are
+                // kernel-grabbed, X never sees the releases of keys that
+                // were pressed before (or during) the isolation, so
+                // synthesizing repeats for them here would replay stale
+                // presses on the client later — the "media keys saved
+                // and applied on the client" bug. The evdev reader
+                // tracks its own presses instead.
+                self.held.clear();
+                self.evdev.set_remote(remote);
             }
         }
     }

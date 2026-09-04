@@ -172,6 +172,29 @@ const HID_TO_EVDEV: &[(u32, u16)] = &[
     (0x89, 124), // Int'l 3 (Yen)
     (0x8a, 94),  // Int'l 4 (Henkan)
     (0x8b, 95),  // Int'l 5 (Muhenkan)
+    // Media transport (USB HID consumer page 0x0C). QMK keyboards
+    // (e.g. the Ergodox EZ) send these from their media layers.
+    (0xb0, 207), // Play
+    (0xb1, 201), // Pause
+    (0xb3, 208), // Fast Forward
+    (0xb4, 168), // Rewind
+    (0xb5, 163), // Next Track
+    (0xb6, 165), // Previous Track
+    (0xb7, 166), // Stop
+    (0xb8, 161), // Eject
+    (0xb9, 398), // Shuffle (Random Toggle)
+    (0xcd, 164), // Play/Pause
+    // (Bass Boost is deliberately unmapped: its consumer usage 0xE5
+    // collides with Right Shift in this single keyboard-page namespace.)
+    // Browser / AC keys (consumer page 0x022x)
+    (0x194, 150), // WWW (AL Internet Browser)
+    (0x221, 217), // AC Search
+    (0x223, 172), // AC Home
+    (0x224, 158), // AC Back
+    (0x225, 159), // AC Forward
+    (0x226, 156), // AC Bookmarks
+    (0x227, 173), // AC Refresh
+    (0x228, 128), // AC Stop
     // Modifiers
     (0xe0, 29),  // Left Control
     (0xe1, 42),  // Left Shift
@@ -255,6 +278,26 @@ const EVDEV_TO_HID: &[(u16, u32)] = &[
     (124, 0x89), // Yen
     (125, 0xe3), // Left Meta
     (126, 0xe7), // Right Meta
+    // Media transport
+    (128, 0x228), // AC Stop
+    (150, 0x194), // WWW
+    (156, 0x226), // Bookmarks
+    (158, 0x224), // Back
+    (159, 0x225), // Forward
+    (161, 0xb8),  // Eject
+    (163, 0xb5),  // Next Track
+    (164, 0xcd),  // Play/Pause
+    (165, 0xb6),  // Previous Track
+    (166, 0xb7),  // Stop
+    (168, 0xb4),  // Rewind
+    (172, 0x223), // Home
+    (173, 0x227), // Refresh
+    (201, 0xb1),  // Pause
+    (207, 0xb0),  // Play
+    (208, 0xb3),  // Fast Forward
+    // (KEY_BASSBOOST 209 is deliberately unmapped — see HID_TO_EVDEV.)
+    (217, 0x221), // Search
+    (398, 0xb9),  // Shuffle
 ];
 
 /// (HID usage, set-1 scancode, E0-extended flag) triples for Windows
@@ -342,6 +385,11 @@ const HID_TO_SCAN: &[(u32, u16, bool)] = &[
     (0x62, 0x52, false), // KP 0
     (0x63, 0x53, false), // KP .
     (0x67, 0x59, false), // KP =
+    // Media transport (standard set-1 extended scan codes)
+    (0xb5, 0x19, true), // Next Track
+    (0xb6, 0x10, true), // Previous Track
+    (0xb7, 0x24, true), // Stop
+    (0xcd, 0x22, true), // Play/Pause
     // International (JIS)
     (0x87, 0x73, false), // Int'l 1 (Ro)
     (0x88, 0x70, false), // Int'l 2 (Katakana)
@@ -361,6 +409,15 @@ const HID_TO_SCAN: &[(u32, u16, bool)] = &[
     (0xe8, 0x20, true), // Mute
     (0xe9, 0x30, true), // Volume Up
     (0xea, 0x2e, true), // Volume Down
+    // Browser / AC keys
+    (0x194, 0x32, true), // WWW / Home
+    (0x221, 0x65, true), // Search
+    (0x223, 0x32, true), // Home (same scan as WWW)
+    (0x224, 0x6a, true), // Back
+    (0x225, 0x69, true), // Forward
+    (0x226, 0x67, true), // Bookmarks
+    (0x227, 0x66, true), // Refresh
+    (0x228, 0x68, true), // Stop
 ];
 
 #[cfg(test)]
@@ -389,11 +446,47 @@ mod tests {
     #[test]
     fn unknown_codes_are_none() {
         assert_eq!(evdev_from_hid(0x0001), None); // HID 0x01 is "ErrorRollOver"
-        assert_eq!(hid_from_evdev(200), None);    // KEY_MAX-ish / unmapped
+        assert_eq!(hid_from_evdev(200), None);    // unmapped
         assert_eq!(scancode_from_hid(0x0001), None);
         assert_eq!(hid_from_scancode(0x00, false), None);
         // Pause (E1 sequence) is intentionally unmapped.
         assert_eq!(hid_from_scancode(0x1d, false), Some(0xe0)); // left ctrl
+    }
+
+    #[test]
+    fn media_keys_roundtrip() {
+        // (HID usage, evdev code) pairs QMK media layers send — the
+        // Ergodox EZ declares exactly these on its consumer-control node.
+        for (hid, evdev) in [
+            (0xb0, 207), // Play
+            (0xb1, 201), // Pause
+            (0xb3, 208), // Fast Forward
+            (0xb4, 168), // Rewind
+            (0xb5, 163), // Next Track
+            (0xb6, 165), // Previous Track
+            (0xb7, 166), // Stop
+            (0xb8, 161), // Eject
+            (0xb9, 398), // Shuffle
+            (0xcd, 164), // Play/Pause
+            (0x194, 150), // WWW
+            (0x221, 217), // Search
+            (0x223, 172), // Home
+            (0x224, 158), // Back
+            (0x225, 159), // Forward
+            (0x226, 156), // Bookmarks
+            (0x227, 173), // Refresh
+            (0x228, 128), // Stop (AC)
+        ] {
+            assert_eq!(evdev_from_hid(hid), Some(evdev), "HID 0x{hid:02x}");
+            assert_eq!(hid_from_evdev(evdev), Some(hid), "evdev {evdev}");
+        }
+        // Transport keys have standard set-1 extended scan codes; the
+        // media-only keys (rewind, eject, …) have none on Windows and are
+        // correctly absent from the scan table.
+        assert_eq!(scancode_from_hid(0xcd), Some((0x22, true))); // Play/Pause
+        assert_eq!(scancode_from_hid(0xb5), Some((0x19, true))); // Next
+        assert_eq!(scancode_from_hid(0x224), Some((0x6a, true))); // Back
+        assert_eq!(scancode_from_hid(0xb4), None); // Rewind: no scan code
     }
 
     #[test]

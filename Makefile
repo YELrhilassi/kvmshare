@@ -51,7 +51,7 @@ GUI_BIN    := gui/kvmshare-gui
 WIN_TARGET := x86_64-pc-windows-gnu
 MINGW      := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
 
-.PHONY: build install dev test clean uninstall release publish winres
+.PHONY: build install dev test clean uninstall release publish winres input-access
 
 ## Compile everything.
 build:
@@ -72,10 +72,34 @@ install: build
 		echo "  config already present, keeping $(CONFIG_DIR)/kvmshare-server.toml"; \
 	fi
 	install -m644 packaging/kvmshare.desktop $(APPS_DIR)/kvmshare.desktop
+	@if [ "$$(id -u)" = "0" ]; then \
+		$(MAKE) --no-print-directory input-access; \
+	else \
+		echo "  note: input isolation needs system access — run \"sudo make input-access\" once (the portable installer does it automatically)"; \
+	fi
 	@echo "installed:"
 	@echo "  $(BINDIR)/kvmshare-server"
 	@echo "  $(BINDIR)/kvmshare-client"
 	@echo "  $(BINDIR)/kvmshare-gui"
+
+## Grant the desktop user read access to physical input devices so the
+## server can isolate them while the cursor is on a client. Installs a
+## udev rule (the uaccess tag makes elogind/logind grant the active seat
+## user an ACL immediately — no group dance, no re-login) and adds the
+## invoking user to the input group as the non-logind fallback. Must run
+## as root:  sudo make input-access
+input-access:
+	@if [ "$$(id -u)" != "0" ]; then \
+		echo "this target must run as root:  sudo make input-access"; exit 1; \
+	fi
+	install -m644 packaging/99-kvmshare-input.rules /etc/udev/rules.d/99-kvmshare-input.rules
+	@if [ -n "$${SUDO_USER:-}" ]; then \
+		echo "adding $${SUDO_USER} to the input group (fallback for non-logind systems)"; \
+		usermod -aG input "$$SUDO_USER" || true; \
+	fi
+	udevadm control --reload-rules
+	udevadm trigger --subsystem-match=input
+	@echo "input access granted — isolation engages without a restart"
 
 ## Watch sources and rebuild + reinstall on every change.
 dev:

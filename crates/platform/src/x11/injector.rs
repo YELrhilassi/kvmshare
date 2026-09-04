@@ -2,6 +2,8 @@
 //! buttons/keys/wheel, hide the local cursor while being controlled,
 //! read/write the clipboard. Implements [`Injector`] from the core crate.
 
+use std::collections::HashSet;
+
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
@@ -32,6 +34,14 @@ pub struct X11Injector {
     /// Last clipboard content applied from the server; the clipboard
     /// poller skips it so remote content is never echoed back.
     last_remote: Option<(String, Vec<u8>)>,
+    /// Keys (HID usages) injected as down and not yet released. `leave`
+    /// releases everything still held — the server may never deliver the
+    /// matching ups (the user crossed back mid-hold), and the desktop
+    /// must not be left with a stuck key.
+    keys_down: HashSet<u32>,
+    /// Buttons injected as down and not yet released (same contract as
+    /// [`X11Injector::keys_down`]).
+    buttons_down: HashSet<u8>,
 }
 
 impl X11Injector {
@@ -45,7 +55,15 @@ impl X11Injector {
         conn.xfixes_query_version(5, 0).map_err(|e| format!("XFixes version: {e}"))?;
 
         let clipboard = if display.is_none() { arboard::Clipboard::new().ok() } else { None };
-        Ok(Self { conn, root, clipboard, cursor_hidden: false, last_remote: None })
+        Ok(Self {
+            conn,
+            root,
+            clipboard,
+            cursor_hidden: false,
+            last_remote: None,
+            keys_down: HashSet::new(),
+            buttons_down: HashSet::new(),
+        })
     }
 
     /// The default screen, used for the reported screen shape.
@@ -66,6 +84,14 @@ impl Injector for X11Injector {
     }
 
     fn button(&mut self, button: u8, pressed: bool) {
+        // Track down-state so `leave` can release whatever the server
+        // never sent an up for. A release for a button we did not press
+        // is dropped (its press happened on the server's machine).
+        if pressed {
+            self.buttons_down.insert(button);
+        } else if !self.buttons_down.remove(&button) {
+            return;
+        }
         let Some(x11_button) = buttons::to_x11(button) else { return };
         let ty = if pressed { BUTTON_PRESS } else { BUTTON_RELEASE };
         let _ = self.conn.xtest_fake_input(ty, x11_button, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
@@ -88,6 +114,23 @@ impl Injector for X11Injector {
         // `keycode = evdev + 8` mapping). Unknown usages are dropped: a
         // wrong key would be worse than no key.
         let Some(evdev) = crate::keys::evdev_from_hid(key) else { return };
+        // Track down-state so `leave` can release whatever the server
+        // never sent an up for. A repeat for a key we did not press (it
+        // was held across the boundary, pressed on the server) must not
+        // start a press here.
+        match kind {
+            KeyKind::Down => {
+                self.keys_down.insert(key);
+            }
+            KeyKind::Up => {
+                self.keys_down.remove(&key);
+            }
+            KeyKind::Repeat => {
+                if !self.keys_down.contains(&key) {
+                    return;
+                }
+            }
+        }
         let keycode = evdev + 8;
         let is_press = matches!(kind, KeyKind::Down | KeyKind::Repeat);
         let ty = if is_press { KEY_PRESS } else { KEY_RELEASE };
@@ -109,6 +152,17 @@ impl Injector for X11Injector {
             let _ = xfixes::show_cursor(&self.conn, self.root);
             let _ = self.conn.flush();
             self.cursor_hidden = false;
+        }
+        // Control left this machine: release every key and button we
+        // injected and never saw released — the user may have crossed
+        // back mid-hold, so the matching ups will never arrive.
+        let keys: Vec<u32> = self.keys_down.drain().collect();
+        for key in keys {
+            self.key(KeyKind::Up, key);
+        }
+        let buttons: Vec<u8> = self.buttons_down.drain().collect();
+        for button in buttons {
+            self.button(button, false);
         }
     }
 

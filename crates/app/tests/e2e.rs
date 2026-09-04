@@ -166,7 +166,10 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     h.wait_for_clients(1);
 
     // -- Cross from pc onto hp (left screen). --
-    feed(&h, Message::MouseMoveRel { dx: -1000, dy: 0 }); // pc center (960,540) - 1000 → past left edge
+    // The real cursor parks at the shared edge (beacon), then an outward
+    // push crosses. (Deltas alone never cross — see core::session.)
+    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
 
     let cc = calls(&client_calls);
     assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
@@ -215,7 +218,8 @@ fn client_disconnect_returns_cursor_home() {
     // Connect but never run the loop: the socket stays open.
     let (client, _injector, _client_calls, _out_rx) = connect_client(h.port);
     h.wait_for_clients(1);
-    feed(&h, Message::MouseMoveRel { dx: -1000, dy: 0 }); // on hp now
+    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 }); // beacon at the shared edge
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 }); // outward push: on hp now
 
     // Dropping the client closes the TCP connection; the server notices
     // and returns the cursor to the local screen.
@@ -244,7 +248,8 @@ fn config_hot_reload_returns_cursor_home_and_broadcasts() {
 
     // Move onto hp, then reload a layout that no longer has hp: the
     // cursor must come home and the client must be told to leave.
-    feed(&h, Message::MouseMoveRel { dx: -1000, dy: 0 });
+    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 }); // beacon at the shared edge
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 }); // outward push
     assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
 
     let new_layout = Layout::new(vec![Screen {

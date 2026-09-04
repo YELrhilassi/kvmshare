@@ -1,0 +1,9 @@
+# kvmshare: grant the `input` group read access to physical input
+# devices (mouse, keyboard, consumer-control nodes).
+#
+# Kernel input isolation (EVIOCGRAB) lets kvmshare stop *all* event
+# delivery to the desktop — raw XI2 included — while the shared cursor
+# is on another machine. Reading /dev/input/event* requires this access;
+# the installer adds the desktop user to the `input` group and reloads
+# rules, so no manual step is ever needed.
+KERNEL=="event*", SUBSYSTEM=="input", MODE="0660", GROUP="input", TAG+="uaccess"

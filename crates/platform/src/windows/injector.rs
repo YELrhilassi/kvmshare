@@ -17,6 +17,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse as km;
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
 use kvmshare_core::client::Injector;
+use std::collections::HashSet;
+
 use kvmshare_protocol::message::{KeyKind, ScreenInfo};
 
 use super::buttons;
@@ -59,6 +61,14 @@ pub struct Win32Injector {
     blocked_since: Option<Instant>,
     /// Moves injected since the last position verification.
     moves_since_verify: u32,
+    /// Keys (HID usages) injected as down and not yet released. `leave`
+    /// releases everything still held: the server may never deliver the
+    /// matching ups (the user crossed back mid-hold), and the OS must
+    /// not be left thinking a key is stuck down.
+    keys_down: HashSet<u32>,
+    /// Buttons injected as down and not yet released (same contract as
+    /// [`Win32Injector::keys_down`]).
+    buttons_down: HashSet<u8>,
 }
 
 impl Win32Injector {
@@ -68,6 +78,8 @@ impl Win32Injector {
             cursor_hidden: false,
             blocked_since: None,
             moves_since_verify: 0,
+            keys_down: HashSet::new(),
+            buttons_down: HashSet::new(),
         }
     }
 
@@ -188,6 +200,14 @@ impl Injector for Win32Injector {
     }
 
     fn button(&mut self, button: u8, pressed: bool) {
+        // Track down-state so `leave` can release whatever the server
+        // never sent an up for. A release for a button we did not press
+        // is dropped (its press happened on the server's machine).
+        if pressed {
+            self.buttons_down.insert(button);
+        } else if !self.buttons_down.remove(&button) {
+            return;
+        }
         let Some((flag, xbutton)) = buttons::sendinput_flags(button, pressed) else { return };
         // SAFETY: building a well-formed INPUT union and passing it to
         // SendInput; the union's active field matches INPUT_MOUSE.
@@ -216,6 +236,23 @@ impl Injector for Win32Injector {
         // flag). Unknown usages are dropped: a wrong key would be worse
         // than no key.
         let Some((scan, extended)) = crate::keys::scancode_from_hid(key) else { return };
+        // Track down-state so `leave` can release whatever the server
+        // never sent an up for. A repeat for a key we did not press (it
+        // was held across the boundary, pressed on the server) must not
+        // start a press here.
+        match kind {
+            KeyKind::Down => {
+                self.keys_down.insert(key);
+            }
+            KeyKind::Up => {
+                self.keys_down.remove(&key);
+            }
+            KeyKind::Repeat => {
+                if !self.keys_down.contains(&key) {
+                    return;
+                }
+            }
+        }
         let is_press = matches!(kind, KeyKind::Down | KeyKind::Repeat);
         // SAFETY: well-formed KEYBDINPUT with scan-code mode; the
         // layout-independent physical key is what travels.
@@ -257,6 +294,20 @@ impl Injector for Win32Injector {
                 wm::ShowCursor(1);
             }
             self.cursor_hidden = false;
+        }
+        // Control left this machine: release every key and button we
+        // injected and never saw released — the user may have crossed
+        // back mid-hold, so the matching ups will never arrive. Without
+        // this the OS would keep the key held (auto-repeating into the
+        // foreground app) until the same key was pressed and released
+        // again.
+        let keys: Vec<u32> = self.keys_down.drain().collect();
+        for key in keys {
+            self.key(KeyKind::Up, key);
+        }
+        let buttons: Vec<u8> = self.buttons_down.drain().collect();
+        for button in buttons {
+            self.button(button, false);
         }
     }
 

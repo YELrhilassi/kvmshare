@@ -32,12 +32,27 @@ import (
 
 func main() {
 	var (
-		version   = flag.String("version", "", "install this exact version (default: latest)")
-		local     = flag.String("local", "", "install from a local directory of built binaries (no network)")
-		check     = flag.Bool("check", false, "print the latest published version and exit")
-		uninstall = flag.Bool("uninstall", false, "remove installed binaries + shortcuts")
+		version     = flag.String("version", "", "install this exact version (default: latest)")
+		local       = flag.String("local", "", "install from a local directory of built binaries (no network)")
+		check       = flag.Bool("check", false, "print the latest published version and exit")
+		uninstall   = flag.Bool("uninstall", false, "remove installed binaries + shortcuts")
+		inputAccess = flag.Bool("input-access", false, "(Linux) grant input-device access; run as root via pkexec")
 	)
 	flag.Parse()
+
+	// Privileged subcommand: invoked by this same binary through pkexec
+	// after a normal install (see integrate_linux.go).
+	if *inputAccess {
+		if os.Geteuid() != 0 {
+			fmt.Fprintln(os.Stderr, "kvmshare-install: --input-access must run as root (pkexec does this automatically)")
+			os.Exit(1)
+		}
+		if err := integrateInputAccess(); err != nil {
+			fatal(err)
+		}
+		fmt.Println("kvmshare-install: input access granted")
+		return
+	}
 
 	if *uninstall {
 		if err := uninstallAll(); err != nil {
