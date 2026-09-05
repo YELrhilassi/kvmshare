@@ -68,15 +68,19 @@ pub trait Engine: Send {
 
     /// Hide/show the local cursor while away / at home.
     fn show_local_cursor(&mut self, visible: bool);
-    /// Put `data` into the local clipboard (copied on a client).
-    fn clipboard_set(&mut self, mime: &str, data: &[u8]);
-    /// Read the current local clipboard, if any.
-    fn clipboard_get(&mut self) -> Option<(String, Vec<u8>)>;
-    /// The last clipboard content applied from a *remote* source (set via
-    /// [`Engine::clipboard_set`]). Clipboard pollers compare against this
-    /// so content that arrived from a peer is never echoed back to it.
-    fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)>;
 }
+
+/// A shared handle to the server's clipboard service.
+///
+/// The clipboard is deliberately **not** part of [`Engine`]: reading or
+/// writing the system clipboard can block for a long time (an X11
+/// selection owner busy or gone, another process holding the clipboard
+/// open), and the engine lock serializes the *entire input path* — a
+/// clipboard call under that lock would freeze every cursor motion on
+/// every client for as long as the call blocks. The clipboard lives
+/// behind its own lock instead, serviced by its own thread (the app's
+/// poller) and only ever touched by clipboard work.
+pub type ServerClipboard = Arc<Mutex<Box<dyn crate::clipboard::Clipboard>>>;
 
 /// The server's view of one connected client.
 struct Client {
@@ -179,16 +183,26 @@ impl Server {
 
     /// Run the server forever. `input` delivers local input events from
     /// the platform; `engine` lets us control the local cursor and is
-    /// shared so other threads (client handlers, the UDP receiver, the
-    /// app's clipboard poller) can reach it too.
-    pub fn run(&self, input: Receiver<Message>, engine: Arc<Mutex<Box<dyn Engine>>>) -> io::Result<()> {
+    /// shared so other threads (client handlers, the UDP receiver) can
+    /// reach it too. `clipboard` is the local clipboard service, on its
+    /// own lock: inbound client clipboard is applied through it, and the
+    /// app's poller reads through it — a stalled clipboard read can
+    /// never hold the engine lock (which serializes every cursor
+    /// motion).
+    pub fn run(
+        &self,
+        input: Receiver<Message>,
+        engine: Arc<Mutex<Box<dyn Engine>>>,
+        clipboard: ServerClipboard,
+    ) -> io::Result<()> {
         // Accept clients on a background thread.
-        let (listener, session, clients, active, engine_accept) = (
+        let (listener, session, clients, active, engine_accept, clipboard_accept) = (
             self.listener.try_clone()?,
             self.session.clone(),
             self.clients.clone(),
             self.active.clone(),
             engine.clone(),
+            clipboard.clone(),
         );
         let udp_accept = self.udp.clone();
         let addrs_accept = self.udp_addrs.clone();
@@ -204,6 +218,7 @@ impl Server {
                             clients.clone(),
                             active.clone(),
                             engine_accept.clone(),
+                            clipboard_accept.clone(),
                             udp_accept.clone(),
                             addrs_accept.clone(),
                             seqs_accept.clone(),
@@ -566,6 +581,7 @@ impl Client {
         clients: Arc<Mutex<HashMap<u8, Arc<Client>>>>,
         active: Arc<Mutex<Option<u8>>>,
         engine: Arc<Mutex<Box<dyn Engine>>>,
+        clipboard: ServerClipboard,
         udp: Arc<UdpSocket>,
         addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
         seqs: Arc<Mutex<HashMap<u8, u32>>>,
@@ -639,6 +655,7 @@ impl Client {
         let active2 = active.clone();
         let session2 = session.clone();
         let engine2 = engine.clone();
+        let clipboard2 = clipboard.clone();
         thread::spawn(move || {
             loop {
                 let msg = match reader.recv() {
@@ -660,10 +677,14 @@ impl Client {
                     }
                     Message::Clipboard { mime, data } => {
                         // Content copied on the client reaches the
-                        // server's local clipboard.
+                        // server's local clipboard. Applied through the
+                        // clipboard service's own lock: `set` can block
+                        // (selection ownership handshakes), and it must
+                        // never hold the engine lock that serializes
+                        // every cursor motion.
                         log_debug!("clipboard from {}: {} ({} bytes)", c2.name, mime, data.len());
-                        if let Ok(mut engine) = engine2.lock() {
-                            engine.clipboard_set(&mime, &data);
+                        if let Ok(mut cb) = clipboard2.lock() {
+                            cb.set(&mime, &data);
                         }
                     }
                     // Defensive: current clients send beacons over UDP;

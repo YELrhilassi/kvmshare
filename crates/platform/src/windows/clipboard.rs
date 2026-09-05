@@ -117,6 +117,23 @@ impl Clipboard {
     }
 }
 
+/// The shared clipboard contract ([`kvmshare_core::clipboard::Clipboard`]),
+/// so this same object serves both the client role and the server role.
+impl kvmshare_core::client::Clipboard for Clipboard {
+    fn set(&mut self, mime: &str, data: &[u8]) {
+        self.set_text(mime, data);
+    }
+    fn get(&mut self) -> Option<(String, Vec<u8>)> {
+        self.get_text()
+    }
+    fn last_injected(&mut self) -> Option<(String, Vec<u8>)> {
+        // Same module: touch the field directly rather than the
+        // same-named inherent method (which would recurse through the
+        // trait dispatch).
+        self.last_remote.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -50,9 +50,11 @@ fn run() -> Result<(), String> {
         cfg.screens[0].name
     );
 
-    // Platform: capture local input + control the local cursor.
-    let (input, engine) = kvmshare_platform::server(None).map_err(|e| format!("platform: {e}"))?;
+    // Platform: capture local input + control the local cursor, and the
+    // standalone clipboard service (its own lock — see the poller docs).
+    let (input, engine, clipboard) = kvmshare_platform::server(None).map_err(|e| format!("platform: {e}"))?;
     let engine = Arc::new(Mutex::new(engine));
+    let clipboard: Arc<Mutex<Box<dyn kvmshare_core::client::Clipboard>>> = Arc::new(Mutex::new(clipboard));
 
     let (ctl_tx, ctl_rx) = mpsc::channel();
     let server = Arc::new(
@@ -61,14 +63,14 @@ fn run() -> Result<(), String> {
     );
 
     // Clipboard: local changes are broadcast to every client.
-    spawn_server_clipboard(engine.clone(), server.clone());
+    spawn_server_clipboard(clipboard.clone(), server.clone());
 
     // Config hot-reload: watch the file and adopt changes live, without
     // a restart (the GUI saves the config while the server keeps running).
     spawn_config_watcher(config_path, ctl_tx);
 
     // Run forever, forwarding local input.
-    server.run(input, engine).map_err(|e| format!("server: {e}"))
+    server.run(input, engine, clipboard).map_err(|e| format!("server: {e}"))
 }
 
 /// How often the config watcher polls the file for changes.

@@ -45,13 +45,6 @@ impl Engine for MockEngine {
     fn show_local_cursor(&mut self, visible: bool) {
         self.calls.lock().unwrap().push(format!("cursor {visible}"));
     }
-    fn clipboard_set(&mut self, _mime: &str, _data: &[u8]) {}
-    fn clipboard_get(&mut self) -> Option<(String, Vec<u8>)> {
-        None
-    }
-    fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)> {
-        None
-    }
 }
 
 /// A client-side injector that records what the client was told to do.
@@ -141,10 +134,13 @@ fn start_server() -> Harness {
 
     // Dropping the JoinHandle detaches the thread; it keeps running for
     // the whole test on its own Arc clones.
+    let clipboard: kvmshare_core::server::ServerClipboard =
+        Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
     thread::spawn({
         let server = server.clone();
         let engine = engine.clone();
-        move || server.run(input_rx, engine).unwrap()
+        let clipboard = clipboard.clone();
+        move || server.run(input_rx, engine, clipboard).unwrap()
     });
 
     Harness { server, input_tx, control_tx, engine_calls, port }

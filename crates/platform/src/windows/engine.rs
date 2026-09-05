@@ -1,21 +1,22 @@
 //! The server's control over its own screen: cursor warp, cursor
-//! hide/show, clipboard. Implements [`Engine`] from the core crate.
+//! hide/show. Implements [`Engine`] from the core crate.
 //!
-//! The engine never *injects* input — it only warps its own cursor and
-//! touches its own clipboard. Because `SetCursorPos` is a programmatic
-//! warp, it does not generate raw input events, so parking/re-centering
-//! the hidden cursor can never feed phantom motion back into the session
-//! (the same property the X11 backend gets from XI2 raw events).
+//! The engine never *injects* input — it only warps its own cursor.
+//! Because `SetCursorPos` is a programmatic warp, it does not generate
+//! raw input events, so parking/re-centering the hidden cursor can
+//! never feed phantom motion back into the session (the same property
+//! the X11 backend gets from XI2 raw events). The clipboard is *not*
+//! here: it lives on its own lock as a standalone service (see
+//! [`super::clipboard`]), because a clipboard call can block on another
+//! process holding the clipboard open and must never serialize with
+//! cursor control.
 
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
 use kvmshare_core::server::Engine;
 
-use super::clipboard::Clipboard;
-
 /// Server-side engine over the local Windows desktop.
 pub struct Win32Engine {
-    clipboard: Clipboard,
     /// True while the local cursor is hidden (between `SwitchTo` and
     /// `SwitchToLocal`). `ShowCursor` is ref-counted, so we only touch it
     /// on transitions to keep the count balanced.
@@ -24,7 +25,7 @@ pub struct Win32Engine {
 
 impl Win32Engine {
     pub fn new() -> Self {
-        Self { clipboard: Clipboard::new(), cursor_hidden: false }
+        Self { cursor_hidden: false }
     }
 }
 
@@ -57,15 +58,4 @@ impl Engine for Win32Engine {
         }
     }
 
-    fn clipboard_set(&mut self, mime: &str, data: &[u8]) {
-        self.clipboard.set_text(mime, data);
-    }
-
-    fn clipboard_get(&mut self) -> Option<(String, Vec<u8>)> {
-        self.clipboard.get_text()
-    }
-
-    fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)> {
-        self.clipboard.last_injected()
-    }
 }

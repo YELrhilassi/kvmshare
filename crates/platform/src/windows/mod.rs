@@ -59,12 +59,17 @@ fn set_dpi_aware() {
 }
 
 /// The server-side Windows platform: local input capture + local cursor
-/// engine.
+/// engine + the standalone clipboard service.
 pub struct Server {
     /// Incoming local input events (motion/buttons/keys).
     pub input: Receiver<Message>,
-    /// Control of the local cursor and clipboard.
+    /// Control of the local cursor.
     pub engine: Box<dyn Engine>,
+    /// The local clipboard, on its own lock in the app layer. Split from
+    /// the engine on purpose: a clipboard read can block on another
+    /// process holding the clipboard open, and the engine lock
+    /// serializes cursor motion.
+    pub clipboard: Box<dyn kvmshare_core::client::Clipboard>,
 }
 
 impl Server {
@@ -79,7 +84,8 @@ impl Server {
         timer::HighResTimer::engage_forever();
         let input = capture::start()?;
         let engine = Box::new(engine::Win32Engine::new());
-        Ok(Self { input, engine })
+        let clipboard: Box<dyn kvmshare_core::client::Clipboard> = Box::new(clipboard::Clipboard::new());
+        Ok(Self { input, engine, clipboard })
     }
 }
 

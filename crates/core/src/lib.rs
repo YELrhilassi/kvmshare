@@ -13,6 +13,7 @@
 //! traits defined here.
 
 pub mod client;
+pub mod clipboard;
 pub mod layout;
 pub mod motion;
 pub mod server;

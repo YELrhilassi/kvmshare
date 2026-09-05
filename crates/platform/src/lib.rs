@@ -47,20 +47,25 @@ pub mod x11;
 pub mod windows;
 
 /// Start the server-side platform: capture local input and build the
-/// engine that controls the local cursor/clipboard.
+/// engine that controls the local cursor, plus the standalone clipboard
+/// service (returned separately because the clipboard lives on its own
+/// lock in the app layer — a clipboard call that stalls must never be
+/// able to freeze the cursor).
 ///
 /// `display` is an X display string (`None` = `$DISPLAY`); ignored on
 /// platforms without displays.
-pub fn server(display: Option<&str>) -> Result<(Receiver<Message>, Box<dyn Engine>), String> {
+pub fn server(
+    display: Option<&str>,
+) -> Result<(Receiver<Message>, Box<dyn Engine>, Box<dyn Clipboard>), String> {
     #[cfg(target_os = "linux")]
     {
         let s = x11::Server::start(display)?;
-        Ok((s.input, s.engine))
+        Ok((s.input, s.engine, s.clipboard))
     }
     #[cfg(target_os = "windows")]
     {
         let s = windows::Server::start(display)?;
-        Ok((s.input, s.engine))
+        Ok((s.input, s.engine, s.clipboard))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {

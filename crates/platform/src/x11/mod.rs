@@ -29,27 +29,31 @@ pub mod injector;
 use std::sync::mpsc::{self, Receiver};
 
 use kvmshare_core::server::Engine;
-use kvmshare_core::client::Injector;
+use kvmshare_core::client::{Clipboard, Injector};
 use kvmshare_protocol::message::Message;
 
-/// The server-side X11 platform: local input capture + local cursor engine.
+/// The server-side X11 platform: local input capture + local cursor
+/// engine + the standalone clipboard service.
 pub struct Server {
-    /// Incoming local input events (motion/buttons/keys/clipboard polls).
+    /// Incoming local input events (motion/buttons/keys).
     pub input: Receiver<Message>,
-    /// Control of the local cursor and clipboard.
+    /// Control of the local cursor.
     pub engine: Box<dyn Engine>,
+    /// The local clipboard, on its own lock in the app layer. Split from
+    /// the engine on purpose: a clipboard read can block on the
+    /// selection owner, and the engine lock serializes cursor motion.
+    pub clipboard: Box<dyn Clipboard>,
 }
 
 impl Server {
     /// Open the X display (default when `None`), start input capture, and
-    /// build the engine. Three roles share two X connections: the
-    /// capture thread owns one exclusively (events + cursor control), the
-    /// engine the other (clipboard + queries).
+    /// build the engine and the clipboard service.
     pub fn start(display: Option<&str>) -> Result<Self, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let input = capture::start(display, cmd_rx)?;
         let engine = Box::new(engine::X11Engine::new(display, cmd_tx)?);
-        Ok(Self { input, engine })
+        let clipboard: Box<dyn Clipboard> = Box::new(injector::X11Clipboard::new(display));
+        Ok(Self { input, engine, clipboard })
     }
 }
 

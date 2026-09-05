@@ -135,16 +135,11 @@ pub trait Injector: Send {
 /// gives the clipboard its own lock, serviced by its own thread — a
 /// stalled clipboard read delays only clipboard sync, never a cursor
 /// placement.
-pub trait Clipboard: Send {
-    /// Put `data` into the local clipboard (received from the server).
-    fn set(&mut self, mime: &str, data: &[u8]);
-    /// Read the current local clipboard, if any.
-    fn get(&mut self) -> Option<(String, Vec<u8>)>;
-    /// The last clipboard content applied from a *remote* source (set via
-    /// [`Clipboard::set`]). Pollers compare against this so content that
-    /// arrived from the server is never echoed back to it.
-    fn last_injected(&mut self) -> Option<(String, Vec<u8>)>;
-}
+///
+/// The trait itself lives in [`crate::clipboard`] — the server role
+/// needs the identical contract — and is re-exported here so the
+/// client-facing name [`Clipboard`] is unchanged.
+pub use crate::clipboard::Clipboard;
 
 /// How often the client sends a keepalive when idle.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
