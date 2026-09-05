@@ -41,6 +41,17 @@ func integrateDesktop(dir string) error {
 	if err := registerUninstall(dir); err != nil {
 		problems = append(problems, fmt.Sprintf("uninstall entry: %v", err))
 	}
+	// A sample layout config on first install only — the server refuses
+	// to start without one (its --config must exist). The GUI also
+	// creates it on demand, so both fresh installs and upgrades are
+	// covered; existing layouts are never overwritten.
+	if home, err := os.UserHomeDir(); err == nil {
+		if err := selfupdate.EnsureServerConfig(
+			filepath.Join(home, ".config", "kvmshare", "kvmshare-server.toml"),
+		); err != nil {
+			problems = append(problems, fmt.Sprintf("sample config: %v", err))
+		}
+	}
 	if len(problems) > 0 {
 		return fmt.Errorf("desktop integration had issues: %s", strings.Join(problems, "; "))
 	}

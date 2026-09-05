@@ -28,6 +28,22 @@ var desktopEntry []byte
 //go:embed assets/kvmshare-server.toml
 var sampleConfig []byte
 
+// EnsureServerConfig writes the sample server config to `path` when
+// nothing is there yet. Existing layouts are never touched — the sample
+// is only a starting point the layout editor refines. Every entry point
+// that can precede a server start calls this, so a server binary is
+// never spawned with a --config pointing at a file that does not exist
+// (which would make it exit immediately with a confusing read error).
+func EnsureServerConfig(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil // already configured — leave the user's layout alone
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, sampleConfig, 0o644)
+}
+
 // InstallDir is where release binaries land.
 //
 //	Linux:  ~/.local/bin        (already on PATH for most setups)

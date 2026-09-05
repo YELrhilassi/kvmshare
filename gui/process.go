@@ -480,7 +480,10 @@ func (a *App) currentMode() Mode {
 // closing the GUI leaves it running in the background (flock keeps it
 // unique).
 func (a *App) spawn(bin, logPath string, args ...string) (*proc, error) {
-	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	// O_TRUNC: each role start begins a fresh log, so an "exited
+	// immediately" message can never echo a stale line from a previous
+	// run (which made real failures look like old ones).
+	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open log: %w", err)
 	}
@@ -498,6 +501,11 @@ func (a *App) spawn(bin, logPath string, args ...string) (*proc, error) {
 		log.Close()
 		return nil, fmt.Errorf("start %s: %w", filepath.Base(bin), err)
 	}
+	// The child inherited its own handle to the file as stdout/stderr;
+	// our copy must be closed or the file stays locked by the GUI for
+	// the whole session (each spawn would leak a handle and block other
+	// readers — e.g. tools reading server.log).
+	log.Close()
 	p := &proc{cmd: cmd, done: make(chan struct{}), started: time.Now()}
 	go func() {
 		_ = cmd.Wait() // reap; closes done when the process is truly gone
