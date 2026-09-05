@@ -33,12 +33,13 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use kvmshare_log::{log_debug, log_info, log_trace, log_warn};
+use kvmshare_log::{log_debug, log_error, log_info, log_trace, log_warn};
 use kvmshare_protocol::id::errors;
 use kvmshare_protocol::message::{Layout, Message};
 
@@ -111,6 +112,92 @@ pub enum Control {
 const CONTROL_POLL: Duration = Duration::from_millis(100);
 
 /// A running server.
+/// Heartbeats the server supervisor watches. Each field is a millisecond
+/// timestamp (see [`now_ms`]) updated by its owning thread every loop
+/// iteration. A tick that goes stale while the cursor is on a client
+/// means that thread is wedged — and a wedged input-path thread while
+/// remote can leave this machine's keyboard and mouse trapped (the
+/// engine lock blocks crossings, or the capture thread holds the local
+/// input grab forever), so the supervisor recovers by exiting cleanly
+/// (see [`supervisor_loop`]).
+#[derive(Default)]
+pub struct Liveness {
+
+    /// The main input loop (wakes every ≤ [`CONTROL_POLL`]).
+    pub loop_tick_ms: AtomicU64,
+    /// The platform's capture thread (wakes every ~2 ms). This is the
+    /// thread that owns the local input grab while remote — the one
+    /// whose wedge traps the machine. Shared (`Arc`) because the
+    /// platform creates and owns the thread that writes it.
+    pub capture_tick_ms: Arc<AtomicU64>,
+}
+
+/// How often the supervisor wakes to check the heartbeats.
+const SUPERVISOR_POLL: Duration = Duration::from_millis(500);
+/// A heartbeat older than this (ms) while remote is a genuine wedge: a
+/// healthy main loop wakes every [`CONTROL_POLL`] and a healthy capture
+/// loop every ~2 ms, so 3 s means the thread has missed hundreds of
+/// wakes (never a false positive from load).
+const SUPERVISOR_STALL_MS: u64 = 3000;
+/// Exit code the supervisor uses to ask the process manager (the GUI)
+/// for a restart. Distinct from a crash (1) so the manager can tell a
+/// deliberate recovery from a failure.
+pub const EXIT_RESTART: i32 = 66;
+
+/// Milliseconds since the epoch (UTC). [`Liveness`] ticks are compared
+/// in this domain; the exact epoch does not matter, only that all ticks
+/// share it.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The watchdog for the server's input path. While the cursor is on a
+/// client, the local machine must be able to bring it home: a wedged
+/// main loop holds the engine lock that crossings need, and a wedged
+/// capture thread holds the local input grab forever — either way the
+/// local keyboard and mouse stay trapped until the process dies. The
+/// supervisor shares nothing with those threads but the liveness
+/// atomics, so whatever wedges them cannot block it. On a stall it
+/// exits with [`EXIT_RESTART`]; process exit closes every fd and X
+/// connection, which releases every kernel and X grab — the machine is
+/// never left input-dead, and the process manager (the GUI) restarts a
+/// clean server. Disabled when no real capture is present (test
+/// harnesses): there is nothing to trap.
+fn supervisor_loop(active: Arc<Mutex<Option<u8>>>, liveness: Arc<Liveness>) -> ! {
+    loop {
+        thread::sleep(SUPERVISOR_POLL);
+        if liveness.capture_tick_ms.load(Ordering::Relaxed) == 0 {
+            continue; // no real capture thread: nothing to guard
+        }
+        // `try_lock`: the supervisor must never block on a lock a wedged
+        // thread holds — that would kill the watchdog itself. If the
+        // active-state lock is held, assume the worst (remote) and let
+        // the tick ages decide.
+        let remote = match active.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
+        };
+        if !remote {
+            continue; // local idle is not a stall
+        }
+        let now = now_ms();
+        let loop_age = now.saturating_sub(liveness.loop_tick_ms.load(Ordering::Relaxed));
+        let capture_age = now.saturating_sub(liveness.capture_tick_ms.load(Ordering::Relaxed));
+        if loop_age > SUPERVISOR_STALL_MS || capture_age > SUPERVISOR_STALL_MS {
+            log_error!(
+                "SUPERVISOR: input path stalled while the cursor is on a client (main loop {loop_age:?}, capture {capture_age:?}) — exiting with code {EXIT_RESTART} so the manager restarts a clean server; local input is never left trapped"
+            );
+            // Give the log writer a moment to drain the line, then exit
+            // (which releases every grab via fd/connection close).
+            thread::sleep(Duration::from_millis(120));
+            std::process::exit(EXIT_RESTART);
+        }
+    }
+}
+
 pub struct Server {
     listener: TcpListener,
     udp: Arc<UdpSocket>,
@@ -194,7 +281,23 @@ impl Server {
         input: Receiver<Message>,
         engine: Arc<Mutex<Box<dyn Engine>>>,
         clipboard: ServerClipboard,
+        liveness: Arc<Liveness>,
     ) -> io::Result<()> {
+        // The watchdog: shares nothing with the input threads but the
+        // liveness atomics, so whatever wedges them cannot block it.
+        // While the cursor is on a client it verifies the input path is
+        // still alive; a wedged path exits with [`EXIT_RESTART`] so the
+        // manager (GUI) restarts a clean server — process exit releases
+        // every kernel and X grab, so the local machine is never left
+        // input-dead.
+        let supervisor = {
+            let active = self.active.clone();
+            let liveness = liveness.clone();
+            thread::Builder::new()
+                .name("kvmshare-server-supervisor".into())
+                .spawn(move || supervisor_loop(active, liveness))
+                .expect("cannot spawn server supervisor")
+        };
         // Accept clients on a background thread.
         let (listener, session, clients, active, engine_accept, clipboard_accept) = (
             self.listener.try_clone()?,
@@ -250,6 +353,8 @@ impl Server {
         // can reach the engine between events. Idle timeouts also drain
         // the app-layer control channel (hot reload).
         loop {
+            liveness.loop_tick_ms.store(now_ms(), Ordering::Relaxed);
+            let msg_start = std::time::Instant::now();
             match input.recv_timeout(CONTROL_POLL) {
                 Ok(msg) => {
                     // Every message (motion deltas + position beacons from
@@ -273,9 +378,23 @@ impl Server {
                         _ => {}
                     }
                     let actions = { self.session.lock().unwrap().on_local_event(msg) };
+                    // Diagnostic: the engine lock serializes the whole
+                    // input path; if another thread holds it for a long
+                    // time (a slow platform call under the lock), every
+                    // motion event queues behind it — the exact shape of
+                    // a client cursor freeze. Flag any long wait.
+                    let lock_wait = std::time::Instant::now();
                     let mut engine = engine.lock().unwrap();
+                    let waited = lock_wait.elapsed();
+                    if waited > std::time::Duration::from_millis(10) {
+                        log_warn!("input loop: engine lock held {waited:?} by another thread");
+                    }
                     for action in actions {
                         self.execute(action, &mut engine)?;
+                    }
+                    let took = msg_start.elapsed();
+                    if took > std::time::Duration::from_millis(15) {
+                        log_warn!("input loop: message processing took {took:?}");
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -298,6 +417,10 @@ impl Server {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
+        // Session over: the supervisor exits only via `process::exit`
+        // (its whole point is recovering a wedged thread), so this join
+        // is just a graceful-session cleanup.
+        let _ = supervisor.join();
         Ok(())
     }
 

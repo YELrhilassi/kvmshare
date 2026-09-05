@@ -140,7 +140,11 @@ fn start_server() -> Harness {
         let server = server.clone();
         let engine = engine.clone();
         let clipboard = clipboard.clone();
-        move || server.run(input_rx, engine, clipboard).unwrap()
+        move || {
+            server
+                .run(input_rx, engine, clipboard, Arc::new(kvmshare_core::server::Liveness::default()))
+                .unwrap()
+        }
     });
 
     Harness { server, input_tx, control_tx, engine_calls, port }
@@ -197,9 +201,11 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
 
     let cc = calls(&client_calls);
     assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
-    // Entry point is hp's right edge (1919, 540); the server also sends
-    // an absolute move for the entry position.
-    assert!(cc.iter().any(|c| c == "move 1919,540"), "client should move to entry point, got {cc:?}");
+    // Entry point is hp's right edge inset 48 px past the seam
+    // (1871, 540); the server also sends an absolute move for the entry
+    // position. (The inset stops the seam-jitter bounce: an entry exactly
+    // on the wall makes the first beacon a park, which re-crosses.)
+    assert!(cc.iter().any(|c| c == "move 1871,540"), "client should move to entry point, got {cc:?}");
 
     let ec = calls(&h.engine_calls);
     assert!(ec.iter().any(|c| c == "cursor false"), "server should hide its cursor, got {ec:?}");
@@ -235,7 +241,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     assert_eq!(rel_x, -100, "motion must deliver the full -100 px command, got {cc:?}");
     assert_eq!(rel_y, 0, "no motion outside the command axis, got {cc:?}");
     assert!(
-        cc.iter().all(|c| !c.starts_with("move ") || c == "move 1919,540"),
+        cc.iter().all(|c| !c.starts_with("move ") || c == "move 1871,540"),
         "only the entry move may be absolute, got {cc:?}"
     );
 
@@ -251,8 +257,10 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     // -- Cross back to pc. --
     // The client's real cursor must be pinned on the shared edge (its
     // right edge) for a crossing; first push moves it there, then the
-    // next outward push (a frame later, as in real use) crosses.
-    feed(&h, Message::MouseMoveRel { dx: 120, dy: 0 }); // roam back to the right wall
+    // next outward push (a frame later, as in real use) crosses. The
+    // entry point sits 48 px inside hp, so the roam must cover that
+    // ground before the cursor can park on the wall.
+    feed(&h, Message::MouseMoveRel { dx: 250, dy: 0 }); // roam back to the right wall
     feed(&h, Message::MouseMoveRel { dx: 10, dy: 0 }); // keep pushing: cross home
 
     let cc = calls(&client_calls);
@@ -317,9 +325,10 @@ fn client_reconnect_is_not_deafened_by_stale_udp_sequences() {
     assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
     assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
 
-    // Cross back: the client's real cursor is parked on the shared edge;
-    // its (fresh) beacons arm it and the outward push fires the crossing.
-    feed(&h, Message::MouseMoveRel { dx: 10, dy: 0 });
+    // Cross back: push the real cursor across the 48 px entry inset to
+    // the shared edge; its (fresh) beacons arm it and the outward push
+    // fires the crossing.
+    feed(&h, Message::MouseMoveRel { dx: 100, dy: 0 });
 
     let mut cc = calls(&client_calls);
     for _ in 0..50 {

@@ -21,8 +21,10 @@
 //! X11 backend and ignored elsewhere (uniform signature).
 
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 use kvmshare_core::client::{Clipboard, Injector};
+use kvmshare_core::server::Liveness;
 use kvmshare_core::server::Engine;
 use kvmshare_protocol::message::Message;
 
@@ -56,16 +58,16 @@ pub mod windows;
 /// platforms without displays.
 pub fn server(
     display: Option<&str>,
-) -> Result<(Receiver<Message>, Box<dyn Engine>, Box<dyn Clipboard>), String> {
+) -> Result<(Receiver<Message>, Box<dyn Engine>, Box<dyn Clipboard>, Arc<Liveness>), String> {
     #[cfg(target_os = "linux")]
     {
         let s = x11::Server::start(display)?;
-        Ok((s.input, s.engine, s.clipboard))
+        Ok((s.input, s.engine, s.clipboard, s.liveness))
     }
     #[cfg(target_os = "windows")]
     {
         let s = windows::Server::start(display)?;
-        Ok((s.input, s.engine, s.clipboard))
+        Ok((s.input, s.engine, s.clipboard, s.liveness))
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {

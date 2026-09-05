@@ -9,7 +9,7 @@
 use std::sync::mpsc::Receiver;
 
 use kvmshare_core::client::{Clipboard, Injector};
-use kvmshare_core::server::Engine;
+use kvmshare_core::server::{Engine, Liveness};
 use kvmshare_protocol::message::Message;
 
 const MSG: &str = "kvmshare: this OS does not have a platform backend yet (Linux/X11 is implemented)";
@@ -32,7 +32,7 @@ impl Clipboard for StubClipboard {
 
 pub fn server(
     _display: Option<&str>,
-) -> Result<(Receiver<Message>, Box<dyn Engine>, Box<dyn Clipboard>), String> {
+) -> Result<(Receiver<Message>, Box<dyn Engine>, Box<dyn Clipboard>, std::sync::Arc<Liveness>), String> {
     Err(MSG.into())
 }
 

@@ -28,9 +28,10 @@ mod isolation;
 mod timer;
 
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 use kvmshare_core::client::Injector;
-use kvmshare_core::server::Engine;
+use kvmshare_core::server::{Engine, Liveness};
 use kvmshare_protocol::message::Message;
 
 /// Raise this process above ordinary applications (see the docs on
@@ -70,6 +71,9 @@ pub struct Server {
     /// process holding the clipboard open, and the engine lock
     /// serializes cursor motion.
     pub clipboard: Box<dyn kvmshare_core::client::Clipboard>,
+    /// Liveness heartbeats for the server supervisor; the capture
+    /// thread's tick is wired here.
+    pub liveness: Arc<Liveness>,
 }
 
 impl Server {
@@ -82,10 +86,11 @@ impl Server {
         // in milliseconds, and Windows' coarse default timer would turn
         // them into ~15 ms clumps (see [`timer`]).
         timer::HighResTimer::engage_forever();
-        let input = capture::start()?;
+        let (input, capture_tick) = capture::start()?;
         let engine = Box::new(engine::Win32Engine::new());
         let clipboard: Box<dyn kvmshare_core::client::Clipboard> = Box::new(clipboard::Clipboard::new());
-        Ok(Self { input, engine, clipboard })
+        let liveness = Arc::new(Liveness { capture_tick_ms: capture_tick, ..Default::default() });
+        Ok(Self { input, engine, clipboard, liveness })
     }
 }
 

@@ -50,10 +50,12 @@
 
 use std::collections::HashSet;
 use std::io;
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -66,15 +68,12 @@ use kvmshare_protocol::message::{KeyKind, Message};
 use crate::keys::{hid_from_evdev, ESCAPE_KEY_HID};
 use crate::motion::PendingMotion;
 
-/// How often the reader re-enumerates `/dev/input` while remote, so a
-/// device plugged in (or access granted) mid-session is picked up and
-/// grabbed too.
+/// How often the enumerator thread re-opens `/dev/input`, so a device
+/// plugged in (or access granted) mid-session is picked up and grabbed
+/// too. Runs on its own thread, so the cadence serves both modes; a
+/// slow open (wedged driver) delays new devices, never the cursor
+/// stream.
 const HOTPLUG_PERIOD: Duration = Duration::from_millis(2000);
-/// How often the reader re-enumerates while local. Nothing is forwarded
-/// then, but devices may appear (or become readable) at any time; the
-/// next crossing must find them ready. A slow cadence keeps idle cost
-/// negligible.
-const LOCAL_ENUM_PERIOD: Duration = Duration::from_millis(3000);
 /// Idle poll pause while remote (no events flowing). Nonblocking reads
 /// are polled in a loop; 1 ms keeps latency negligible.
 const REMOTE_POLL_PAUSE: Duration = Duration::from_millis(1);
@@ -103,10 +102,19 @@ fn classify(dev: &Device) -> bool {
     pointer || keyboard
 }
 
-/// Open every pointer/keyboard in `/dev/input`, nonblocking. The bool
-/// reports whether any open failed on permissions (the actionable
-/// case — vs. no input devices at all).
-fn open_devices() -> (Vec<Opened>, bool) {
+/// Open every pointer/keyboard in `/dev/input`, with the fd opened
+/// **nonblocking at the syscall level** (`O_NONBLOCK` on `open(2)`
+/// itself). A wedged device driver that blocks in `open` must fail
+/// fast, never hang the caller. The bool reports whether any open
+/// failed on permissions (the actionable case — vs. no input devices at
+/// all).
+///
+/// # Safety
+///
+/// The raw fd is opened with `O_NONBLOCK | O_CLOEXEC` and ownership
+/// moves into `OwnedFd` immediately; `Device::from_fd` takes it from
+/// there.
+fn open_devices(known: &HashSet<PathBuf>) -> (Vec<Opened>, bool) {
     let mut out = Vec::new();
     let mut denied = false;
     if let Ok(dir) = std::fs::read_dir("/dev/input") {
@@ -116,19 +124,38 @@ fn open_devices() -> (Vec<Opened>, bool) {
                 continue;
             }
             let path = entry.path();
-            let dev = match Device::open(&path) {
-                Ok(d) => d,
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            // Skip devices the reader already watches. Re-opening a
+            // watched device would hand us a duplicate handle whose
+            // `Drop` (an EVIOCGRAB(0) ungrab ioctl) would run on the
+            // caller's thread — eight of those per pass are exactly the
+            // periodic stall this reader used to see.
+            if known.contains(&path) {
+                continue;
+            }
+            // /dev/input/eventN is plain ASCII; a failure here is
+            // unrepresentable, so skip rather than panic.
+            let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+                continue;
+            };
+            // SAFETY: open(2) with a NUL-terminated path; the result is
+            // checked before it is wrapped.
+            let fd = unsafe {
+                libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            };
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::PermissionDenied {
                     denied = true;
-                    continue;
                 }
+                continue;
+            }
+            // SAFETY: fd is a valid, owned, nonblocking event-device fd.
+            let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let dev = match Device::from_fd(owned) {
+                Ok(d) => d,
                 Err(_) => continue,
             };
             if !classify(&dev) {
-                continue;
-            }
-            if let Err(e) = dev.set_nonblocking(true) {
-                log_warn!("evdev: {path:?}: cannot set nonblocking: {e}");
                 continue;
             }
             let name = dev.name().unwrap_or(&name).to_owned();
@@ -139,8 +166,10 @@ fn open_devices() -> (Vec<Opened>, bool) {
 }
 
 /// Merge freshly opened devices into the watch set, isolating any new
-/// ones immediately when remote (hot-plugged mid-session).
-fn absorb(devices: &mut Vec<Opened>, fresh: Vec<Opened>, remote: &AtomicBool) {
+/// ones immediately when remote (hot-plugged mid-session), and record
+/// their paths so the enumerator never re-opens (and later drops) a
+/// device the reader already watches.
+fn absorb(devices: &mut Vec<Opened>, fresh: Vec<Opened>, remote: &AtomicBool, known: &Mutex<HashSet<PathBuf>>) {
     for d in fresh {
         if devices.iter().any(|w| w.path == d.path) {
             continue;
@@ -151,6 +180,7 @@ fn absorb(devices: &mut Vec<Opened>, fresh: Vec<Opened>, remote: &AtomicBool) {
                 log_warn!("evdev: {name}: cannot grab: {e}");
             }
         }
+        known.lock().unwrap().insert(path.clone());
         log_info!("evdev: watching {name} ({path:?})");
         devices.push(Opened { path, name, dev });
     }
@@ -256,6 +286,11 @@ fn handle_event(ev: &InputEvent, motion: &mut PendingMotion, press: &mut PressSt
 /// A handle to the evdev reader thread.
 pub struct EvdevReader {
     remote: Arc<AtomicBool>,
+    /// Bumped by the reader thread every time it completes a grab/release
+    /// transition. A caller that needs the devices in a *known* state
+    /// (the crossing-back warp must land on a live stream) waits for the
+    /// counter to advance — bounded, so nothing can ever hang.
+    ack: Arc<AtomicU64>,
     _thread: thread::JoinHandle<()>,
 }
 
@@ -266,20 +301,58 @@ impl EvdevReader {
     pub fn start(tx: Sender<Message>) -> Self {
         let remote = Arc::new(AtomicBool::new(false));
         let remote2 = Arc::clone(&remote);
+        let ack = Arc::new(AtomicU64::new(0));
+        let ack2 = Arc::clone(&ack);
+        // Device re-enumeration runs on its own thread: `open(2)` on a
+        // wedged or slow device can block for hundreds of milliseconds,
+        // and while the cursor is on a client this reader *is* the whole
+        // cursor stream — a stall here is a client cursor freeze. The
+        // reader only ever applies freshly opened lists (fast grabs), so
+        // a slow hot-plug pass delays new devices, never motion.
+        let (enum_tx, enum_rx) = mpsc::channel();
+        // Devices the reader already watches; the enumerator skips them
+        // so a pass never hands back duplicate handles (whose `Drop` —
+        // an EVIOCGRAB(0) ungrab ioctl — would stall the reader).
+        let known_paths = Arc::new(Mutex::new(HashSet::new()));
+        spawn_enumerator(enum_tx, Arc::clone(&known_paths));
         let thread = thread::Builder::new()
             .name("kvmshare-evdev".into())
-            .spawn(move || reader_main(tx, remote2))
+            .spawn(move || reader_main(tx, remote2, ack2, enum_rx, known_paths))
             .expect("cannot spawn evdev reader");
-        Self { remote, _thread: thread }
+        Self { remote, ack, _thread: thread }
     }
 
     /// Switch the reader between forwarding (remote) and silent (local)
     /// mode. Called by the capture thread when control crosses a
-    /// boundary.
+    /// boundary. Async: the reader picks the flag up on its next
+    /// iteration (≤ ~2 ms) and grabs/releases then.
     pub fn set_remote(&self, remote: bool) {
         self.remote.store(remote, Ordering::Relaxed);
     }
+
+    /// Release the kernel grabs **and wait until the reader has actually
+    /// done it** (bounded — never blocks more than [`RELEASE_WAIT`]).
+    /// The crossing-back path uses this so the entry warp lands on a
+    /// live input stream instead of racing an async release that can
+    /// swallow the first moments of physical motion. Safe to call when
+    /// already local (the flag is already false; the wait just times out
+    /// quietly).
+    pub fn release_and_wait(&self) {
+        let before = self.ack.load(Ordering::Acquire);
+        self.remote.store(false, Ordering::Release);
+        let deadline = Instant::now() + RELEASE_WAIT;
+        while self.ack.load(Ordering::Acquire) == before && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
+
+/// How long [`EvdevReader::release_and_wait`] waits for the reader
+/// thread to complete the release. A healthy reader processes a
+/// transition within one iteration (~1 ms idle sleep + the ungrab
+/// ioctls); this bound just keeps the capture thread from ever waiting
+/// on a wedged reader.
+const RELEASE_WAIT: Duration = Duration::from_millis(30);
 
 impl Drop for EvdevReader {
     fn drop(&mut self) {
@@ -289,26 +362,70 @@ impl Drop for EvdevReader {
     }
 }
 
+/// The re-enumeration thread: opens `/dev/input` on a cadence and hands
+/// the fresh device list to the reader over a channel. Everything that
+/// can block (the device opens themselves) happens here — the reader
+/// never waits on it. The thread is detached: if a device open wedges
+/// for a long time, the reader simply keeps its current devices until
+/// the next pass completes.
+fn spawn_enumerator(enum_tx: Sender<(Vec<Opened>, bool)>, known_paths: Arc<Mutex<HashSet<PathBuf>>>) {
+    thread::Builder::new()
+        .name("kvmshare-evdev-enum".into())
+        .spawn(move || loop {
+            thread::sleep(HOTPLUG_PERIOD);
+            // Diagnostic: a slow pass is now harmless to the cursor
+            // stream, but still worth knowing about.
+            let t0 = Instant::now();
+            let known = known_paths.lock().unwrap().clone();
+            let (fresh, denied) = open_devices(&known);
+            let took = t0.elapsed();
+            // A pass is normally 100-200 ms (the device opens) and runs
+            // off the motion thread, so it is not worth a WARN on every
+            // cadence — that was log spam. Only a genuinely pathological
+            // pass (a wedged device open) rises to WARN.
+            if took > Duration::from_millis(400) {
+                log_warn!("evdev: re-enumeration took {took:?} (off the motion thread)");
+            } else if took > Duration::from_millis(20) {
+                log_debug!("evdev: re-enumeration took {took:?}");
+            }
+            if enum_tx.send((fresh, denied)).is_err() {
+                return; // reader gone
+            }
+        })
+        .ok();
+}
+
 /// The reader loop. Waits for the remote flag; on each transition grabs
 /// (or releases) every device. **Devices are drained in both modes** —
 /// the kernel ring buffer would otherwise replay events that happened
 /// while the cursor was local (a mute tap, a Win+E, a click) to the
 /// client the moment forwarding starts. Drain-and-discard while local,
 /// drain-and-forward while remote, so a boundary crossing never carries
-/// stale events across it. Re-enumerates on a cadence so late-granted
-/// access and hot-plugged devices are picked up live.
-fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
-    let (mut devices, mut denied) = open_devices();
+/// stale events across it. Freshly opened device lists arrive from the
+/// enumerator thread over the channel (see [`spawn_enumerator`]).
+fn reader_main(
+    tx: Sender<Message>,
+    remote: Arc<AtomicBool>,
+    ack: Arc<AtomicU64>,
+    enum_rx: Receiver<(Vec<Opened>, bool)>,
+    known_paths: Arc<Mutex<HashSet<PathBuf>>>,
+) {
+    let (mut devices, mut denied) = open_devices(&HashSet::new());
+    known_paths.lock().unwrap().extend(devices.iter().map(|d| d.path.clone()));
     let mut was_remote = false;
     let mut press = PressState::new();
     let mut motion = PendingMotion::default();
-    let mut last_enum = Instant::now();
     let mut logged = u8::MAX; // never-logged sentinel
+    let mut last_remote_drain: Option<Instant> = None;
     log_presence(&devices, denied, &mut logged);
     loop {
+        let iter_start = Instant::now();
         let is_remote = remote.load(Ordering::Relaxed);
         if is_remote != was_remote {
             set_grabbed(&mut devices, is_remote);
+            // Acknowledge the transition so a caller waiting on
+            // [`EvdevReader::release_and_wait`] can proceed.
+            ack.fetch_add(1, Ordering::Release);
             if is_remote {
                 // Events that landed in the ring buffers in the moments
                 // before the grab belong to the local side (the buffer is
@@ -316,6 +433,7 @@ fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
                 // slip through): purge them so the crossing never
                 // replays them on the client.
                 purge(&mut devices);
+                last_remote_drain = None;
             } else {
                 // Local again: the X capture owns input; any press state
                 // this reader accumulated belongs to the past.
@@ -323,20 +441,20 @@ fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
             }
             was_remote = is_remote;
         }
-        // Re-enumerate on a cadence in both modes (hot-plug + late-granted
-        // access). While remote the cadence is tighter; newly opened
-        // devices must be isolated before the next event is read.
-        let period = if is_remote { HOTPLUG_PERIOD } else { LOCAL_ENUM_PERIOD };
-        if last_enum.elapsed() >= period {
-            let (fresh, d) = open_devices();
+        // Apply any fresh device list the enumerator produced (fast:
+        // just merges and grabs new devices — all the slow opens already
+        // happened on the enumerator thread).
+        let enum_start = Instant::now();
+        while let Ok((fresh, d)) = enum_rx.try_recv() {
             denied = d;
-            absorb(&mut devices, fresh, &remote);
+            absorb(&mut devices, fresh, &remote, &known_paths);
             log_presence(&devices, denied, &mut logged);
-            last_enum = Instant::now();
         }
+        let enum_took = enum_start.elapsed();
         // Drain every device. Forward only while remote; while local the
         // events belong to the X capture and are discarded here — but
         // they must be *read* so they never replay later.
+        let drain_start = Instant::now();
         let mut saw_event = false;
         let mut dead: Vec<usize> = Vec::new();
         for (i, d) in devices.iter_mut().enumerate() {
@@ -359,6 +477,9 @@ fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
             }
         }
         for i in dead.into_iter().rev() {
+            if let Some(removed) = devices.get(i) {
+                known_paths.lock().unwrap().remove(&removed.path);
+            }
             devices.remove(i);
         }
         if is_remote {
@@ -366,10 +487,33 @@ fn reader_main(tx: Sender<Message>, remote: Arc<AtomicBool>) {
                 let _ = tx.send(Message::MouseMoveRel { dx, dy });
             });
         }
+        // Diagnostic: an iteration that took longer than ~15 ms while
+        // remote means this thread itself was blocked or starved for the
+        // whole stream (everything the client needs flows through here).
+        // The phase split shows whether the block was the device drain
+        // or the (off-thread-open) enumerator apply.
+        let iter = iter_start.elapsed();
+        if is_remote && iter > Duration::from_millis(15) {
+            let drain_took = drain_start.elapsed();
+            log_warn!("evdev: reader iteration took {iter:?} (enum apply {enum_took:?}, drain {drain_took:?})");
+        }
         if !saw_event {
             // Idle: pause a tick. While local the pause is longer (the
             // X capture owns input; we only keep the buffers drained).
             thread::sleep(if is_remote { REMOTE_POLL_PAUSE } else { LOCAL_PAUSE });
+        } else if is_remote {
+            // Diagnostic: while the cursor is on a client this thread is
+            // the whole cursor stream. A long gap between event-bearing
+            // drains means the stream stalled *here* (this thread blocked
+            // on a device open/grab/read) — the client would see exactly
+            // that gap as a frozen cursor.
+            if let Some(last) = last_remote_drain {
+                let gap = last.elapsed();
+                if gap > std::time::Duration::from_millis(100) {
+                    log_warn!("evdev: remote motion stream gap of {gap:?}");
+                }
+            }
+            last_remote_drain = Some(Instant::now());
         }
     }
 }

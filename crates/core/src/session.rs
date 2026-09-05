@@ -128,6 +128,22 @@ const EDGE_PUSH_FRESH: Duration = Duration::from_millis(40);
 /// long enough that a beacon lag can never fire a crossing on its own.
 const EDGE_PUSH_FALLBACK: Duration = Duration::from_millis(150);
 
+/// How far past a shared edge the cursor is placed on entry (px).
+/// Placing it exactly ON the edge makes the destination's very first
+/// beacon report a park at the entry wall with the crossing push still
+/// fresh — an immediate bounce back across the seam, and with the cursor
+/// pinned on the wall any continued push re-fires it (the boundary
+/// oscillation seen in the field: crossings ping-ponged within
+/// milliseconds, hammering the grab/release machinery on both machines
+/// and occasionally leaving one input-dead). Insetting the entry point
+/// gives the continued motion room to read as travel into the screen:
+/// the boundary re-arms only after the cursor has actually moved
+/// [`ENTRY_INSET`] px away from the seam, so a resting or jittering
+/// cursor can never bounce while a real push-through still works. It
+/// also stops the reverse bounce — coming home to a cursor sitting
+/// exactly on the wall.
+const ENTRY_INSET: i32 = 48;
+
 /// How old a client cursor-position beacon may be and still be treated
 /// as the real cursor's location. Beacons arrive every few ms while the
 /// client is controlled; anything older than this means the stream
@@ -526,15 +542,30 @@ impl Session {
 
     /// Leave the local screen through `dir`: switch to the neighbor in
     /// that direction. Resets the boundary state and snaps the virtual
-    /// cursor to the neighbor's entry point. Returns nothing on a dead
-    /// edge (the cursor stays clamped).
+    /// cursor to the neighbor's entry point (inset past the seam — see
+    /// [`ENTRY_INSET`]). Returns nothing on a dead edge (the cursor stays
+    /// clamped).
     fn switch_out(&mut self, dir: Direction) -> Vec<Action> {
         match self.layout.neighbor(0, dir, self.cursor.x, self.cursor.y) {
             Some((id, x, y)) => {
+                let (x, y) = self.inset_entry(id, dir, x, y);
                 self.enter_screen(id, x, y);
                 vec![Action::SwitchTo { to: id, x, y }]
             }
             None => vec![], // dead edge: stay
+        }
+    }
+
+    /// Push an entry point [`ENTRY_INSET`] px past the crossed edge
+    /// (clamped to the screen), so the cursor never lands exactly on a
+    /// wall — see the const docs for why that matters.
+    fn inset_entry(&self, id: u8, dir: Direction, x: i32, y: i32) -> (i32, i32) {
+        let s = self.layout.find(id).expect("entry screen must exist");
+        match dir {
+            Direction::Left => (x.saturating_sub(ENTRY_INSET).max(0), y),
+            Direction::Right => (x.saturating_add(ENTRY_INSET).min(s.rect.w - 1), y),
+            Direction::Top => (x, y.saturating_sub(ENTRY_INSET).max(0)),
+            Direction::Bottom => (x, y.saturating_add(ENTRY_INSET).min(s.rect.h - 1)),
         }
     }
 
@@ -675,10 +706,12 @@ impl Session {
 
     /// Switch away from the remote screen `id` through `dir` (back home
     /// or on to another client). Resets the remote boundary state and
-    /// snaps the virtual cursor to the destination's entry point.
+    /// snaps the virtual cursor to the destination's entry point (inset
+    /// past the seam — see [`ENTRY_INSET`]).
     fn cross_from_remote(&mut self, id: u8, dir: Direction) -> Vec<Action> {
         match self.layout.neighbor(id, dir, self.cursor.x, self.cursor.y) {
             Some((next, x, y)) => {
+                let (x, y) = self.inset_entry(next, dir, x, y);
                 self.enter_screen(next, x, y);
                 if next == 0 {
                     vec![Action::SwitchToLocal { x, y }]
@@ -773,7 +806,7 @@ mod tests {
         match actions {
             [Action::SwitchTo { to, x, y: ay }] => {
                 assert_eq!(*to, 1);
-                assert_eq!(*x, 1919); // hp's right edge, local coords
+                assert_eq!(*x, 1871); // hp's right edge, inset 48 px from the seam
                 assert_eq!(*ay, y);
             }
             other => panic!("expected SwitchTo to hp, got {other:?}"),
@@ -814,8 +847,9 @@ mod tests {
         let actions = s.on_local_event(Message::MouseMoveRel { dx: -10, dy: 0 });
         assert_switch_to_hp(&actions, 540);
         assert_eq!(s.mode(), Mode::Remote(1));
-        // Virtual position was snapped to hp's entry point (-1, 540).
-        assert_eq!(s.cursor_pos(), (-1, 540));
+        // Virtual position was snapped to hp's entry point, 48 px past
+        // the seam (-49, 540) — never exactly on the wall.
+        assert_eq!(s.cursor_pos(), (-49, 540));
     }
 
     #[test]
@@ -965,7 +999,7 @@ mod tests {
         // A push right while the real cursor is on that wall crosses
         // home.
         let actions = s.on_local_event(Message::MouseMoveRel { dx: 1, dy: 0 });
-        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 48, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
     }
 
@@ -985,8 +1019,40 @@ mod tests {
         // does the crossing happen — and with the push still fresh it
         // fires on the park itself (no dead frame at the boundary).
         let actions = s.on_remote_beacon(1, 1919, 540);
-        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 48, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
+    }
+
+    #[test]
+    fn entry_is_inset_past_the_seam() {
+        // The cursor enters hp 48 px past the seam — never exactly on the
+        // wall — so hp's first beacon reports an interior cursor, not a
+        // park. (An entry exactly on the wall made the first beacon a
+        // park with the crossing push still fresh, which bounced the
+        // cursor straight back across the seam.)
+        let mut s = two_screens();
+        s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 });
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: -1, dy: 0 });
+        assert_switch_to_hp(&actions, 540);
+        assert_eq!(
+            s.on_remote_beacon(1, 1871, 540),
+            vec![],
+            "a beacon at the inset entry point is interior, not a wall park"
+        );
+        assert_eq!(s.mode(), Mode::Remote(1));
+        // A genuine park at the shared wall still crosses home — the
+        // inset only stops seam-jitter bounce, not real travel.
+        assert_eq!(s.on_remote_beacon(1, 1919, 540), vec![]);
+        let actions = s.on_local_event(Message::MouseMoveRel { dx: 1, dy: 0 });
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 48, y: 540 }]);
+        assert_eq!(s.mode(), Mode::Local);
+        // And coming home is inset too: the local beacon at the entry
+        // point is interior and must not immediately re-cross.
+        assert_eq!(
+            s.on_local_event(Message::MouseMoveAbs { x: 48, y: 540 }),
+            vec![],
+            "the local beacon at the inset point is interior, not a wall park"
+        );
     }
 
     #[test]
@@ -1004,7 +1070,7 @@ mod tests {
         // The real cursor must reach the wall again; with the push still
         // fresh, the park itself completes the crossing home.
         let actions = s.on_remote_beacon(1, 1919, 540);
-        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 48, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
     }
 
@@ -1022,7 +1088,7 @@ mod tests {
         assert_eq!(s.mode(), Mode::Remote(1));
         // The beacon parks the real cursor on the wall mid-push: cross now.
         let actions = s.on_remote_beacon(1, 1919, 540);
-        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 48, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
     }
 
@@ -1112,7 +1178,7 @@ mod tests {
         match actions.as_slice() {
             [Action::SwitchTo { to, x, y }] => {
                 assert_eq!(*to, 2);
-                assert_eq!(*x, 1919); // mac's right edge
+                assert_eq!(*x, 1871); // mac's right edge, inset 48 px
                 assert_eq!(*y, 540);
             }
             other => panic!("expected [SwitchTo], got {other:?}"),
@@ -1235,17 +1301,17 @@ mod tests {
     #[test]
     fn local_abs_beacon_is_ignored_while_remote() {
         let mut s = two_screens();
-        cross_to_hp(&mut s); // on hp, virtual (-1, 540)
+        cross_to_hp(&mut s); // on hp, virtual (-49, 540)
         // A *local* capture beacon while remote is the hidden parked
         // cursor (meaningless): it must not resync the virtual position.
         let actions = s.on_local_event(Message::MouseMoveAbs { x: 50, y: 60 });
         assert_eq!(actions, vec![]);
-        assert_eq!(s.cursor_pos(), (-1, 540)); // untouched
+        assert_eq!(s.cursor_pos(), (-49, 540)); // untouched
         // Crossing home is driven by the client's own beacon, not the
         // local one.
         assert_eq!(s.on_remote_beacon(1, 1919, 540), vec![]);
         let actions = s.on_local_event(Message::MouseMoveRel { dx: 5, dy: 0 });
-        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 48, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
     }
 
@@ -1264,12 +1330,18 @@ mod tests {
         // fallback window, or the cursor would be stuck on the client
         // forever.
         let mut s = two_screens();
-        cross_to_hp(&mut s); // virtual (-1, 540), hp's right edge
+        cross_to_hp(&mut s); // virtual (-49, 540): the entry inset
         assert_eq!(s.on_local_event(Message::MouseMoveRel { dx: 1, dy: 0 }), vec![Action::Send(Message::MouseMoveRel { dx: 1, dy: 0 })]);
         assert_eq!(s.mode(), Mode::Remote(1), "no beacon yet: one push must not cross");
+        // Keep pushing until the virtual cursor has traversed the entry
+        // inset and actually leaves hp's rect — then the fallback window
+        // must bring control home.
+        for _ in 0..60 {
+            s.on_local_event(Message::MouseMoveRel { dx: 1, dy: 0 });
+        }
         std::thread::sleep(REMOTE_BEACON_FRESH + EDGE_PUSH_FALLBACK + Duration::from_millis(20));
         let actions = s.on_local_event(Message::MouseMoveRel { dx: 1, dy: 0 });
-        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 48, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
     }
 
@@ -1325,7 +1397,7 @@ mod tests {
         // hp -> pc
         assert_eq!(s.on_remote_beacon(1, 1919, 540), vec![]);
         let actions = s.on_local_event(Message::MouseMoveRel { dx: 2, dy: 0 });
-        assert_eq!(actions, vec![Action::SwitchToLocal { x: 0, y: 540 }]);
+        assert_eq!(actions, vec![Action::SwitchToLocal { x: 48, y: 540 }]);
         assert_eq!(s.mode(), Mode::Local);
         // pc -> hp again, immediately.
         assert_eq!(s.on_local_event(Message::MouseMoveAbs { x: 0, y: 540 }), vec![]);

@@ -76,11 +76,11 @@
 //! make every notch scroll twice on the client.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
@@ -272,14 +272,20 @@ struct InputCapture {
     /// Always present; it engages the moment `/dev/input` becomes
     /// readable (grab-only until then).
     evdev: EvdevReader,
+    /// Heartbeat for the server supervisor ([`Liveness::capture_tick_ms`]):
+    /// bumped every capture-loop iteration. This thread owns the local
+    /// input grab while remote, so its wedge is exactly what traps the
+    /// machine's input — the supervisor must see it.
+    capture_tick: Arc<AtomicU64>,
 }
 
 /// Open the X display (`None` = `$DISPLAY`), select XI2 raw events on the
 /// root window, and start the capture thread.
 ///
-/// Returns the channel the server's main loop reads local input from.
+/// Returns the channel the server's main loop reads local input from,
+/// plus the capture thread's heartbeat for the server supervisor.
 /// `cmd_rx` delivers the engine's cursor-control commands.
-pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<Receiver<Message>, String> {
+pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<(Receiver<Message>, Arc<AtomicU64>), String> {
     let (conn, screen_num) = RustConnection::connect(display).map_err(|e| format!("X11 connect: {e}"))?;
     let root = conn.setup().roots[screen_num].root;
 
@@ -308,6 +314,7 @@ pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<
     // probe without ever doing a round-trip itself).
     let grabbed = Arc::new(AtomicBool::new(false));
     let real_pos = Arc::new(Mutex::new(None));
+    let capture_tick = Arc::new(AtomicU64::new(0));
     let capture = InputCapture {
         conn,
         root,
@@ -321,6 +328,7 @@ pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<
         grabbed: grabbed.clone(),
         real_pos: real_pos.clone(),
         evdev,
+        capture_tick: capture_tick.clone(),
     };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {
@@ -336,7 +344,7 @@ pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<
     // is grabbed (beacons are suppressed then anyway), so the beacon
     // thread skips the round-trip entirely in that state.
     spawn_beacon_thread(display.map(str::to_owned), grabbed, real_pos, tx);
-    Ok(rx)
+    Ok((rx, capture_tick))
 }
 
 /// Poll the real pointer position on a dedicated thread with its own X
@@ -392,6 +400,10 @@ impl InputCapture {
     /// fatal X error.
     fn run_forever(mut self) -> Result<(), String> {
         loop {
+            self.capture_tick.store(
+                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+                Ordering::Relaxed,
+            );
             loop {
                 match self.conn.poll_for_event() {
                     Ok(Some(ev)) => self.on_event(ev),
@@ -553,7 +565,18 @@ impl InputCapture {
                 // and applied on the client" bug. The evdev reader
                 // tracks its own presses instead.
                 self.held.clear();
-                self.evdev.set_remote(remote);
+                if remote {
+                    // Grab is async: the kernel grab engages within a
+                    // couple of ms, before any forwarded event can leak.
+                    self.evdev.set_remote(true);
+                } else {
+                    // Release is SYNCHRONOUS: the next command in this
+                    // queue is the entry warp, and it must land on a
+                    // live input stream. Waiting here (bounded) means
+                    // the physical mouse is already ungrab'd before the
+                    // warp — no swallowed motion at the seam.
+                    self.evdev.release_and_wait();
+                }
             }
         }
     }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +32,9 @@ import (
 type proc struct {
 	cmd  *exec.Cmd
 	done chan struct{}
+	// When the child was spawned; the auto-restart watcher uses it to
+	// reset its consecutive-restart budget after a long-lived run.
+	started time.Time
 }
 
 func (p *proc) running() bool {
@@ -194,6 +198,23 @@ func (a *App) ClientStop() error {
 	return a.stopRoleLocked(roleClient)
 }
 
+// The exit code the server binary uses to ask for a restart after the
+// supervisor detects a wedged input path (mirrors EXIT_RESTART in
+// crates/core/src/server.rs). Any other exit is a stop, a crash, or a
+// role conflict — none of which warrant an automatic restart here.
+const restartExitCode = 66
+
+// How long to wait before respawning after a supervisor restart, and how
+// many consecutive restarts to attempt before giving up (a machine that
+// keeps wedging has a real problem the user should see, not an endless
+// respawn loop).
+const restartDelay = 1500 * time.Millisecond
+const maxRestarts = 3
+
+// A start that survives longer than this counts as healthy and resets
+// the consecutive-restart budget.
+const restartBudgetResetAfter = 2 * time.Minute
+
 func (a *App) ServerStart() (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -208,15 +229,7 @@ func (a *App) ServerStart() (bool, error) {
 	if err := a.stopRoleLocked(roleClient); err != nil {
 		return false, err
 	}
-
-	if _, err := os.Stat(a.serverPath); err != nil {
-		return false, fmt.Errorf("server binary not found at %s (run make install)", a.serverPath)
-	}
-	// The log-control file sets the level/enabled the operator chose;
-	// the process polls it, so later changes apply without a restart.
-	a.writeLogCtlLocked(roleServer)
-	p, err := a.spawn(a.serverPath, a.serverLogPath, "--config", a.configPath,
-		"--logctl", filepath.Join(a.stateDir, roleServer+".logctl"))
+	p, err := a.spawnServerLocked()
 	if err != nil {
 		return false, err
 	}
@@ -224,7 +237,98 @@ func (a *App) ServerStart() (bool, error) {
 		return false, err
 	}
 	a.serverProc = p
+	a.watchAutoRestart(roleServer, p)
 	return true, nil
+}
+
+// spawnServerLocked starts the server binary with the configured args.
+// Callers hold a.mu.
+func (a *App) spawnServerLocked() (*proc, error) {
+	if _, err := os.Stat(a.serverPath); err != nil {
+		return nil, fmt.Errorf("server binary not found at %s (run make install)", a.serverPath)
+	}
+	// The log-control file sets the level/enabled the operator chose;
+	// the process polls it, so later changes apply without a restart.
+	a.writeLogCtlLocked(roleServer)
+	return a.spawn(a.serverPath, a.serverLogPath, "--config", a.configPath,
+		"--logctl", filepath.Join(a.stateDir, roleServer+".logctl"))
+}
+
+// watchAutoRestart respawns a role process when it exits with the
+// supervisor's restart code: the server detected a wedged input path and
+// asked for a clean restart (its own exit released every kernel/X grab).
+// A stop, a crash or a role switch never triggers it (different exit
+// codes, and the mode/proc checks below). The watcher shares nothing with
+// the process beyond `p.done`, so it can never be blocked by whatever
+// wedged the role. Bounded: at most [`maxRestarts`] consecutive
+// respawns, then it logs and gives up.
+func (a *App) watchAutoRestart(role string, p *proc) {
+	go func() {
+		<-p.done
+		code := -1
+		if p.cmd.ProcessState != nil {
+			code = p.cmd.ProcessState.ExitCode()
+		}
+		if code != restartExitCode {
+			return
+		}
+		restarts := 0
+		for restarts < maxRestarts {
+			time.Sleep(restartDelay)
+			a.mu.Lock()
+			// The user may have stopped the role or switched modes
+			// (serverProc replaced or nil, or the mode no longer matches)
+			// while we waited — then this process is no longer the one
+			// being managed, and respawning would fight the user.
+			relevant := a.serverProc == p && a.currentModeLocked() == ModeServer && !a.roleActive(roleServer)
+			var err error
+			if relevant {
+				var np *proc
+				np, err = a.spawnServerLocked()
+				if err == nil {
+					if cErr := a.checkStarted(np, a.serverLogPath, "server"); cErr != nil {
+						err = cErr
+					} else {
+						a.serverProc = np
+					}
+				}
+			}
+			a.mu.Unlock()
+			if err != nil {
+				log.Printf("kvmshare: auto-restart failed for %s: %v", role, err)
+				return
+			}
+			if !relevant {
+				return
+			}
+			restarts++
+			// The fresh process inherits the same supervision: watch it
+			// the same way. A start that survives a while is healthy — it
+			// resets the consecutive-restart budget, so a wedge that only
+			// happens under specific conditions can never exhaust it over
+			// time.
+			p = a.serverProc
+			select {
+			case <-p.done:
+				if time.Since(p.started) > restartBudgetResetAfter {
+					restarts = 0
+				}
+				code = -1
+				if p.cmd.ProcessState != nil {
+					code = p.cmd.ProcessState.ExitCode()
+				}
+				if code != restartExitCode {
+					return
+				}
+			}
+		}
+		log.Printf("kvmshare: %s asked for a restart %d times in a row — giving up; check the log for the wedge cause", role, maxRestarts)
+	}()
+}
+
+// currentModeLocked returns the selected role. Callers hold a.mu.
+func (a *App) currentModeLocked() Mode {
+	return a.settings.Mode
 }
 
 func (a *App) ClientStart() (bool, error) {
@@ -321,7 +425,7 @@ func (a *App) spawn(bin, logPath string, args ...string) (*proc, error) {
 		log.Close()
 		return nil, fmt.Errorf("start %s: %w", filepath.Base(bin), err)
 	}
-	p := &proc{cmd: cmd, done: make(chan struct{})}
+	p := &proc{cmd: cmd, done: make(chan struct{}), started: time.Now()}
 	go func() {
 		_ = cmd.Wait() // reap; closes done when the process is truly gone
 		close(p.done)

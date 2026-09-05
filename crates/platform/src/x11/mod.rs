@@ -27,9 +27,10 @@ pub mod engine;
 pub mod injector;
 
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
-use kvmshare_core::server::Engine;
 use kvmshare_core::client::{Clipboard, Injector};
+use kvmshare_core::server::{Engine, Liveness};
 use kvmshare_protocol::message::Message;
 
 /// The server-side X11 platform: local input capture + local cursor
@@ -43,6 +44,9 @@ pub struct Server {
     /// the engine on purpose: a clipboard read can block on the
     /// selection owner, and the engine lock serializes cursor motion.
     pub clipboard: Box<dyn Clipboard>,
+    /// Liveness heartbeats for the server supervisor; the capture
+    /// thread's tick is wired here.
+    pub liveness: Arc<Liveness>,
 }
 
 impl Server {
@@ -50,10 +54,11 @@ impl Server {
     /// build the engine and the clipboard service.
     pub fn start(display: Option<&str>) -> Result<Self, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        let input = capture::start(display, cmd_rx)?;
+        let (input, capture_tick) = capture::start(display, cmd_rx)?;
         let engine = Box::new(engine::X11Engine::new(display, cmd_tx)?);
         let clipboard: Box<dyn Clipboard> = Box::new(injector::X11Clipboard::new(display));
-        Ok(Self { input, engine, clipboard })
+        let liveness = Arc::new(Liveness { capture_tick_ms: capture_tick, ..Default::default() });
+        Ok(Self { input, engine, clipboard, liveness })
     }
 }
 

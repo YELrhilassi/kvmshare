@@ -32,7 +32,9 @@
 //! the pointer is pinned at a wall (so the last beacon before the pin is
 //! the one that arms it).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
@@ -86,6 +88,9 @@ struct InputCapture {
     /// The last beaconed cursor position (`None` = none yet). Only
     /// changes are forwarded, so a still (or pinned) cursor goes quiet.
     beacon: Option<(i32, i32)>,
+    /// Heartbeat for the server supervisor (see
+    /// [`core::server::Liveness`]). Bumped every capture-loop iteration.
+    capture_tick: Arc<AtomicU64>,
 }
 
 /// Register the hidden capture window for raw mouse + keyboard input.
@@ -170,24 +175,26 @@ fn create_capture_window() -> Result<HWND, String> {
 /// Open raw input capture and start the background message loop.
 ///
 /// Returns the channel the server's main loop reads local input from.
-pub fn start() -> Result<Receiver<Message>, String> {
+pub fn start() -> Result<(Receiver<Message>, Arc<AtomicU64>), String> {
     let hwnd = create_capture_window()?;
     register_raw_input(hwnd)?;
 
     log_info!("input capture started (Raw Input)");
     let (tx, rx) = mpsc::channel();
+    let capture_tick = Arc::new(AtomicU64::new(0));
     let capture = InputCapture {
         tx,
         abs: AbsoluteTracker::default(),
         keys: KeyTracker::default(),
         beacon: None,
+        capture_tick: capture_tick.clone(),
     };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {
             log_error!("input capture stopped: {e}");
         }
     });
-    Ok(rx)
+    Ok((rx, capture_tick))
 }
 
 impl InputCapture {
@@ -200,6 +207,13 @@ impl InputCapture {
         unsafe {
             let mut msg = std::mem::zeroed::<wm::MSG>();
             loop {
+                self.capture_tick.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                    Ordering::Relaxed,
+                );
                 let ret = wm::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
                 if ret == 0 || ret == -1 {
                     return Ok(());
