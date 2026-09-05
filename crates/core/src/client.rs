@@ -166,6 +166,12 @@ const CURSOR_BEACON_INTERVAL: Duration = Duration::from_millis(8);
 /// and wakes at this cadence when idle (to notice shutdown). Frames
 /// themselves wake it immediately — this is not a poll.
 const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(8);
+/// Consecutive 100 ms probe windows where the cursor was commanded to
+/// move but did not (away from a screen edge) before the client treats
+/// injected input as blocked and recovers. ~600 ms: long enough that a
+/// single hiccup never trips it, short enough that a genuinely blocked
+/// cursor recovers in about a second.
+const PIN_WINDOWS_TO_TRIP: u32 = 6;
 
 /// A connected client. The transport is owned by the TCP thread (the
 /// thread that called [`Client::run`]); the cursor stream socket moves
@@ -241,6 +247,17 @@ struct MotionState {
     frames_win: u32,
     /// Steering ticks since the last telemetry window (loop health).
     ticks_win: u32,
+    /// Pixels commanded since the last probe window (accumulated in
+    /// `apply_motion_frame`). Compared against the real cursor's travel
+    /// to detect a cursor the OS refuses to move.
+    win_cmd_px: i64,
+    /// Real cursor position when the current probe window opened.
+    win_real_start: (i32, i32),
+    /// Consecutive windows where the cursor was commanded to move but
+    /// did not. Enough of them, away from a screen edge, means injected
+    /// motion is being eaten by the OS — the recovery path releases
+    /// local input and restarts the session (see the probe block).
+    pin_windows: u32,
 }
 
 impl Client {
@@ -310,6 +327,9 @@ impl Client {
                 probe: MotionProbe::default(),
                 frames_win: 0,
                 ticks_win: 0,
+                win_cmd_px: 0,
+                win_real_start: (0, 0),
+                pin_windows: 0,
             }),
             active: AtomicBool::new(false),
             udp,
@@ -352,6 +372,13 @@ impl Client {
         // motion cadence.
         let mut last_keepalive = Instant::now();
         loop {
+            // A recovery path (the supervisor or the cursor-pin detector)
+            // can ask the session to end from another thread; the read
+            // timeout bounds this loop's wake so the request is seen
+            // within ~100 ms even when the link is silent.
+            if shared.stop.load(Ordering::Relaxed) {
+                break;
+            }
             match transport.recv()? {
                 RecvResult::Msg(msg) => {
                     shared.tcp_tick_ms.store(now_ms(), Ordering::Relaxed);
@@ -564,7 +591,8 @@ impl Client {
 fn motion_loop(shared: Arc<Shared>, own_id: u8) {
     let mut last_beacon = Instant::now();
     let mut beacon_failed = false;
-    while !shared.stop.load(Ordering::Relaxed) {
+    let mut recover = false;
+    while !shared.stop.load(Ordering::Relaxed) && !recover {
         let tick = Instant::now();
         shared.motion_tick_ms.store(now_ms(), Ordering::Relaxed);
         if shared.active.load(Ordering::Acquire) {
@@ -589,6 +617,38 @@ fn motion_loop(shared: Arc<Shared>, own_id: u8) {
                 let (frames, ticks) = (m.frames_win, m.ticks_win);
                 m.frames_win = 0;
                 m.ticks_win = 0;
+                // Cursor-pin detection: this window commanded real
+                // motion (`win_cmd_px`, accumulated as UDP frames
+                // arrived) yet the real cursor did not travel. That
+                // means the OS is silently eating injected motion — the
+                // supervisor cannot see it (the motion thread is healthy;
+                // the cursor just never moves). A few such windows away
+                // from a screen edge is the signature of blocked input.
+                let travel = ((rx - m.win_real_start.0).abs()
+                    + (ry - m.win_real_start.1).abs()) as i64;
+                let pinned = m.win_cmd_px > 60 && travel < 6;
+                m.pin_windows = if pinned { m.pin_windows + 1 } else { 0 };
+                let pin_age_ms = m.pin_windows as u64 * 100;
+                m.win_cmd_px = 0;
+                m.win_real_start = (rx, ry);
+                if m.pin_windows >= PIN_WINDOWS_TO_TRIP {
+                    // A cursor legitimately parked at a screen edge is a
+                    // wall push (the clamp holds the command), not a
+                    // block — only trip away from the edges.
+                    let info = inj.screen_info();
+                    let at_edge = rx <= 1
+                        || ry <= 1
+                        || rx as i64 >= info.width as i64 - 2
+                        || ry as i64 >= info.height as i64 - 2;
+                    if !at_edge {
+                        log_error!(
+                            "cursor pinned ~{pin_age_ms} ms while {frames} frames/tick commanded motion — injected input is being eaten; releasing local input and restarting the session"
+                        );
+                        inj.emergency_release();
+                        shared.stop.store(true, Ordering::Relaxed);
+                        recover = true;
+                    }
+                }
                 m.probe.sample((rx, ry), &mut |rx, ry, ax, ay, _exp_x, _exp_y, gx, gy| {
                     log_trace!(
                         "motion req=({rx},{ry}) act=({ax},{ay}) err=({ex},{ey}) real=({gx},{gy}) frames={frames} ticks={ticks}"
@@ -694,6 +754,9 @@ fn sync_loop(shared: Arc<Shared>, tx: Sender<Message>) {
 fn apply_motion_frame(shared: &Shared, dx: i32, dy: i32) {
     let mut m = shared.motion.lock().unwrap();
     m.frames_win += 1;
+    // Feed the cursor-pin detector: how much motion was commanded this
+    // probe window, compared against the real cursor's travel.
+    m.win_cmd_px += dx.abs() as i64 + dy.abs() as i64;
     {
         let mut inj = shared.injector.lock().unwrap();
         if inj.absolute_motion() {

@@ -136,14 +136,15 @@ pub fn write_line(lvl: Level, args: std::fmt::Arguments<'_>) {
     if !enabled() || lvl > level() {
         return;
     }
-    let secs = SystemTime::now()
+    let dur = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (h, m, s) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
+        .unwrap_or_default();
+    let ms = dur.as_millis();
+    let (h, m, s) = ((ms / 3600_000) % 24, (ms / 60_000) % 60, (ms / 1000) % 60);
+    let ms = ms % 1000;
     let component = COMPONENT.get().map(String::as_str).unwrap_or("kvmshare");
     let mut out = std::io::stderr().lock();
-    let _ = writeln!(out, "{h:02}:{m:02}:{s:02} {} {component}: {}", lvl.label(), args);
+    let _ = writeln!(out, "{h:02}:{m:02}:{s:02}.{ms:03} {} {component}: {}", lvl.label(), args);
 }
 
 /// `log_error!`, `log_warn!`, `log_info!`, `log_debug!`, `log_trace!` —
