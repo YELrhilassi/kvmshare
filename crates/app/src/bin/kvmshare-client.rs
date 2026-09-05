@@ -47,9 +47,11 @@ fn run() -> Result<(), String> {
     // change so a down server doesn't spam the log.
     let mut warned = false;
     loop {
-        // Platform: the local injector (moves the cursor, injects keys...).
-        let mut injector = match kvmshare_platform::client(None) {
-            Ok(i) => i,
+        // Platform: the local injector (moves the cursor, injects keys...)
+        // and the standalone clipboard service. They are separate so a
+        // clipboard call that stalls can never freeze the cursor.
+        let (mut injector, clipboard) = match kvmshare_platform::client(None) {
+            Ok(pair) => pair,
             Err(e) => {
                 if !warned {
                     log_warn!("platform: {e} — retrying every 3 s");
@@ -69,7 +71,7 @@ fn run() -> Result<(), String> {
                 // the core run loop handles clipboard upload and
                 // keepalives itself.
                 let (_out_tx, out_rx) = mpsc::channel::<Message>();
-                if let Err(e) = client.run(injector, &out_rx) {
+                if let Err(e) = client.run(injector, clipboard, &out_rx) {
                     log_warn!("session ended: {e} — reconnecting");
                 }
             }

@@ -34,6 +34,77 @@ impl Layout {
         Self { screens }
     }
 
+    /// Return a copy with layout noise removed: near-adjacent screens
+    /// (within [`EDGE_TOLERANCE`]) are snapped into exact contact and
+    /// their perpendicular spans aligned, so the boundary math is
+    /// pixel-exact. GUI-built layouts routinely drift a few pixels off
+    /// contact (drag rounding, scaled canvas coordinates); a 2 px gap or
+    /// a 4 px vertical offset turns a crossing at y=500 into an entry at
+    /// y=504 — a visible seam glitch that reads as "the boundary is
+    /// off". The server applies this to every layout it adopts (config
+    /// load and hot reload), so the user never has to fight pixel
+    /// alignment in the GUI.
+    pub fn normalized(&self) -> Layout {
+        let mut screens = self.screens.clone();
+        // Closing one gap can bring another pair into snapping range, so
+        // iterate to a fixed point. Bounded by the screen count; a pass
+        // that changes nothing stops early.
+        for _ in 0..8 {
+            let mut changed = false;
+            for i in 0..screens.len() {
+                let a = screens[i].rect;
+                for j in 0..screens.len() {
+                    if i == j {
+                        continue;
+                    }
+                    let b = screens[j].rect;
+                    let mut nb = b;
+                    // Side-by-side: snap the facing edges together and
+                    // align the shared edge's perpendicular span.
+                    if near(a.right(), b.left(), EDGE_TOLERANCE)
+                        && spans_overlap(a.top(), a.bottom(), b.top(), b.bottom(), EDGE_TOLERANCE)
+                    {
+                        nb.x = a.right();
+                        if (nb.y - a.y).abs() <= EDGE_TOLERANCE {
+                            nb.y = a.y;
+                        }
+                    } else if near(b.right(), a.left(), EDGE_TOLERANCE)
+                        && spans_overlap(a.top(), a.bottom(), b.top(), b.bottom(), EDGE_TOLERANCE)
+                    {
+                        nb.x = a.left() - b.w;
+                        if (nb.y - a.y).abs() <= EDGE_TOLERANCE {
+                            nb.y = a.y;
+                        }
+                    }
+                    // Stacked: same for top/bottom neighbors.
+                    if near(a.bottom(), b.top(), EDGE_TOLERANCE)
+                        && spans_overlap(a.left(), a.right(), b.left(), b.right(), EDGE_TOLERANCE)
+                    {
+                        nb.y = a.bottom();
+                        if (nb.x - a.x).abs() <= EDGE_TOLERANCE {
+                            nb.x = a.x;
+                        }
+                    } else if near(b.bottom(), a.top(), EDGE_TOLERANCE)
+                        && spans_overlap(a.left(), a.right(), b.left(), b.right(), EDGE_TOLERANCE)
+                    {
+                        nb.y = a.top() - b.h;
+                        if (nb.x - a.x).abs() <= EDGE_TOLERANCE {
+                            nb.x = a.x;
+                        }
+                    }
+                    if nb != b {
+                        screens[j].rect = nb;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        Layout::new(screens)
+    }
+
     pub fn find(&self, id: u8) -> Option<&Screen> {
         self.screens.iter().find(|s| s.id == id)
     }

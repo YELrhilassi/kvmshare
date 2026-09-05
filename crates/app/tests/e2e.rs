@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use kvmshare_core::client::{Client, Injector};
+use kvmshare_core::client::{Clipboard, Client, Injector};
 use kvmshare_core::layout::Layout;
 use kvmshare_core::server::{Control, Engine, Server};
 use kvmshare_core::session::Session;
@@ -104,13 +104,6 @@ impl Injector for RecordingInjector {
     fn leave(&mut self) {
         self.calls.lock().unwrap().push("leave".into());
     }
-    fn clipboard(&mut self, _mime: &str, _data: &[u8]) {}
-    fn clipboard_get(&mut self) -> Option<(String, Vec<u8>)> {
-        None
-    }
-    fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)> {
-        None
-    }
 }
 
 /// A running server with a channel for feeding it local input, a control
@@ -167,6 +160,21 @@ fn connect_client(port: u16) -> (Client, RecordingInjector, Arc<Mutex<Vec<String
     (client, injector, calls, out_rx)
 }
 
+/// The e2e tests never touch a real clipboard; the split [`Clipboard`]
+/// service is satisfied with a no-op (the sync thread's poll simply
+/// reports nothing).
+struct NoClipboard;
+
+impl Clipboard for NoClipboard {
+    fn set(&mut self, _mime: &str, _data: &[u8]) {}
+    fn get(&mut self) -> Option<(String, Vec<u8>)> {
+        None
+    }
+    fn last_injected(&mut self) -> Option<(String, Vec<u8>)> {
+        None
+    }
+}
+
 /// Feed one input event and let the pipeline settle.
 fn feed(h: &Harness, msg: Message) {
     h.input_tx.send(msg).unwrap();
@@ -182,7 +190,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     let h = start_server();
 
     let (client, injector, client_calls, out_rx) = connect_client(h.port);
-    thread::spawn(move || client.run(Box::new(injector), &out_rx).unwrap());
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
     h.wait_for_clients(1);
 
     // -- Cross from pc onto hp (left screen). --
@@ -303,7 +311,7 @@ fn client_reconnect_is_not_deafened_by_stale_udp_sequences() {
     // The real client reconnects (same screen id) and must work normally:
     // beacons from sequence 1 on are fresh and drive the crossing back.
     let (client, injector, client_calls, out_rx) = connect_client(h.port);
-    thread::spawn(move || client.run(Box::new(injector), &out_rx).unwrap());
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
     h.wait_for_clients(1);
 
     // Cross onto hp.
@@ -364,7 +372,7 @@ fn config_hot_reload_returns_cursor_home_and_broadcasts() {
     let h = start_server();
 
     let (client, injector, client_calls, out_rx) = connect_client(h.port);
-    thread::spawn(move || client.run(Box::new(injector), &out_rx).unwrap());
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
     h.wait_for_clients(1);
 
     // Move onto hp, then reload a layout that no longer has hp: the

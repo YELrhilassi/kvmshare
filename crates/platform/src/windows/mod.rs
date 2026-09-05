@@ -21,7 +21,7 @@
 
 mod buttons;
 mod capture;
-mod clipboard;
+pub(crate) mod clipboard;
 mod engine;
 mod injector;
 mod isolation;
@@ -69,11 +69,18 @@ impl Server {
     }
 }
 
-/// The client-side Windows platform: an input injector.
-pub fn client_injector(_display: Option<&str>) -> Result<Box<dyn Injector>, String> {
+/// The client-side Windows platform: an input injector and the
+/// standalone clipboard service (see [`core::client::Clipboard`] for why
+/// the clipboard is split from the injector).
+pub fn client_injector(
+    _display: Option<&str>,
+) -> Result<(Box<dyn Injector>, Box<dyn kvmshare_core::client::Clipboard>), String> {
     set_dpi_aware();
     // 1 ms timer resolution for the motion tick and beacon cadence (see
     // [`timer`] and [`Server::start`]).
     timer::HighResTimer::engage_forever();
-    Ok(Box::new(injector::Win32Injector::new()))
+    Ok((
+        Box::new(injector::Win32Injector::new()),
+        Box::new(injector::Win32Clipboard::new()),
+    ))
 }

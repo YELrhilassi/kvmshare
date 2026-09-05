@@ -7,7 +7,7 @@
 
 use std::sync::mpsc::Receiver;
 
-use kvmshare_core::client::Injector;
+use kvmshare_core::client::{Clipboard, Injector};
 use kvmshare_core::server::Engine;
 use kvmshare_protocol::message::Message;
 
@@ -17,6 +17,8 @@ pub fn server(_display: Option<&str>) -> Result<(Receiver<Message>, Box<dyn Engi
     Err(MSG.into())
 }
 
-pub fn client(_display: Option<&str>) -> Result<Box<dyn Injector>, String> {
+pub fn client(
+    _display: Option<&str>,
+) -> Result<(Box<dyn Injector>, Box<dyn Clipboard>), String> {
     Err(MSG.into())
 }

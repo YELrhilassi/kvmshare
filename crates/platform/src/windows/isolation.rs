@@ -51,7 +51,7 @@
 //! [`SetWindowsHookExW`]: windows_sys::Win32::UI::WindowsAndMessaging::SetWindowsHookExW
 //! [`SendInput`]: windows_sys::Win32::UI::Input::KeyboardAndMouse::SendInput
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -69,13 +69,37 @@ struct SendHwnd(HWND);
 // SAFETY: HWND is an opaque handle value; nothing is dereferenced.
 unsafe impl Send for SendHwnd {}
 
-use kvmshare_log::{log_error, log_info};
+use kvmshare_log::{log_error, log_info, log_warn};
 
 /// True while this machine's cursor is controlled remotely. Read by the
 /// hook procedures on every system input event; flipped by the injector
 /// on `enter`/`leave`. A single client injector per process makes a
 /// static the honest shape for this state.
 static ISOLATE: AtomicBool = AtomicBool::new(false);
+
+/// The liveness heartbeat (ms since boot): bumped by the injector on
+/// every motion tick while this machine is controlled. The watchdog
+/// releases isolation when it goes stale — a wedged client (a blocked
+/// lock, a stuck thread) must never leave this machine's hardware
+/// silenced, or the user would be trapped on a screen that cannot move.
+static LAST_STEER: AtomicU64 = AtomicU64::new(0);
+/// Steering must stay fresh within this window (ms) while isolating,
+/// or the watchdog releases local input.
+const WATCHDOG_TIMEOUT_MS: u64 = 2000;
+/// How often the pump thread re-checks the heartbeat (ms).
+const WATCHDOG_PERIOD_MS: u32 = 500;
+
+/// Milliseconds since the process started (monotonic, immune to clock
+/// changes — `Instant::elapsed` on Windows uses the same tick source
+/// `GetTickCount64` does). Shared by the injector (heartbeat) and the
+/// pump thread (watchdog), so both must agree on the epoch; a process
+/// static gives them exactly that.
+static BOOT: OnceLock<std::time::Instant> = OnceLock::new();
+
+fn ms_now() -> u64 {
+    let boot = *BOOT.get_or_init(std::time::Instant::now);
+    boot.elapsed().as_millis() as u64
+}
 
 /// Mouse events marked as injected (travelled through SendInput). Covers
 /// both same-integrity events and lower-integrity-injected ones (which
@@ -139,6 +163,52 @@ impl NativeIsolation {
     /// the crossing path.
     pub fn set_isolating(&self, isolating: bool) {
         ISOLATE.store(isolating, Ordering::SeqCst);
+        if isolating {
+            // Arm the heartbeat at the moment control arrives, so the
+            // watchdog's staleness check can never trip between `enter`
+            // and the first motion tick.
+            Self::heartbeat();
+        }
+    }
+
+    /// Bump the steering heartbeat. Called by the injector on every
+    /// motion tick; the watchdog releases isolation if this goes stale
+    /// while isolating (see the [`LAST_STEER`] docs).
+    pub fn heartbeat() {
+        LAST_STEER.store(ms_now(), Ordering::Relaxed);
+    }
+
+    /// The watchdog, run on the pump thread at [`WATCHDOG_PERIOD_MS`]:
+    /// if isolation is active but steering has been silent for
+    /// [`WATCHDOG_TIMEOUT_MS`], release local input and restore the
+    /// cursor. This is the last line of defense — a client that cannot
+    /// steer must never hold this machine's hardware hostage.
+    fn watchdog() {
+        if !ISOLATE.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = ms_now();
+        let last = LAST_STEER.load(Ordering::Relaxed);
+        if last == 0 {
+            // Control just entered before the first steering tick: arm
+            // the heartbeat now so the check below has a baseline.
+            LAST_STEER.store(now, Ordering::Relaxed);
+            return;
+        }
+        if now.saturating_sub(last) > WATCHDOG_TIMEOUT_MS {
+            log_warn!(
+                "isolation watchdog: client steering stalled — releasing local input so this machine is never trapped"
+            );
+            ISOLATE.store(false, Ordering::SeqCst);
+            // Restore the cursor the injector hid. Best effort: the
+            // injector's own `leave` cannot run (it is wedged too), and
+            // ShowCursor's per-thread count is a cosmetic detail next to
+            // the machine being usable again.
+            // SAFETY: ShowCursor is a trivial user32 call.
+            unsafe {
+                wm::ShowCursor(1);
+            }
+        }
     }
 
     /// The pump thread's body: a hidden message-only window, both hooks
@@ -185,10 +255,19 @@ impl NativeIsolation {
         }
         log_info!("input isolation hooks installed");
         let _ = hwnd_tx.send(SendHwnd(hwnd));
+        // A periodic timer so the pump wakes and runs the watchdog even
+        // when no input events flow (the whole point is to catch a
+        // machine that has gone quiet).
+        // SAFETY: SetTimer with a period and no callback posts WM_TIMER
+        // to this thread's queue; the window is ours.
+        unsafe {
+            wm::SetTimer(hwnd, 1, WATCHDOG_PERIOD_MS, None);
+        }
 
-        // Pump until the owner posts QUIT_MSG. Messages other than the
-        // quit signal are discarded (nothing dispatches them; the window
-        // exists only as a message target).
+        // Pump until the owner posts QUIT_MSG. WM_TIMER wakes the loop
+        // for the watchdog; everything else is discarded (nothing
+        // dispatches messages; the window exists only as a message
+        // target).
         // SAFETY: msg is a valid out-parameter; GetMessageW blocks until
         // a message arrives and returns 0 only on WM_QUIT, -1 on error.
         unsafe {
@@ -201,11 +280,15 @@ impl NativeIsolation {
                 if msg.message == QUIT_MSG {
                     break;
                 }
+                if msg.message == wm::WM_TIMER {
+                    Self::watchdog();
+                }
             }
         }
         // SAFETY: unhooking the handles this thread installed, then
         // destroying the window it created.
         unsafe {
+            wm::KillTimer(hwnd, 1);
             wm::UnhookWindowsHookEx(mouse);
             wm::UnhookWindowsHookEx(keyboard);
             wm::DestroyWindow(hwnd);

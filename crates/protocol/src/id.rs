@@ -12,9 +12,6 @@ pub mod types {
     pub const LAYOUT: u8 = 0x04;
     pub const ENTER: u8 = 0x10;
     pub const LEAVE: u8 = 0x11;
-    /// Client → server: the client cannot apply injected input locally
-    /// (an elevated / input-isolated window is swallowing SendInput).
-    pub const INPUT_BLOCKED: u8 = 0x12;
     /// Client → server: the client's *real* cursor position while it is
     /// being controlled (its OS applies its own pointer acceleration to
     /// the relative motion it receives, so the real position is the only

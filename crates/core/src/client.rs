@@ -8,24 +8,52 @@
 //!   beacons out. Additive and loss-tolerant, so the cursor's latency is
 //!   never coupled to the reliable stream's buffering.
 //!
-//! The cursor on the client is steered by a **closed loop**
-//! ([`PositionFollower`]): every received motion frame advances a
-//! commanded position and is injected verbatim (zero added latency on a
-//! healthy wire), and every loop tick the real cursor is compared
-//! against the command — any residual (the OS's pointer acceleration
-//! over-moving, a lost frame under-moving, a stall) is corrected with a
-//! damped injection. There is no replay queue, so no backlog can ever
-//! form. All OS-specific work (moving the real cursor, injecting keys,
-//! touching the clipboard) lives behind the [`Injector`] trait; this
-//! module is plain message dispatch and can be tested with a fake
-//! injector.
+//! ## Threads, not one loop
+//!
+//! The old client ran everything in a single loop — draining UDP, a
+//! timeout-driven TCP read, cursor placement, clipboard polling, screen
+//! queries. One slow platform call (a clipboard read stalling on a busy
+//! `OpenClipboard`, a resolution query) stalled the *motion tick* with
+//! it, which showed up as the cursor stopping for a beat at a regular
+//! cadence. The client now runs four isolated threads, each owning only
+//! the work it can do without ever blocking the others:
+//!
+//! * **TCP thread** (the caller's thread in [`Client::run`]) — the
+//!   control channel. Blocks on `recv`, dispatches Enter/Leave/events,
+//!   drains the outbox and sends keepalives. Never touches the cursor
+//!   hot path.
+//! * **Motion thread** — a fixed-cadence steering loop: place the cursor
+//!   at the commanded position (or correct it), beacon the real position
+//!   back, sample telemetry. It does nothing else, ever.
+//! * **UDP thread** — drains the cursor stream and advances the command.
+//!   Blocks on the socket (event-driven, no polling), never sleeps
+//!   beyond the socket's own read timeout.
+//! * **Sync thread** — the slow periodic duties (resolution check,
+//!   clipboard poll) at a 500 ms cadence, results handed to the TCP
+//!   thread over a channel. A stalled clipboard read can delay a
+//!   clipboard sync by 500 ms — it can never delay a cursor placement.
+//!
+//! Shared state is a single [`Shared`] with short critical sections
+//! (lock order: `motion` → `injector`, held for microseconds). A slow
+//! call on any thread delays only that thread's own next step.
+//!
+//! The cursor is steered by a **closed loop** ([`PositionFollower`]):
+//! every received motion frame advances a commanded position, and the
+//! motion thread places the real cursor on the command each tick (for
+//! absolute backends) or corrects toward it (relative backends). There
+//! is no replay queue, so no backlog can ever form. All OS-specific work
+//! lives behind the [`Injector`] trait; this module is plain message
+//! dispatch and thread wiring, tested with a fake injector.
 
 use std::io;
 use std::net::{TcpStream, UdpSocket};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use kvmshare_log::{log_debug, log_trace, log_warn};
+use kvmshare_log::{log_debug, log_error, log_trace, log_warn};
 use kvmshare_protocol::message::{KeyKind, Layout, Message, ScreenInfo};
 
 use crate::motion::{MotionProbe, PositionFollower, MOTION_PERIOD};
@@ -37,40 +65,39 @@ use crate::udp;
 /// The server controls this machine, so every call here is "make the
 /// local machine do what the server asked".
 pub trait Injector: Send {
-    /// The client's screen shape (resolution and scale). Re-queried on
-    /// every loop iteration so resolution changes are noticed and
-    /// reported back to the server.
+    /// The client's screen shape (resolution and scale). Re-queried by
+    /// the sync thread so resolution changes are noticed and reported
+    /// back to the server.
     fn screen_info(&mut self) -> ScreenInfo;
     /// Move the local cursor to local screen pixels `(x, y)` (absolute
-    /// placement: used when control *enters* and for any explicit
-    /// positioning, never in the motion stream).
+    /// placement: used when control *enters*, for explicit positioning,
+    /// and by absolute-motion backends for the whole motion stream).
     fn move_cursor(&mut self, x: i32, y: i32);
     /// Apply relative cursor motion. The client OS applies its own
     /// pointer transform (acceleration / speed settings) to relative
     /// input, so the shared cursor feels exactly like a physical mouse on
-    /// this machine — the model every mature KVM uses. The motion stream
-    /// is relative; absolute positioning is reserved for entry points.
+    /// this machine — the model every mature KVM uses.
     fn move_rel(&mut self, dx: i32, dy: i32);
     /// Whether this backend places the cursor **absolutely** for motion
-    /// (each `move_rel` delta accumulated and the cursor set exactly)
-    /// rather than forwarding relative input for the OS to transform.
+    /// (each received delta accumulates into a commanded position and the
+    /// cursor is set exactly there each tick) rather than forwarding
+    /// relative input for the OS to transform.
     ///
     /// Absolute placement bypasses the client OS's pointer acceleration
-    /// entirely: the shared cursor lands exactly where commanded, the
-    /// OS can never over-run the hand, and a lost frame self-heals (the
-    /// next set lands the whole command). Backends that return `true`
-    /// skip the closed-loop follower — the placement *is* the loop. The
-    /// server compensates for its own pointer transform by scaling the
-    /// counts it sends (see `GainTracker`), so the client cursor mirrors
-    /// the server cursor pixel-for-pixel.
+    /// entirely: the shared cursor lands exactly where commanded, the OS
+    /// can never over-run the hand, and a lost frame self-heals (the
+    /// next placement lands the whole command). Backends that return
+    /// `true` skip the closed-loop correction — the placement *is* the
+    /// loop. The server compensates for its own pointer transform by
+    /// scaling the counts it sends (see `GainTracker`), so the client
+    /// cursor mirrors the server cursor pixel-for-pixel.
     fn absolute_motion(&self) -> bool {
         false
     }
-    /// The cursor's *real* current position in local screen pixels (what
-    /// the OS reports, after applying its transform to the relative
-    /// motion we injected). Reported to the server on a cadence while
-    /// being controlled, so the server knows exactly where the shared
-    /// cursor sits for edge crossings.
+    /// The cursor's *real* current position in local screen pixels.
+    /// Reported to the server on a cadence while being controlled, so
+    /// the server knows exactly where the shared cursor sits for edge
+    /// crossings.
     fn cursor_position(&mut self) -> (i32, i32);
     fn button(&mut self, button: u8, pressed: bool);
     fn wheel(&mut self, dx: i32, dy: i32);
@@ -82,64 +109,138 @@ pub trait Injector: Send {
     fn enter(&mut self);
     /// Control has left this machine: show the local cursor again.
     fn leave(&mut self);
+    /// Called by the motion thread once per steering tick while this
+    /// machine is controlled. Backends with a remote-control watchdog
+    /// (Windows input isolation) use it as the liveness heartbeat: if
+    /// steering stops while the machine is being driven remotely, the
+    /// watchdog releases local input so the machine is never trapped.
+    /// Default: nothing.
+    fn steer_heartbeat(&mut self) {}
+    /// Force-restore local input ownership after a client-side stall.
+    /// The client's supervisor thread calls this when a worker wedges
+    /// (e.g. a blocking OS call holds the injector lock and the cursor
+    /// can no longer be steered). Backends that silence local hardware
+    /// while remotely controlled must undo that here so the machine is
+    /// never left trapped: the user's own mouse and keyboard always
+    /// work again, even if the shared session has to restart.
+    /// Default: nothing (backends without hardware silencing need
+    /// nothing to undo).
+    fn emergency_release(&mut self) {}
+}
+
+/// Clipboard access, split from [`Injector`] **on purpose**: reading or
+/// writing the system clipboard can block indefinitely while another
+/// process holds it open (some apps open it and never close it), so a
+/// clipboard call must never share a lock with the cursor. The client
+/// gives the clipboard its own lock, serviced by its own thread — a
+/// stalled clipboard read delays only clipboard sync, never a cursor
+/// placement.
+pub trait Clipboard: Send {
     /// Put `data` into the local clipboard (received from the server).
-    fn clipboard(&mut self, mime: &str, data: &[u8]);
+    fn set(&mut self, mime: &str, data: &[u8]);
     /// Read the current local clipboard, if any.
-    fn clipboard_get(&mut self) -> Option<(String, Vec<u8>)>;
+    fn get(&mut self) -> Option<(String, Vec<u8>)>;
     /// The last clipboard content applied from a *remote* source (set via
-    /// [`Injector::clipboard`]). Clipboard pollers compare against this
-    /// so content that arrived from the server is never echoed back.
-    fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)>;
-    /// Whether the local OS is dropping injected input right now (e.g. an
-    /// elevated or input-isolated window on Windows swallows SendInput).
-    /// The client loop reports this to the server, which brings control
-    /// home so the user is never trapped on a screen that cannot move.
-    /// Defaults to `false`; platforms that cannot detect this simply
-    /// never report it.
-    fn input_blocked(&mut self) -> bool {
-        false
-    }
+    /// [`Clipboard::set`]). Pollers compare against this so content that
+    /// arrived from the server is never echoed back to it.
+    fn last_injected(&mut self) -> Option<(String, Vec<u8>)>;
 }
 
 /// How often the client sends a keepalive when idle.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-/// How long the TCP read can block while idle (not controlled). While
-/// being controlled the timeout drops to one motion period, so the
-/// closed-loop tick and beacons stay fresh even on a quiet wire.
+/// How long the TCP read can block. The control channel is quiet, and
+/// nothing on it has a deadline tighter than this: motion lives on its
+/// own thread and its own socket.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
-/// How often the client polls its local clipboard to push changes up.
+/// How often the sync thread polls the local clipboard to push changes
+/// up. The poll lives on the sync thread, so even a clipboard read that
+/// stalls for tens of milliseconds delays only the clipboard sync.
 const CLIPBOARD_INTERVAL: Duration = Duration::from_millis(500);
-/// How often the client re-checks whether local input injection is being
-/// dropped by the OS (cheap; guards against a continuous message stream
-/// starving the check).
-const BLOCK_CHECK_INTERVAL: Duration = Duration::from_millis(150);
 /// How often the client reports its real cursor position to the server
 /// while being controlled. The server anchors its virtual cursor and
-/// edge decisions on these (the client's OS applies its own pointer
-/// acceleration to relative motion, so the reported position is the only
-/// ground truth) — a tight cadence keeps crossings exact without
-/// flooding the wire. Beacons ride UDP; a lost one is replaced by the
-/// next, which is fine — the stream is a continuous sample, not a
-/// command.
+/// edge decisions on these — a tight cadence keeps crossings exact
+/// without flooding the wire. Beacons ride UDP; a lost one is replaced
+/// by the next.
 const CURSOR_BEACON_INTERVAL: Duration = Duration::from_millis(8);
+/// UDP socket read timeout: the cursor stream thread blocks on `recv`
+/// and wakes at this cadence when idle (to notice shutdown). Frames
+/// themselves wake it immediately — this is not a poll.
+const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(8);
 
-/// A connected client.
+/// A connected client. The transport is owned by the TCP thread (the
+/// thread that called [`Client::run`]); the cursor stream socket moves
+/// into [`Shared`] when `run` starts.
 #[derive(Debug)]
 pub struct Client {
     transport: Transport,
-    /// The UDP cursor stream: relative motion in, beacons out. Connected
-    /// to the server's address; the first datagram sent is the
-    /// registration that teaches the server where to route motion.
-    udp: UdpSocket,
-    /// Sequence for outgoing beacon datagrams (registration used 0).
-    udp_seq: u32,
     /// The id this machine has in the server's layout.
     own_id: u8,
     /// The full layout as last sent by the server (includes the server's
     /// own screen). Clients mostly ignore it today; it exists so future
-    /// features (relative position awareness, on-screen indicators) have
-    /// the data they need.
+    /// features have the data they need.
     layout: Layout,
+    /// The cursor stream socket; handed to [`Shared`] when `run` starts
+    /// (motion and UDP threads share it).
+    udp: UdpSocket,
+}
+
+/// State shared by the client's worker threads. Every thread touches
+/// only the fields it needs, and every critical section is short —
+/// microsecond-scale lock holds on [`Shared::motion`] and
+/// [`Shared::injector`] (always in that order).
+struct Shared {
+    /// The platform injector. Touched by the motion thread (placement),
+    /// the TCP thread (events, enter/leave) and the sync thread (screen
+    /// info). Never held across a slow call.
+    injector: Mutex<Box<dyn Injector>>,
+    /// The platform clipboard, on its own lock. A clipboard read or
+    /// write can block (another process holding the clipboard open), so
+    /// it must never serialize with the cursor — a stalled clipboard
+    /// delays only clipboard sync.
+    clipboard: Mutex<Box<dyn Clipboard>>,
+    /// The cursor follower (command trajectory), telemetry probe, and
+    /// per-window wire counters.
+    motion: Mutex<MotionState>,
+    /// Whether control is currently on this machine. Flipped by the TCP
+    /// thread on Enter/Leave; read every tick by the motion and UDP
+    /// threads.
+    active: AtomicBool,
+    /// The UDP cursor stream: motion in, beacons out.
+    udp: UdpSocket,
+    /// Sequence for outgoing beacon datagrams (registration used 0).
+    udp_seq: AtomicU32,
+    /// Set when the session ends; worker threads exit at their next wake.
+    stop: AtomicBool,
+    /// Monotonic millis of the motion thread's last loop wake. Bumped
+    /// unconditionally every iteration, so a stalled value means the
+    /// motion thread is genuinely wedged (not merely idle). Read by the
+    /// supervisor to detect the stall and by the teardown path to decide
+    /// whether joining would hang.
+    motion_tick_ms: AtomicU64,
+    /// Monotonic millis of the TCP thread's last wake (a dispatch or an
+    /// idle NoData cycle). A stalled value while the link is healthy
+    /// means the control loop is wedged inside a dispatch.
+    tcp_tick_ms: AtomicU64,
+}
+
+/// Monotonic milliseconds since the first call (process anchor). Cheap
+/// and immune to clock changes; shared by the liveness ticks and the
+/// supervisor so they agree on an epoch.
+fn now_ms() -> u64 {
+    static BOOT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let boot = *BOOT.get_or_init(std::time::Instant::now);
+    boot.elapsed().as_millis() as u64
+}
+
+/// The cursor-side steering state, guarded by [`Shared::motion`].
+struct MotionState {
+    follower: PositionFollower,
+    probe: MotionProbe,
+    /// Motion frames accepted since the last telemetry window (wire
+    /// health — a stall shows as a window with few frames).
+    frames_win: u32,
+    /// Steering ticks since the last telemetry window (loop health).
+    ticks_win: u32,
 }
 
 impl Client {
@@ -168,338 +269,274 @@ impl Client {
         };
 
         // The cursor stream: one UDP socket, connected to the server's
-        // address, non-blocking so the loop can drain it every iteration.
+        // address. The UDP thread blocks on `recv` with a short timeout
+        // (frames wake it immediately, so the kernel receive buffer is
+        // drained at full speed and only extreme bursts can drop a
+        // frame — motion is loss-tolerant, the next frame self-heals).
         let udp = UdpSocket::bind(("0.0.0.0", 0))?;
-        udp.set_nonblocking(true)?;
+        udp.set_read_timeout(Some(UDP_RECV_TIMEOUT))?;
         udp.connect(addr)?;
         // First datagram = registration: it carries the client id, so the
         // server learns both who we are and where to send motion.
         udp.send(&udp::pack(own_id, 0, &Message::KeepAlive))?;
 
-        Ok(Self { transport, udp, udp_seq: 1, own_id, layout })
+        Ok(Self { transport, own_id, layout, udp })
     }
 
-    /// Run the message loop until the connection closes.
+    /// Run the client until the connection closes.
+    ///
+    /// Spawns the motion, UDP and sync worker threads, then services the
+    /// TCP control channel on the calling thread. When the link closes
+    /// the workers are stopped and joined, and the cursor is placed once
+    /// more at the final command so the last position is exact.
     ///
     /// `outbox` lets the app layer push messages to the server (future
-    /// control messages). Drained every loop iteration.
-    pub fn run(mut self, mut injector: Box<dyn Injector>, outbox: &Receiver<Message>) -> io::Result<()> {
-        let mut last_info = injector.screen_info();
-        let mut last_keepalive = Instant::now();
-        let mut last_clip_check = Instant::now();
-        let mut last_clip_seen: Option<(String, Vec<u8>)> = None;
-        let mut last_block_check = Instant::now();
-        let mut last_cursor_beacon = Instant::now();
-        let mut blocked_reported = false;
-        let mut controlled = false;
-        let mut beacon_failed = false;
-        // The cursor is steered by a closed loop (see
-        // [`PositionFollower`]): received frames advance the command and
-        // are injected verbatim; each tick the real cursor is corrected
-        // toward the command. No queue — no backlog can form.
-        let mut follower = PositionFollower::default();
-        // Sequence of the newest applied cursor-stream frame (stale and
-        // duplicate datagrams are dropped).
-        let mut motion_seq: u32 = 0;
-        // Motion telemetry (trace): the commanded trajectory (entry point
-        // plus every received frame) vs where the real cursor actually
-        // is — the residual gap is exactly the lag a windowed magnitude
-        // probe cannot see. See [`MotionProbe`].
-        let mut probe = MotionProbe::default();
-        // Current TCP read timeout, so it is only reconfigured on change.
-        let mut timeout: Option<Duration> = Some(READ_TIMEOUT);
-        // Periodic duties (resolution check, clipboard, keepalive) only
-        // run at this cadence while controlled — they must never crowd
-        // the motion tick.
-        let mut last_duty = Instant::now();
-        let duty_interval = CLIPBOARD_INTERVAL;
-        loop {
-            // 1. Drain the UDP cursor stream. Only relative motion rides
-            //    it; beacons are sent below. Stale/duplicate frames are
-            //    dropped by sequence number (a reordered frame is older
-            //    traffic the cursor already moved past). Each accepted
-            //    frame advances the commanded position and is injected
-            //    verbatim (feedforward — the wire cadence *is* the
-            //    cursor cadence).
-            loop {
-                let mut buf = [0u8; 512];
-                match self.udp.recv(&mut buf) {
-                    Ok(n) => {
-                        let Some(d) = udp::unpack(&buf[..n]) else { continue };
-                        if d.id != self.own_id || !udp::is_newer(d.seq, motion_seq) {
-                            continue;
-                        }
-                        motion_seq = d.seq;
-                        if let Message::MouseMoveRel { dx, dy } = d.msg {
-                            // Motion outside Enter/Leave is dropped: it can
-                            // beat the TCP Enter on the wire (different
-                            // transports), and at most a frame or two at
-                            // the seam is lost — self-correcting.
-                            if controlled {
-                                Self::apply_motion(dx, dy, &mut *injector, &mut follower, &mut probe);
-                            }
-                        }
-                    }
-                    Err(_) => break, // WouldBlock or link error: drained
-                }
-            }
+    /// control messages). Drained on the TCP thread.
+    pub fn run(
+        self,
+        injector: Box<dyn Injector>,
+        clipboard: Box<dyn Clipboard>,
+        outbox: &Receiver<Message>,
+    ) -> io::Result<()> {
+        // Destructure so each field is owned independently — `udp` moves
+        // into [`Shared`] while `transport` stays on this thread.
+        let Client { mut transport, own_id, layout, udp } = self;
+        let mut layout = layout;
+        let shared = Arc::new(Shared {
+            injector: Mutex::new(injector),
+            clipboard: Mutex::new(clipboard),
+            motion: Mutex::new(MotionState {
+                follower: PositionFollower::default(),
+                probe: MotionProbe::default(),
+                frames_win: 0,
+                ticks_win: 0,
+            }),
+            active: AtomicBool::new(false),
+            udp,
+            udp_seq: AtomicU32::new(1),
+            stop: AtomicBool::new(false),
+            motion_tick_ms: AtomicU64::new(0),
+            tcp_tick_ms: AtomicU64::new(0),
+        });
+        // The sync thread hands messages (resolution changes, clipboard
+        // uploads) to the TCP thread over this channel.
+        let (sync_tx, sync_rx) = mpsc::channel::<Message>();
 
-            // 2. Control channel: one TCP message, or a timeout. While
-            //    being controlled, wake at motion cadence so corrections
-            //    and beacons stay fresh even on a quiet wire.
-            let want = if controlled { Some(MOTION_PERIOD) } else { Some(READ_TIMEOUT) };
-            if want != timeout {
-                self.transport.set_read_timeout(want)?;
-                timeout = want;
-            }
-            match self.transport.recv()? {
+        let sync = thread::Builder::new()
+            .name("kvmshare-client-sync".into())
+            .spawn({ let s = shared.clone(); move || sync_loop(s, sync_tx) })
+            .expect("cannot spawn client sync thread");
+        let udp_thread = thread::Builder::new()
+            .name("kvmshare-client-udp".into())
+            .spawn({ let s = shared.clone(); move || udp_loop(s, own_id) })
+            .expect("cannot spawn client udp thread");
+        let motion = thread::Builder::new()
+            .name("kvmshare-client-motion".into())
+            .spawn({ let s = shared.clone(); move || motion_loop(s, own_id) })
+            .expect("cannot spawn client motion thread");
+        // The supervisor: a watchdog that can never be blocked by
+        // whatever wedges the workers, because it shares nothing with
+        // them but two atomics. If a worker stalls while this machine is
+        // being controlled, it force-restores local input and ends the
+        // session so the reconnect path starts a clean client — a wedged
+        // client must never leave this machine's mouse and keyboard
+        // trapped. It also logs the stall so the root cause is visible
+        // on the next occurrence instead of a mystery freeze.
+        let supervisor = thread::Builder::new()
+            .name("kvmshare-client-supervisor".into())
+            .spawn({ let s = shared.clone(); move || supervisor_loop(s) })
+            .expect("cannot spawn client supervisor thread");
+
+        // TCP control channel on this thread. The read timeout is
+        // constant — motion no longer needs the control loop to wake at
+        // motion cadence.
+        let mut last_keepalive = Instant::now();
+        loop {
+            match transport.recv()? {
                 RecvResult::Msg(msg) => {
-                    let entered = matches!(msg, Message::Enter { .. });
-                    let left = matches!(msg, Message::Leave { .. });
-                    self.dispatch(msg, &mut *injector, &mut follower, &mut probe);
-                    if entered {
-                        controlled = true;
-                        // Control just landed: report where we are right
-                        // away so the server's edge state is fresh from
-                        // the first moment.
-                        let (x, y) = injector.cursor_position();
-                        self.send_beacon(x, y, &mut beacon_failed)?;
-                        last_cursor_beacon = Instant::now();
-                    } else if left {
-                        controlled = false;
-                    }
+                    shared.tcp_tick_ms.store(now_ms(), Ordering::Relaxed);
+                    dispatch(&mut layout, &shared, own_id, msg);
                 }
                 RecvResult::Eof => break,
                 RecvResult::NoData => {
-                    // Periodic duties run at a cadence, never on every
-                    // wakeup: a slow clipboard read or a monitor query
-                    // must not crowd the motion tick while controlled.
-                    if last_duty.elapsed() >= duty_interval {
-                        last_duty = Instant::now();
-                        // Service the outbox, notice resolution changes,
-                        // push clipboard changes up, keep the link warm.
-                        while let Ok(msg) = outbox.try_recv() {
-                            self.transport.send(&msg)?;
-                        }
-                        let info = injector.screen_info();
-                        if info != last_info {
-                            self.transport.send(&Message::ScreenInfo { info })?;
-                            last_info = info;
-                        }
-                        if last_clip_check.elapsed() >= CLIPBOARD_INTERVAL {
-                            last_clip_check = Instant::now();
-                            let cur = injector.clipboard_get();
-                            // Skip content we just applied from the
-                            // server, and content we have already sent.
-                            if let Some(cur) = cur {
-                                if last_clip_seen.as_ref() != Some(&cur)
-                                    && injector.clipboard_last_injected().as_ref() != Some(&cur)
-                                {
-                                    let (mime, data) = cur.clone();
-                                    self.transport.send(&Message::Clipboard { mime, data })?;
-                                    last_clip_seen = Some(cur);
-                                }
-                            }
-                        }
-                        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
-                            self.transport.send(&Message::KeepAlive)?;
-                            last_keepalive = Instant::now();
-                        }
+                    shared.tcp_tick_ms.store(now_ms(), Ordering::Relaxed);
+                    // App-layer outbox, slow-path traffic from the sync
+                    // thread, and keepalives to keep the link warm. All
+                    // cheap sends; nothing here can block for long.
+                    while let Ok(msg) = outbox.try_recv() {
+                        transport.send(&msg)?;
                     }
-                }
-            }
-
-            // 3. The closed-loop tick while being controlled: steer the
-            //    cursor, read the real position once, beacon it to the
-            //    server (edge crossings depend on it), and sample
-            //    telemetry — all from the same fresh position.
-            if controlled {
-                if injector.absolute_motion() {
-                    // Absolute backends place the cursor exactly at the
-                    // commanded position once per tick. Every frame that
-                    // arrived since the last tick is represented, so the
-                    // cursor moves once — evenly, at the loop's cadence
-                    // — and a burst of UDP datagrams can never clump it
-                    // into visible steps. (The placement is skipped when
-                    // the cursor is already there: an idle cursor costs
-                    // nothing, and a stray native move is re-placed —
-                    // self-healing.)
-                    let (rx, ry) = injector.cursor_position();
-                    let (cx, cy) = follower.command();
-                    if (cx, cy) != (rx, ry) {
-                        injector.move_cursor(cx, cy);
+                    while let Ok(msg) = sync_rx.try_recv() {
+                        transport.send(&msg)?;
                     }
-                } else {
-                    let (rx, ry) = injector.cursor_position();
-                    if let Some((cx, cy)) = follower.correct((rx, ry)) {
-                        injector.move_rel(cx, cy);
+                    if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+                        transport.send(&Message::KeepAlive)?;
+                        last_keepalive = Instant::now();
                     }
-                }
-                let (rx, ry) = injector.cursor_position();
-                if last_cursor_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
-                    last_cursor_beacon = Instant::now();
-                    self.send_beacon(rx, ry, &mut beacon_failed)?;
-                }
-                if probe.due() {
-                    let (ex, ey) = follower.error((rx, ry));
-                    probe.sample((rx, ry), &mut |rx, ry, ax, ay, _ex, _ey, gx, gy| {
-                        log_trace!(
-                            "motion req=({rx},{ry}) act=({ax},{ay}) err=({ex},{ey}) real=({gx},{gy})"
-                        );
-                    });
-                }
-            }
-
-            // 5. After every wakeup (message or timeout): if the local OS
-            //    is dropping our injected input (elevated /
-            //    input-isolated window), tell the server so it brings
-            //    control home. Rate-limited; a latch avoids spamming the
-            //    server while blocked.
-            if last_block_check.elapsed() >= BLOCK_CHECK_INTERVAL {
-                last_block_check = Instant::now();
-                let blocked = injector.input_blocked();
-                if blocked && !blocked_reported {
-                    blocked_reported = true;
-                    log_warn!("local input injection blocked — asking the server to return control");
-                    self.transport.send(&Message::InputBlocked)?;
-                } else if !blocked {
-                    blocked_reported = false;
                 }
             }
         }
+
+        // Session over: stop the workers, then place the cursor once more
+        // at the final command so the last position is exact. Joins are
+        // bounded: a worker wedged on an OS call must not hang the
+        // reconnect loop (the supervisor already released local input for
+        // that case).
+        shared.stop.store(true, Ordering::Relaxed);
+        Self::join_bounded(motion, "motion");
+        Self::join_bounded(udp_thread, "udp");
+        Self::join_bounded(sync, "sync");
+        let _ = supervisor.join();
+        place_at_command(&shared);
         Ok(())
     }
 
-    /// Send one real-cursor beacon over the UDP stream. The stream is
-    /// loss-tolerant, but a dead link is worth knowing about — log the
-    /// first failure, then stay quiet (the TCP keepalives will surface a
-    /// genuinely dead connection).
-    fn send_beacon(&mut self, x: i32, y: i32, failed: &mut bool) -> io::Result<()> {
-        let bytes = udp::pack(self.own_id, self.udp_seq, &Message::CursorPos { x, y });
-        self.udp_seq = self.udp_seq.wrapping_add(1);
-        match self.udp.send(&bytes) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if !*failed {
-                    log_warn!("cursor beacon send failed (first): {e}");
-                    *failed = true;
-                }
-                Ok(())
-            }
+    /// Join a worker thread with a grace period; a thread that has not
+    /// exited by then is abandoned (dropping the handle detaches it).
+    /// Wedged workers hold only their own locks — the fresh session's
+    /// threads do not share them — so abandoning is safe and the machine
+    /// is never held hostage by a stuck join.
+    fn join_bounded(handle: thread::JoinHandle<()>, name: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !handle.is_finished() {
+            thread::sleep(Duration::from_millis(20));
         }
-    }
-
-    /// Apply one motion frame to the local machine. Relative backends
-    /// get the follower's feedforward portion (the closed loop delivers
-    /// the rest). Absolute backends only advance the command — the
-    /// cursor itself is placed at the command on the loop tick (see the
-    /// run loop), so the wire cadence never reaches the cursor directly
-    /// and a burst of datagrams cannot clump it. Either way the command
-    /// (and hence the telemetry) tracks the full frame.
-    fn apply_motion(
-        dx: i32,
-        dy: i32,
-        injector: &mut dyn Injector,
-        follower: &mut PositionFollower,
-        probe: &mut MotionProbe,
-    ) {
-        if injector.absolute_motion() {
-            follower.advance(dx, dy);
+        if !handle.is_finished() {
+            log_error!("client {name} thread did not exit after stop — abandoning it");
+            drop(handle);
         } else {
-            let (dx, dy) = follower.push(dx, dy);
-            injector.move_rel(dx, dy);
-        }
-        probe.requested(dx, dy);
-    }
-
-    /// Before an ordering-critical event (button, key, wheel) the cursor
-    /// must sit on the command point. Absolute backends place it there
-    /// exactly — the placement is the loop, and the command is the only
-    /// truth. Relative backends flush the follower's residual as one
-    /// capped move, so a click lands where the motion pointed without a
-    /// wedged cursor dragging it across the screen.
-    fn flush_before_event(injector: &mut dyn Injector, follower: &mut PositionFollower) {
-        if injector.absolute_motion() {
-            let (cx, cy) = follower.command();
-            injector.move_cursor(cx, cy);
-            return;
-        }
-        let (rx, ry) = injector.cursor_position();
-        if let Some((cx, cy)) = follower.flush((rx, ry)) {
-            injector.move_rel(cx, cy);
+            let _ = handle.join();
         }
     }
+}
 
-    /// Apply one server message to the local machine. Motion advances
-    /// the [`PositionFollower`] command (and is injected verbatim);
-    /// ordering-critical events first flush the follower's residual so a
-    /// click, key or wheel lands where the motion pointed.
-    fn dispatch(
-        &mut self,
-        msg: Message,
-        injector: &mut dyn Injector,
-        follower: &mut PositionFollower,
-        probe: &mut MotionProbe,
-    ) {
+/// The supervisor watchdog, on its own thread: it shares nothing with
+/// the workers but two atomic liveness ticks, so nothing that wedges
+/// them can wedge it. While control is on this machine, a motion thread
+/// that stops ticking means the cursor is no longer being steered — a
+/// blocking call is holding a lock the motion loop needs. Recovery is
+/// deliberately blunt and always safe: force-restore local input (the
+/// user's own mouse/keyboard work again, no matter what), then end the
+/// session so the reconnect path starts a clean client. The stall is
+/// logged loudly with the liveness facts so the root cause is visible.
+fn supervisor_loop(shared: Arc<Shared>) {
+    while !shared.stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(500));
+        if shared.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // Only guard while this machine is being controlled: local idle
+        // is not a stall.
+        if !shared.active.load(Ordering::Acquire) {
+            continue;
+        }
+        let now = now_ms();
+        let motion_age = now.saturating_sub(shared.motion_tick_ms.load(Ordering::Relaxed));
+        let tcp_age = now.saturating_sub(shared.tcp_tick_ms.load(Ordering::Relaxed));
+        // The motion loop ticks at ~4 ms; any age over 3 s while active
+        // is a genuine wedge (a healthy loop cannot be quiet that long),
+        // never a false positive.
+        if motion_age > 3000 {
+            // Probe which lock the stalled motion thread is likely
+            // waiting on: a lock we cannot acquire here is held by a
+            // wedged thread (the motion loop takes motion then injector
+            // every tick).
+            let motion_locked = shared.motion.try_lock().is_err();
+            let injector_locked = shared.injector.try_lock().is_err();
+            let clipboard_locked = shared.clipboard.try_lock().is_err();
+            log_error!(
+                "SUPERVISOR: motion thread stalled {motion_age} ms while control is on this machine (tcp thread {tcp_age} ms; locks held: motion={motion_locked} injector={injector_locked} clipboard={clipboard_locked}) — releasing local input and restarting the session"
+            );
+            // Force-restore the machine's own input. `try_lock` so the
+            // supervisor itself can never block on a wedged lock.
+            if let Ok(mut inj) = shared.injector.try_lock() {
+                inj.emergency_release();
+            }
+            // End the session: the TCP loop wakes within its read
+            // timeout, run() unwinds, and the binary reconnects fresh.
+            shared.stop.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+}
+
+    /// Apply one server message to the local machine. Ordering-critical
+    /// events (button, key, wheel) first place the cursor on the command
+    /// point; Enter/Leave flip control ownership; everything else is
+    /// dispatch.
+    fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, msg: Message) {
         match msg {
             Message::MouseMoveRel { dx, dy } => {
-                // Defensive: motion normally arrives over UDP (drained in
-                // run()); a frame on the control channel follows the same
-                // path.
-                Self::apply_motion(dx, dy, injector, follower, probe);
+                // Defensive: motion normally arrives over UDP (drained by
+                // the UDP thread); a frame on the control channel follows
+                // the same path.
+                apply_motion_frame(shared, dx, dy);
             }
             Message::MouseMoveAbs { x, y } => {
                 // Absolute placement (defensive — entry placement travels
                 // in the Enter message; the session never emits absolute
                 // moves in the motion stream). The command follows the
                 // placed point.
-                injector.move_cursor(x, y);
-                follower.reanchor(x, y);
+                let mut m = shared.motion.lock().unwrap();
+                let mut inj = shared.injector.lock().unwrap();
+                inj.move_cursor(x, y);
+                m.follower.reanchor(x, y);
             }
             Message::Enter { screen_id: _, x, y } => {
                 log_trace!("control entered at ({x},{y})");
-                follower.enter(x, y);
-                injector.enter();
-                // Absolute placement at the entry point only — from here
-                // on the motion stream is relative (see
-                // [`Injector::move_rel`]). Anchor the command and the
-                // telemetry at where the cursor actually ended up (read
-                // back, so placement rounding never shows up as drift).
-                injector.move_cursor(x, y);
-                let (rx, ry) = injector.cursor_position();
-                follower.reanchor(rx, ry);
-                probe.enter((rx, ry));
+                // Anchor the command at the entry point and place the
+                // cursor there, *then* flip `active` — the motion and UDP
+                // threads must never steer toward a stale command.
+                let mut m = shared.motion.lock().unwrap();
+                m.follower.enter(x, y);
+                {
+                    let mut inj = shared.injector.lock().unwrap();
+                    inj.enter();
+                    inj.move_cursor(x, y);
+                    let (rx, ry) = inj.cursor_position();
+                    m.follower.reanchor(rx, ry);
+                    m.probe.enter((rx, ry));
+                }
+                drop(m);
+                shared.active.store(true, Ordering::Release);
+                // Report where we are right away so the server's edge
+                // state is fresh from the first moment.
+                let (x, y) = shared.injector.lock().unwrap().cursor_position();
+                let _ = send_beacon(shared, own_id, x, y);
             }
             Message::Leave { screen_id: _ } => {
                 log_trace!("control left");
-                follower.leave();
-                probe.leave();
-                injector.leave();
+                shared.active.store(false, Ordering::Release);
+                let mut m = shared.motion.lock().unwrap();
+                m.follower.leave();
+                m.probe.leave();
+                let mut inj = shared.injector.lock().unwrap();
+                inj.leave();
             }
             // Buttons, keys and wheel are ordering-critical: the cursor
             // must sit on the command point before the event fires.
             Message::MouseButton { button, pressed } => {
-                Self::flush_before_event(injector, follower);
+                flush_before_event(shared);
                 log_trace!("button {button} {}", if pressed { "down" } else { "up" });
-                injector.button(button, pressed);
+                shared.injector.lock().unwrap().button(button, pressed);
             }
             Message::MouseWheel { dx, dy } => {
-                Self::flush_before_event(injector, follower);
+                flush_before_event(shared);
                 log_trace!("wheel {dx},{dy}");
-                injector.wheel(dx, dy);
+                shared.injector.lock().unwrap().wheel(dx, dy);
             }
             Message::Key { kind, key } => {
-                Self::flush_before_event(injector, follower);
+                flush_before_event(shared);
                 log_trace!("key {kind:?} {key}");
-                injector.key(kind, key);
+                shared.injector.lock().unwrap().key(kind, key);
             }
             Message::Clipboard { mime, data } => {
                 log_debug!("clipboard from server: {} ({} bytes)", mime, data.len());
-                injector.clipboard(&mime, &data);
+                shared.clipboard.lock().unwrap().set(&mime, &data);
             }
-            Message::Layout { layout } => {
-                log_debug!("layout updated: {} screens", layout.screens.len());
-                self.layout = layout;
+            Message::Layout { layout: new_layout } => {
+                log_debug!("layout updated: {} screens", new_layout.screens.len());
+                *layout = new_layout;
             }
             Message::KeepAlive => {}
             Message::Error { code, text } => log_warn!("server error ({code}): {text}"),
@@ -508,14 +545,206 @@ impl Client {
             | Message::Welcome { .. }
             | Message::ScreenInfo { .. }
             | Message::CursorPos { .. }
-            | Message::InputBlocked
             | Message::Escape => {}
         }
     }
 
+impl Client {
     pub fn own_id(&self) -> u8 {
         self.own_id
     }
+}
+
+/// The motion thread: a fixed-cadence steering loop. Each tick it places
+/// the real cursor on the commanded position (absolute backends) or
+/// corrects toward it (relative backends), beacons the real position
+/// back at [`CURSOR_BEACON_INTERVAL`], and samples telemetry. It does
+/// nothing else — no network reads, no clipboard, no screen queries — so
+/// nothing can make the cursor wait.
+fn motion_loop(shared: Arc<Shared>, own_id: u8) {
+    let mut last_beacon = Instant::now();
+    let mut beacon_failed = false;
+    while !shared.stop.load(Ordering::Relaxed) {
+        let tick = Instant::now();
+        shared.motion_tick_ms.store(now_ms(), Ordering::Relaxed);
+        if shared.active.load(Ordering::Acquire) {
+            let mut m = shared.motion.lock().unwrap();
+            m.ticks_win += 1;
+            let mut inj = shared.injector.lock().unwrap();
+            inj.steer_heartbeat();
+            let (rx, ry) = inj.cursor_position();
+            if inj.absolute_motion() {
+                // Place exactly at the command. Skipped when the cursor
+                // is already there: an idle cursor costs nothing, and a
+                // stray native move is re-placed — self-healing.
+                let (cx, cy) = m.follower.command();
+                if (cx, cy) != (rx, ry) {
+                    inj.move_cursor(cx, cy);
+                }
+            } else if let Some((dx, dy)) = m.follower.correct((rx, ry)) {
+                inj.move_rel(dx, dy);
+            }
+            if m.probe.due() {
+                let (ex, ey) = m.follower.error((rx, ry));
+                let (frames, ticks) = (m.frames_win, m.ticks_win);
+                m.frames_win = 0;
+                m.ticks_win = 0;
+                m.probe.sample((rx, ry), &mut |rx, ry, ax, ay, _exp_x, _exp_y, gx, gy| {
+                    log_trace!(
+                        "motion req=({rx},{ry}) act=({ax},{ay}) err=({ex},{ey}) real=({gx},{gy}) frames={frames} ticks={ticks}"
+                    );
+                });
+            }
+            drop(m);
+            drop(inj);
+            if last_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
+                last_beacon = Instant::now();
+                if let Err(e) = send_beacon(&shared, own_id, rx, ry) {
+                    if !beacon_failed {
+                        log_warn!("cursor beacon send failed (first): {e}");
+                        beacon_failed = true;
+                    }
+                }
+            }
+        }
+        // Sleep until the next tick. The cadence is fixed by
+        // [`MOTION_PERIOD`]; the tick work itself is microseconds.
+        let elapsed = tick.elapsed();
+        let rem = MOTION_PERIOD.saturating_sub(elapsed);
+        thread::sleep(rem);
+    }
+}
+
+/// The UDP thread: drains the cursor stream and advances the commanded
+/// position. Blocks on the socket (event-driven — a frame wakes it
+/// immediately); the read timeout only bounds idle wakes so shutdown is
+/// noticed promptly.
+fn udp_loop(shared: Arc<Shared>, own_id: u8) {
+    let mut motion_seq: u32 = 0;
+    let mut buf = [0u8; 512];
+    while !shared.stop.load(Ordering::Relaxed) {
+        match shared.udp.recv(&mut buf) {
+            Ok(n) => {
+                let Some(d) = udp::unpack(&buf[..n]) else { continue };
+                if d.id != own_id || !udp::is_newer(d.seq, motion_seq) {
+                    continue;
+                }
+                motion_seq = d.seq;
+                if let Message::MouseMoveRel { dx, dy } = d.msg {
+                    // Motion outside Enter/Leave is dropped: it can beat
+                    // the TCP Enter on the wire (different transports),
+                    // and at most a frame or two at the seam is lost —
+                    // self-correcting.
+                    if shared.active.load(Ordering::Acquire) {
+                        apply_motion_frame(&shared, dx, dy);
+                    }
+                }
+            }
+            Err(_) => {} // timeout (idle) or link error: check stop, loop
+        }
+    }
+}
+
+/// The sync thread: slow periodic duties on their own thread so they can
+/// never delay the cursor. Results are handed to the TCP thread over the
+/// channel, which sends them on its next wake.
+fn sync_loop(shared: Arc<Shared>, tx: Sender<Message>) {
+    let mut last_info = shared.injector.lock().unwrap().screen_info();
+    let mut last_clip_check = Instant::now();
+    let mut last_clip_seen: Option<(String, Vec<u8>)> = None;
+    while !shared.stop.load(Ordering::Relaxed) {
+        // Resolution changes are noticed at a slow cadence; a monitor
+        // query is a couple of cheap syscalls.
+        let info = shared.injector.lock().unwrap().screen_info();
+        if info != last_info {
+            let _ = tx.send(Message::ScreenInfo { info });
+            last_info = info;
+        }
+        // Push local clipboard changes up to the server. This read is the
+        // one call that can legitimately stall (another process holding
+        // the clipboard open) — which is exactly why it lives here, on
+        // the clipboard's own lock, where a stall delays only clipboard
+        // sync and never the cursor.
+        if last_clip_check.elapsed() >= CLIPBOARD_INTERVAL {
+            last_clip_check = Instant::now();
+            let mut cb = shared.clipboard.lock().unwrap();
+            let cur = cb.get();
+            // Skip content we just applied from the server, and content
+            // we have already sent.
+            if let Some(cur) = cur {
+                if last_clip_seen.as_ref() != Some(&cur)
+                    && cb.last_injected().as_ref() != Some(&cur)
+                {
+                    let (mime, data) = cur.clone();
+                    let _ = tx.send(Message::Clipboard { mime, data });
+                    last_clip_seen = Some(cur);
+                }
+            }
+        }
+        thread::sleep(CLIPBOARD_INTERVAL / 2);
+    }
+}
+
+/// Apply one motion frame to the shared command. Relative backends get
+/// the follower's feedforward portion injected immediately (the motion
+/// thread's corrections deliver the rest). Absolute backends only
+/// advance the command — the motion thread places the cursor there at
+/// its own cadence, so the wire cadence never reaches the cursor
+/// directly and a burst of datagrams cannot clump it.
+fn apply_motion_frame(shared: &Shared, dx: i32, dy: i32) {
+    let mut m = shared.motion.lock().unwrap();
+    m.frames_win += 1;
+    {
+        let mut inj = shared.injector.lock().unwrap();
+        if inj.absolute_motion() {
+            m.follower.advance(dx, dy);
+        } else {
+            let (dx, dy) = m.follower.push(dx, dy);
+            inj.move_rel(dx, dy);
+        }
+    }
+    m.probe.requested(dx, dy);
+}
+
+/// Before an ordering-critical event (button, key, wheel) the cursor
+/// must sit on the command point. Absolute backends place it there
+/// exactly — the placement is the loop, and the command is the only
+/// truth. Relative backends flush the follower's residual as one capped
+/// move, so a click lands where the motion pointed without a wedged
+/// cursor dragging it across the screen.
+fn flush_before_event(shared: &Shared) {
+    let mut m = shared.motion.lock().unwrap();
+    let mut inj = shared.injector.lock().unwrap();
+    if inj.absolute_motion() {
+        let (cx, cy) = m.follower.command();
+        inj.move_cursor(cx, cy);
+        return;
+    }
+    let (rx, ry) = inj.cursor_position();
+    if let Some((dx, dy)) = m.follower.flush((rx, ry)) {
+        inj.move_rel(dx, dy);
+    }
+}
+
+/// A final placement at the last command (used when the session ends).
+/// Absolute backends land exactly; relative backends have already
+/// converged (the follower only corrects toward the command).
+fn place_at_command(shared: &Shared) {
+    let m = shared.motion.lock().unwrap();
+    let mut inj = shared.injector.lock().unwrap();
+    if inj.absolute_motion() {
+        let (cx, cy) = m.follower.command();
+        inj.move_cursor(cx, cy);
+    }
+}
+
+/// Send one real-cursor beacon over the UDP stream. Loss-tolerant: a
+/// dropped beacon is replaced by the next. The stream is quiet enough
+/// that an outright dead link surfaces via the TCP keepalives.
+fn send_beacon(shared: &Shared, own_id: u8, x: i32, y: i32) -> io::Result<()> {
+    let seq = shared.udp_seq.fetch_add(1, Ordering::Relaxed);
+    let bytes = udp::pack(own_id, seq, &Message::CursorPos { x, y });
+    shared.udp.send(&bytes).map(|_| ())
 }
 
 #[cfg(test)]
@@ -523,8 +752,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, UdpSocket};
-    use std::sync::{mpsc, Arc, Mutex};
-    use std::thread;
+    use std::sync::mpsc;
     use std::time::Duration;
     use kvmshare_protocol::message::KeyKind;
 
@@ -546,6 +774,19 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         });
+    }
+
+    /// A clipboard that never has anything on it.
+    struct NoClipboard;
+
+    impl Clipboard for NoClipboard {
+        fn set(&mut self, _mime: &str, _data: &[u8]) {}
+        fn get(&mut self) -> Option<(String, Vec<u8>)> {
+            None
+        }
+        fn last_injected(&mut self) -> Option<(String, Vec<u8>)> {
+            None
+        }
     }
 
     /// Records calls into a shared vec so the test can inspect them after
@@ -595,12 +836,6 @@ mod tests {
         fn screen_info(&mut self) -> ScreenInfo {
             *self.info.lock().unwrap()
         }
-        fn clipboard_get(&mut self) -> Option<(String, Vec<u8>)> {
-            None
-        }
-        fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)> {
-            None
-        }
         fn move_cursor(&mut self, x: i32, y: i32) {
             *self.pos.lock().unwrap() = (x, y);
             self.calls.lock().unwrap().push(format!("move {x},{y}"));
@@ -630,9 +865,6 @@ mod tests {
         fn leave(&mut self) {
             self.calls.lock().unwrap().push("leave".into());
         }
-        fn clipboard(&mut self, mime: &str, data: &[u8]) {
-            self.calls.lock().unwrap().push(format!("clipboard {mime}: {}", String::from_utf8_lossy(data)));
-        }
     }
 
     #[test]
@@ -652,7 +884,7 @@ mod tests {
         let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
         assert_eq!(client.own_id(), 7);
         let (_tx, rx) = mpsc::channel::<Message>();
-        client.run(Box::new(injector), &rx).unwrap();
+        client.run(Box::new(injector), Box::new(NoClipboard), &rx).unwrap();
 
         let calls = calls_handle.lock().unwrap().clone();
         assert!(calls.contains(&"move 100,200".to_string()));
@@ -712,7 +944,8 @@ mod tests {
 
         // Run the client on its own thread and simulate a display scale
         // change while it is running.
-        let client_thread = thread::spawn(move || client.run(Box::new(injector), &out_rx).unwrap());
+        let client_thread =
+            thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
         thread::sleep(Duration::from_millis(200));
         *info_handle.lock().unwrap() = ScreenInfo { width: 3840, height: 2160, scale: 2.0 };
 
@@ -779,7 +1012,7 @@ mod tests {
         let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
         let (_tx, rx) = mpsc::channel::<Message>();
         // The fake server closes the TCP side after ~310ms; run until EOF.
-        let _ = client.run(Box::new(injector), &rx);
+        let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
         let _ = calls;
 
         let calls = calls_handle.lock().unwrap().clone();
@@ -852,7 +1085,7 @@ mod tests {
         let pos_handle = injector.pos.clone();
         let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
         let (_tx, rx) = mpsc::channel::<Message>();
-        let _ = client.run(Box::new(injector), &rx);
+        let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
 
         let calls = calls_handle.lock().unwrap().clone();
         // Nothing is injected per datagram — the tick places the whole

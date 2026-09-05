@@ -76,7 +76,9 @@
 //! make every notch scroll twice on the client.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -126,14 +128,6 @@ const POLL_PAUSE: Duration = Duration::from_millis(2);
 /// period plus the poll pause, and the stream costs a few frames per
 /// second instead of a thousand.
 const BEACON_PERIOD: Duration = Duration::from_millis(6);
-
-/// How often the real pointer position is polled with a core
-/// `QueryPointer`. Every poll is one cheap local round-trip; this
-/// cadence keeps the beacon (and with it the session's wall-arm) at most
-/// one period stale while the pointer moves — the same latency budget as
-/// [`BEACON_PERIOD`] itself. Faster would add round-trips for no
-/// perceptible gain; slower would make crossings hesitate by that much.
-const REAL_POLL_PERIOD: Duration = Duration::from_millis(4);
 
 /// A control action the engine wants performed on the local cursor.
 ///
@@ -258,22 +252,22 @@ struct InputCapture {
     beacon: Option<(i32, i32)>,
     /// When the last beacon was sent (rate limiter).
     last_beacon: Option<Instant>,
-    /// When the real pointer position was last polled (rate limiter for
-    /// [`REAL_POLL_PERIOD`]).
-    real_poll_at: Instant,
     /// Motion telemetry (trace): forwarded raw counts vs pc's own real
     /// (post-acceleration) pointer travel — the px-per-count reference
     /// the client's feel should match. Fed at the send points and
     /// sampled on the poll cadence (see [`MotionProbe`]).
     probe: kvmshare_core::motion::MotionProbe,
-    /// The last real pointer position the probe sampled at (kept so a
-    /// window is measured against the position where the previous window
-    /// ended, even when XI motion events pause between samples).
-    probe_last_real: Option<(i32, i32)>,
     /// Keys the device has pressed but not yet released (HID usage → state).
     held: HashMap<u32, Held>,
-    /// Whether *we* currently hold the pointer+keyboard grab.
-    grabbed: bool,
+    /// Whether *we* currently hold the pointer+keyboard grab. Shared
+    /// with the beacon thread: while the local pointer is grabbed and
+    /// parked, position beacons are meaningless and must not be sent.
+    grabbed: Arc<AtomicBool>,
+    /// The latest real pointer position, polled by the beacon thread on
+    /// its own X connection — so the event hot path never waits on a
+    /// round-trip reply. Fed to the probe and to the coalesced beacon
+    /// when the local pointer is free.
+    real_pos: Arc<Mutex<Option<(i32, i32)>>>,
     /// Kernel-level device isolation while the cursor is on a client.
     /// Always present; it engages the moment `/dev/input` becomes
     /// readable (grab-only until then).
@@ -308,19 +302,24 @@ pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<
     // kernel the moment they become readable. Until then the server runs
     // grab-only (raw-reading apps may react to forwarded input).
     let evdev = EvdevReader::start(tx.clone());
+    // Shared between the event thread and the beacon thread: the grab
+    // state (beacons must stop while the pointer is grabbed) and the
+    // latest polled pointer position (the event thread feeds it to the
+    // probe without ever doing a round-trip itself).
+    let grabbed = Arc::new(AtomicBool::new(false));
+    let real_pos = Arc::new(Mutex::new(None));
     let capture = InputCapture {
         conn,
         root,
-        tx,
+        tx: tx.clone(),
         cmd_rx,
         motion: PendingMotion::default(),
         beacon: None,
         last_beacon: None,
-        real_poll_at: Instant::now(),
         probe: kvmshare_core::motion::MotionProbe::default(),
-        probe_last_real: None,
         held: HashMap::new(),
-        grabbed: false,
+        grabbed: grabbed.clone(),
+        real_pos: real_pos.clone(),
         evdev,
     };
     thread::spawn(move || {
@@ -328,7 +327,61 @@ pub fn start(display: Option<&str>, cmd_rx: Receiver<CaptureCommand>) -> Result<
             log_error!("input capture stopped: {e}");
         }
     });
+    // The real pointer position is polled on its own thread with its own
+    // X connection: a synchronous `QueryPointer` round-trip on the event
+    // thread stalled motion flushing whenever the X server was busy — a
+    // busy server (compositor, a game, heavy load) delayed the reply, and
+    // with it the cursor stream, which showed up as the cursor stopping
+    // for a beat. Polling is also strictly unnecessary while the pointer
+    // is grabbed (beacons are suppressed then anyway), so the beacon
+    // thread skips the round-trip entirely in that state.
+    spawn_beacon_thread(display.map(str::to_owned), grabbed, real_pos, tx);
     Ok(rx)
+}
+
+/// Poll the real pointer position on a dedicated thread with its own X
+/// connection, feeding the shared [`InputCapture::real_pos`] and — while
+/// the local pointer is free — sending position beacons at
+/// [`BEACON_PERIOD`] cadence.
+///
+/// This is the *only* thread that does a `QueryPointer` round-trip. The
+/// event thread forwards raw motion and processes X events without ever
+/// waiting on a reply, so a busy X server can delay the beacon thread's
+/// round-trips without stalling the cursor stream.
+fn spawn_beacon_thread(
+    display: Option<String>,
+    grabbed: Arc<AtomicBool>,
+    real_pos: Arc<Mutex<Option<(i32, i32)>>>,
+    tx: Sender<Message>,
+) {
+    thread::spawn(move || {
+        let Ok((conn, screen_num)) = RustConnection::connect(display.as_deref()) else { return };
+        let root = conn.setup().roots[screen_num].root;
+        let mut last: Option<(i32, i32)> = None;
+        loop {
+            // While the local pointer is grabbed (cursor on a client),
+            // beacons are meaningless — skip the round-trip entirely.
+            if !grabbed.load(Ordering::Relaxed) {
+                if let Ok(cookie) = conn.query_pointer(root) {
+                    if let Ok(reply) = cookie.reply() {
+                        let (x, y) = (reply.root_x as i32, reply.root_y as i32);
+                        *real_pos.lock().unwrap() = Some((x, y));
+                        if last != Some((x, y)) {
+                            last = Some((x, y));
+                            // The session re-anchors on every beacon; the
+                            // ordering guarantee (motion first, then the
+                            // position) is the event thread's job — the
+                            // poll path is a resync, never a command.
+                            if tx.send(Message::MouseMoveAbs { x, y }).is_err() {
+                                return; // server gone
+                            }
+                        }
+                    }
+                }
+            }
+            thread::sleep(BEACON_PERIOD);
+        }
+    });
 }
 
 impl InputCapture {
@@ -349,50 +402,11 @@ impl InputCapture {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 self.apply(cmd);
             }
-            self.poll_real_pointer();
             self.flush_motion();
             self.flush_beacon();
             self.tick_repeats();
             self.sample_probe();
             thread::sleep(POLL_PAUSE);
-        }
-    }
-
-    /// Sample the real pointer position with a core `QueryPointer` at
-    /// [`REAL_POLL_PERIOD`], and feed the coalesced beacon and the
-    /// telemetry anchor.
-    ///
-    /// The XI motion fast path ([`Self::on_event`]) stays, but polling is
-    /// the source that always works: some X servers never deliver XI
-    /// motion events to selectors at all, and even on healthy ones the
-    /// stream stops under grabs and at the pinned screen edge — the exact
-    /// moments the real position matters most. Polling reports the
-    /// server-side pointer state and is immune to both. Ordering is
-    /// identical to the event path: any raw motion accrued since the last
-    /// send is forwarded *first*, then the position is kept for the
-    /// beacon — the session applies deltas and re-anchors in that order.
-    fn poll_real_pointer(&mut self) {
-        let now = Instant::now();
-        if now.duration_since(self.real_poll_at) < REAL_POLL_PERIOD {
-            return;
-        }
-        self.real_poll_at = now;
-        let Ok(cookie) = self.conn.query_pointer(self.root) else { return };
-        let Ok(reply) = cookie.reply() else { return };
-        let (x, y) = (reply.root_x as i32, reply.root_y as i32);
-        if self.probe_last_real == Some((x, y)) {
-            // Unchanged since the last sample: no new beacon, and the
-            // motion flush below already ran on the last change.
-            return;
-        }
-        self.flush_motion();
-        self.probe_last_real = Some((x, y));
-        // The real position only means something while the local pointer
-        // is free; while remote it is grabbed and parked (or pinned by
-        // isolation), so its position would report the seam, not the
-        // user's intent.
-        if !self.grabbed {
-            self.beacon = Some((x, y));
         }
     }
 
@@ -411,8 +425,7 @@ impl InputCapture {
                 self.flush_motion();
                 let x = (e.root_x >> 16) as i32;
                 let y = (e.root_y >> 16) as i32;
-                self.probe_last_real = Some((x, y));
-                if !self.grabbed {
+                if !self.grabbed.load(Ordering::Relaxed) {
                     self.beacon = Some((x, y));
                 }
             }
@@ -424,7 +437,7 @@ impl InputCapture {
                     // escape hatch: it is consumed here and turned into a
                     // session-level "come home" signal instead of being
                     // forwarded.
-                    if self.grabbed && is_escape(key) {
+                    if self.grabbed.load(Ordering::Relaxed) && is_escape(key) {
                         log_info!("escape (Scroll Lock) pressed while remote — returning control home");
                         self.send(Message::Escape);
                         return;
@@ -438,7 +451,7 @@ impl InputCapture {
                     // Swallow the release of a consumed escape press too
                     // (see the press arm above). If the grab already
                     // released, the stray key-up goes nowhere.
-                    if self.grabbed && is_escape(key) {
+                    if self.grabbed.load(Ordering::Relaxed) && is_escape(key) {
                         return;
                     }
                     self.held.remove(&key);
@@ -491,10 +504,10 @@ impl InputCapture {
         // Local only: while the cursor is on a client the local pointer
         // is grabbed and pinned, and comparing against it would report a
         // bogus zero travel.
-        if self.grabbed || !self.probe.due() {
+        if self.grabbed.load(Ordering::Relaxed) || !self.probe.due() {
             return;
         }
-        let Some(real) = self.probe_last_real else { return };
+        let Some(real) = *self.real_pos.lock().unwrap() else { return };
         self.probe.sample(real, &mut |rx, ry, ax, ay, ex, ey, gx, gy| {
             log_trace!("motion req=({rx},{ry}) act=({ax},{ay}) exp=({ex},{ey}) real=({gx},{gy})");
         });
@@ -554,7 +567,7 @@ impl InputCapture {
     /// manager popup) is logged and tolerated: input still forwards, only
     /// the local-echo suppression is lost until the grab succeeds.
     fn set_grabbed(&mut self, grab: bool) {
-        if grab == self.grabbed {
+        if grab == self.grabbed.load(Ordering::Relaxed) {
             return;
         }
         let ok = if grab {
@@ -591,8 +604,8 @@ impl InputCapture {
             let _ = self.conn.flush();
             false
         };
-        self.grabbed = if grab { ok } else { false };
-        if self.grabbed {
+        self.grabbed.store(if grab { ok } else { false }, Ordering::Relaxed);
+        if self.grabbed.load(Ordering::Relaxed) {
             log_debug!("local input grabbed (cursor is on a client)");
         } else if !grab {
             log_debug!("local input released");

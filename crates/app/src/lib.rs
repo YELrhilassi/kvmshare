@@ -116,7 +116,10 @@ impl Config {
                 },
             })
             .collect();
-        Layout::new(screens)
+        // Normalize: snap near-adjacent screens into exact contact and
+        // align their perpendicular spans, so crossings land pixel-exact
+        // regardless of how the GUI's canvas positioned the screens.
+        Layout::new(screens).normalized()
     }
 
     /// A default two-machine config, handy for first runs and tests.

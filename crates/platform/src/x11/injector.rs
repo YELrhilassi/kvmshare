@@ -16,6 +16,50 @@ use kvmshare_protocol::message::{KeyKind, ScreenInfo};
 
 use super::buttons;
 
+/// The X11 clipboard, as the client's standalone [`Clipboard`] service
+/// (see the core trait docs for why the clipboard is split from the
+/// injector). Wraps `arboard`, the same backend the injector used.
+pub struct X11Clipboard {
+    clipboard: Option<arboard::Clipboard>,
+    /// Last clipboard content applied from the server; the poller skips
+    /// it so remote content is never echoed back.
+    last_remote: Option<(String, Vec<u8>)>,
+}
+
+impl X11Clipboard {
+    pub fn new(display: Option<&str>) -> Self {
+        // Remote sessions (SSH, a second X server) have no real
+        // clipboard; the None arm keeps the client fully functional for
+        // cursor/keyboard control there.
+        let clipboard = if display.is_none() { arboard::Clipboard::new().ok() } else { None };
+        Self { clipboard, last_remote: None }
+    }
+}
+
+impl kvmshare_core::client::Clipboard for X11Clipboard {
+    fn set(&mut self, mime: &str, data: &[u8]) {
+        if mime != "text/plain" {
+            log_warn!("clipboard: ignoring non-text mime {mime:?}");
+            return;
+        }
+        if let Some(cb) = &mut self.clipboard {
+            if let Ok(text) = std::str::from_utf8(data) {
+                if let Err(e) = cb.set_text(text.to_owned()) {
+                    log_warn!("clipboard: set failed: {e}");
+                }
+            }
+            self.last_remote = Some((mime.to_owned(), data.to_vec()));
+        }
+    }
+    fn get(&mut self) -> Option<(String, Vec<u8>)> {
+        let text = self.clipboard.as_mut()?.get_text().ok()?;
+        Some(("text/plain".into(), text.into_bytes()))
+    }
+    fn last_injected(&mut self) -> Option<(String, Vec<u8>)> {
+        self.last_remote.clone()
+    }
+}
+
 /// Core X event codes used by XTest's fake-input requests. (x11rb does
 /// not export these as constants, so they live here next to their use.)
 const KEY_PRESS: u8 = 2;
@@ -27,13 +71,9 @@ const BUTTON_RELEASE: u8 = 5;
 pub struct X11Injector {
     conn: RustConnection,
     root: xproto::Window,
-    clipboard: Option<arboard::Clipboard>,
     /// True while we are hiding the local cursor (between `enter` and
     /// `leave`). Lets `leave` only show the cursor if we hid it.
     cursor_hidden: bool,
-    /// Last clipboard content applied from the server; the clipboard
-    /// poller skips it so remote content is never echoed back.
-    last_remote: Option<(String, Vec<u8>)>,
     /// Keys (HID usages) injected as down and not yet released. `leave`
     /// releases everything still held — the server may never deliver the
     /// matching ups (the user crossed back mid-hold), and the desktop
@@ -54,13 +94,10 @@ impl X11Injector {
         }
         conn.xfixes_query_version(5, 0).map_err(|e| format!("XFixes version: {e}"))?;
 
-        let clipboard = if display.is_none() { arboard::Clipboard::new().ok() } else { None };
         Ok(Self {
             conn,
             root,
-            clipboard,
             cursor_hidden: false,
-            last_remote: None,
             keys_down: HashSet::new(),
             buttons_down: HashSet::new(),
         })
@@ -211,29 +248,17 @@ impl Injector for X11Injector {
         }
     }
 
-    fn clipboard(&mut self, mime: &str, data: &[u8]) {
-        if mime != "text/plain" {
-            log_warn!("clipboard: ignoring non-text mime {mime:?}");
-            return;
-        }
-        if let Some(cb) = &mut self.clipboard {
-            if let Ok(text) = std::str::from_utf8(data) {
-                if let Err(e) = cb.set_text(text.to_owned()) {
-                    log_warn!("clipboard: set failed: {e}");
-                }
-            }
-            self.last_remote = Some((mime.to_owned(), data.to_vec()));
+    fn emergency_release(&mut self) {
+        // The X11 client never silences local hardware (no grabs on the
+        // client side), so there is nothing to undo but a hidden cursor:
+        // make sure the user can always see their own pointer.
+        if self.cursor_hidden {
+            let _ = xfixes::show_cursor(&self.conn, self.root);
+            let _ = self.conn.flush();
+            self.cursor_hidden = false;
         }
     }
 
-    fn clipboard_get(&mut self) -> Option<(String, Vec<u8>)> {
-        let text = self.clipboard.as_mut()?.get_text().ok()?;
-        Some(("text/plain".into(), text.into_bytes()))
-    }
-
-    fn clipboard_last_injected(&mut self) -> Option<(String, Vec<u8>)> {
-        self.last_remote.clone()
-    }
 }
 
 #[cfg(test)]

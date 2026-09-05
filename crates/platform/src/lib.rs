@@ -22,7 +22,7 @@
 
 use std::sync::mpsc::Receiver;
 
-use kvmshare_core::client::Injector;
+use kvmshare_core::client::{Clipboard, Injector};
 use kvmshare_core::server::Engine;
 use kvmshare_protocol::message::Message;
 
@@ -68,8 +68,14 @@ pub fn server(display: Option<&str>) -> Result<(Receiver<Message>, Box<dyn Engin
     }
 }
 
-/// Build a client-side injector for the local machine.
-pub fn client(display: Option<&str>) -> Result<Box<dyn Injector>, String> {
+/// Build the client-side platform: an input injector and the standalone
+/// clipboard service. They are returned separately because the clipboard
+/// lives on its own lock and thread in the client — a clipboard call
+/// that stalls (another process holding the clipboard open) must never
+/// be able to freeze the cursor.
+pub fn client(
+    display: Option<&str>,
+) -> Result<(Box<dyn Injector>, Box<dyn Clipboard>), String> {
     #[cfg(target_os = "linux")]
     {
         x11::client_injector(display)

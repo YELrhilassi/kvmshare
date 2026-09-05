@@ -53,7 +53,14 @@ impl Server {
     }
 }
 
-/// The client-side X11 platform: an input injector.
-pub fn client_injector(display: Option<&str>) -> Result<Box<dyn Injector>, String> {
-    Ok(Box::new(injector::X11Injector::new(display)?))
+/// The client-side X11 platform: an input injector and the standalone
+/// clipboard service (see [`core::client::Clipboard`] for why the
+/// clipboard is split from the injector).
+pub fn client_injector(
+    display: Option<&str>,
+) -> Result<(Box<dyn Injector>, Box<dyn kvmshare_core::client::Clipboard>), String> {
+    Ok((
+        Box::new(injector::X11Injector::new(display)?),
+        Box::new(injector::X11Clipboard::new(display)),
+    ))
 }

@@ -149,6 +149,11 @@ impl Server {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let udp_port = listener.local_addr()?.port();
         let udp = Arc::new(UdpSocket::bind(("0.0.0.0", udp_port))?);
+        // Non-blocking sends: the writer thread must never stall the
+        // cursor stream on a full socket buffer (congestion, a slow
+        // peer). Motion is loss-tolerant — dropping a frame is always
+        // better than delaying the next hundred.
+        udp.set_nonblocking(true)?;
         Ok(Self {
             listener,
             udp,
@@ -476,9 +481,31 @@ fn udp_receiver(
                         continue;
                     }
                 }
-                let is_new = { addrs.lock().unwrap().insert(d.id, from).is_none() };
-                if is_new {
-                    log_debug!("client {} registered UDP stream from {from}", d.id);
+                // Learn or verify the datagram's source. The first
+                // datagram from a client teaches us its address; a
+                // datagram from a *different* address is either a stale
+                // frame from a previous session (still draining the
+                // socket buffer after a disconnect) or a fresh
+                // registration from a reconnect. Either way the old
+                // sequence space belongs to the old address — reset it
+                // and adopt the new source. Without this, a late frame
+                // from a dead session re-creates the seq tracker at its
+                // high value and every fresh beacon (starting at 1) is
+                // judged stale: the live session is deafened.
+                {
+                    let mut addrs = addrs.lock().unwrap();
+                    match addrs.get(&d.id) {
+                        None => {
+                            addrs.insert(d.id, from);
+                            log_debug!("client {} registered UDP stream from {from}", d.id);
+                        }
+                        Some(addr) if *addr != from => {
+                            seqs.lock().unwrap().remove(&d.id);
+                            addrs.insert(d.id, from);
+                            log_debug!("client {} re-registered UDP stream from {from}", d.id);
+                        }
+                        Some(_) => {}
+                    }
                 }
                 match d.msg {
                     Message::CursorPos { x, y } => {
@@ -515,9 +542,18 @@ fn udp_receiver(
                     _ => {}
                 }
             }
+            // Non-blocking socket: WouldBlock is the normal idle state,
+            // not an error — yield briefly and check again. The sleep is
+            // kept short so a beacon parked at a wall is answered within
+            // ~1 ms (crossing latency is invisible at that scale) while
+            // the thread still yields the CPU when nothing is flowing.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                log_trace!("udp receiver idle");
+                thread::sleep(Duration::from_millis(1));
+            }
             Err(e) => {
                 log_warn!("udp receiver: {e}");
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -635,28 +671,6 @@ impl Client {
                     // peers, transport fallbacks).
                     Message::CursorPos { x, y } => {
                         session2.lock().unwrap().on_remote_beacon(c2.id, x, y);
-                    }
-                    Message::InputBlocked => {
-                        // The client's OS is dropping our injected input
-                        // (on Windows: an elevated or input-isolated
-                        // window — UAC prompt, on-screen keyboard, an
-                        // admin tool — swallows SendInput). The cursor is
-                        // frozen there and the local grab would keep the
-                        // keyboard from the user, so bring control home.
-                        let was_active = *active2.lock().unwrap() == Some(c2.id);
-                        if !was_active {
-                            continue;
-                        }
-                        log_warn!(
-                            "{}: local input blocked (elevated window?) — returning control home",
-                            c2.name
-                        );
-                        let action = session2.lock().unwrap().force_local();
-                        if let Action::SwitchToLocal { .. } = action {
-                            if let Ok(mut engine) = engine2.lock() {
-                                let _ = apply_action(action, &active2, &clients2, &mut engine);
-                            }
-                        }
                     }
                     _ => {}
                 }

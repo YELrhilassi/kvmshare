@@ -212,11 +212,6 @@ pub enum Message {
     Clipboard { mime: String, data: Vec<u8> },
     KeepAlive,
     Error { code: u8, text: String },
-    /// Client → server: local input injection is being dropped (an
-    /// elevated or input-isolated window — UAC prompt, on-screen
-    /// keyboard, admin tool — swallows SendInput). The server should
-    /// bring control home so the user is not trapped.
-    InputBlocked,
     /// Local only, never serialized to a peer: the user pressed the
     /// escape key (e.g. Scroll Lock) while the cursor was on a client
     /// and wants control back on the server machine now. The capture
@@ -243,7 +238,6 @@ impl Message {
             Message::Clipboard { .. } => types::CLIPBOARD,
             Message::KeepAlive => types::KEEPALIVE,
             Message::Error { .. } => types::ERROR,
-            Message::InputBlocked => types::INPUT_BLOCKED,
             Message::Escape => types::ESCAPE,
         }
     }
@@ -304,7 +298,6 @@ impl Message {
                 w.put_u8(*code);
                 w.put_str(text);
             }
-            Message::InputBlocked => {}
             Message::Escape => {}
         }
         Frame::new(self.msg_type(), w.finish())
@@ -352,7 +345,6 @@ impl Message {
             }
             types::KEEPALIVE => Message::KeepAlive,
             types::ERROR => Message::Error { code: r.get_u8()?, text: r.get_str()?.to_owned() },
-            types::INPUT_BLOCKED => Message::InputBlocked,
             types::ESCAPE => Message::Escape,
             _other => return Err(WireError { what: "unknown message type" }),
         };
@@ -439,7 +431,6 @@ mod tests {
     fn keepalive_and_error_roundtrip() {
         roundtrip(Message::KeepAlive);
         roundtrip(Message::Error { code: errors::PROTOCOL, text: "nope".into() });
-        roundtrip(Message::InputBlocked);
         roundtrip(Message::Escape);
     }
 
