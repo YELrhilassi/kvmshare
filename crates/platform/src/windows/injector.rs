@@ -72,6 +72,22 @@ impl Win32Injector {
         }
     }
 
+    /// Restore the machine to its users: undo the hardware silence and
+    /// show the cursor again. Runs on whatever thread is dropping the
+    /// injector — which is the session thread that hid the cursor — so
+    /// the `ShowCursor` count balances exactly. Idempotent; safe to call
+    /// when the machine was never isolated.
+    fn restore_machine(&mut self) {
+        self.isolation.set_isolating(false);
+        if self.cursor_hidden {
+            // SAFETY: balances the ShowCursor(0) in `enter`.
+            unsafe {
+                wm::ShowCursor(1);
+            }
+            self.cursor_hidden = false;
+        }
+    }
+
     /// Inject one event. A rejected event (`SendInput` returns 0) is
     /// logged; the cursor itself is steered by `SetCursorPos`, which is
     /// not subject to the input-isolation rules that can swallow
@@ -186,16 +202,16 @@ impl Injector for Win32Injector {
         // users: undo the hardware silence (the isolation gate) and show
         // the cursor again. Both are idempotent and cannot fail.
         use kvmshare_log::log_warn;
-        self.isolation.set_isolating(false);
-        if self.cursor_hidden {
-            // SAFETY: ShowCursor(1) restores the display count we
-            // decremented at enter.
-            unsafe {
-                wm::ShowCursor(1);
-            }
-            self.cursor_hidden = false;
-        }
+        self.restore_machine();
         log_warn!("injector: local input restored after a client stall");
+    }
+
+    fn system_resumed(&mut self) -> bool {
+        // Read once per session: the isolation pump marks the resume;
+        // the run loop sees it, ends the session, and the reconnect
+        // starts fresh and local. The clear (inside `take_resumed`)
+        // keeps a new session from inheriting a stale resume.
+        super::isolation::take_resumed()
     }
 
     fn cursor_position(&mut self) -> (i32, i32) {
@@ -324,6 +340,17 @@ impl Injector for Win32Injector {
 /// open) can never freeze the cursor.
 pub struct Win32Clipboard {
     inner: crate::windows::clipboard::Clipboard,
+}
+
+/// A session ended without `leave` (disconnect, sleep resume, wedge):
+/// the machine must never be left input-dead or cursor-invisible. Runs
+/// on the session thread that hid the cursor, so the `ShowCursor` count
+/// balances exactly. The isolation gate is a process static, so this
+/// also covers injectors that never entered.
+impl Drop for Win32Injector {
+    fn drop(&mut self) {
+        self.restore_machine();
+    }
 }
 
 impl Win32Clipboard {

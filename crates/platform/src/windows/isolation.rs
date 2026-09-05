@@ -58,6 +58,7 @@ use std::thread::{self, JoinHandle};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Power as power;
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
 /// A window handle is a raw pointer, so it is not [`Send`] by default —
@@ -76,6 +77,27 @@ use kvmshare_log::{log_error, log_info, log_warn};
 /// on `enter`/`leave`. A single client injector per process makes a
 /// static the honest shape for this state.
 static ISOLATE: AtomicBool = AtomicBool::new(false);
+
+/// Set when Windows reports this machine resuming from sleep. A resume
+/// invalidates the remote-control state (the pre-sleep "cursor on this
+/// machine, hardware silenced, cursor hidden" is stale), so the client
+/// run loop reads this once per session (via the injector) and ends the
+/// session — the reconnect starts fresh and local. See
+/// [`core::client::Injector::system_resumed`].
+static RESUMED: AtomicBool = AtomicBool::new(false);
+
+/// Mark that the machine resumed from sleep. Called by the pump thread
+/// when Windows reports the resume.
+pub fn mark_resumed() {
+    RESUMED.store(true, Ordering::SeqCst);
+}
+
+/// Read-and-clear the resume notice. The client run loop calls this once
+/// per session; the clear keeps a fresh session from inheriting a stale
+/// resume from a previous one.
+pub fn take_resumed() -> bool {
+    RESUMED.swap(false, Ordering::SeqCst)
+}
 
 /// The liveness heartbeat (ms since boot): bumped by the injector on
 /// every motion tick while this machine is controlled. The watchdog
@@ -211,6 +233,30 @@ impl NativeIsolation {
         }
     }
 
+    /// Handle a power broadcast on the pump thread. A resume (the machine
+    /// waking from sleep) is the one event the watchdog cannot catch
+    /// promptly — the process was suspended with it — so on resume the
+    /// input gate is released immediately and the session is told to end
+    /// (via [`mark_resumed`]).
+    fn on_power_event(event: u32) {
+        match event {
+            wm::PBT_APMRESUMEAUTOMATIC | wm::PBT_APMRESUMESUSPEND => {
+                log_warn!("system resumed from sleep — releasing local input so this machine is never left trapped");
+                // The pre-sleep control state is stale: release the gate
+                // now (the watchdog would take ~2 s) and show the cursor
+                // (best effort; the injector's own restore balances the
+                // count exactly when the session ends).
+                ISOLATE.store(false, Ordering::SeqCst);
+                mark_resumed();
+                // SAFETY: ShowCursor is a trivial user32 call.
+                unsafe {
+                    wm::ShowCursor(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The pump thread's body: a hidden message-only window, both hooks
     /// installed, then a message loop. Low-level hook procedures run on
     /// the installing thread, so this thread must keep pumping for the
@@ -263,6 +309,19 @@ impl NativeIsolation {
         unsafe {
             wm::SetTimer(hwnd, 1, WATCHDOG_PERIOD_MS, None);
         }
+        // Register for suspend/resume notifications (delivered to this
+        // window as WM_POWERBROADCAST). Sleep is the one event the
+        // watchdog cannot see in time: the process itself suspends, so
+        // on resume the pre-sleep control state (cursor on this machine,
+        // hardware silenced, cursor hidden) is stale — the session must
+        // end so the machine returns to its user. Best effort: without
+        // the registration the watchdog still releases the input gate
+        // ~2 s after resume via the stale-steering check.
+        // SAFETY: RegisterSuspendResumeNotification takes an HWND and
+        // returns a handle to keep; both are opaque values here.
+        let power_notify = unsafe {
+            power::RegisterSuspendResumeNotification(hwnd as _, wm::DEVICE_NOTIFY_WINDOW_HANDLE)
+        };
 
         // Pump until the owner posts QUIT_MSG. WM_TIMER wakes the loop
         // for the watchdog; everything else is discarded (nothing
@@ -283,6 +342,16 @@ impl NativeIsolation {
                 if msg.message == wm::WM_TIMER {
                     Self::watchdog();
                 }
+                if msg.message == wm::WM_POWERBROADCAST {
+                    Self::on_power_event(msg.wParam as u32);
+                }
+            }
+        }
+        // SAFETY: unregistering the power notification if we got one
+        // (HPOWERNOTIFY is 0 on failure).
+        unsafe {
+            if power_notify != 0 {
+                power::UnregisterSuspendResumeNotification(power_notify);
             }
         }
         // SAFETY: unhooking the handles this thread installed, then

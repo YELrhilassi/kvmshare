@@ -126,6 +126,17 @@ pub trait Injector: Send {
     /// Default: nothing (backends without hardware silencing need
     /// nothing to undo).
     fn emergency_release(&mut self) {}
+    /// Whether the OS reported this machine resuming from sleep since
+    /// the session started. A resume invalidates the remote-control
+    /// state by definition (the user is wherever they are; the
+    /// pre-sleep "cursor on this machine" state cannot be trusted), so
+    /// the client ends the session and reconnects — a clean, local
+    /// start instead of a machine left with its input silenced and its
+    /// cursor hidden. Read once per session (the backend clears it).
+    /// Default: never.
+    fn system_resumed(&mut self) -> bool {
+        false
+    }
 }
 
 /// Clipboard access, split from [`Injector`] **on purpose**: reading or
@@ -377,6 +388,16 @@ impl Client {
             // timeout bounds this loop's wake so the request is seen
             // within ~100 ms even when the link is silent.
             if shared.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            // The machine just woke from sleep: the pre-sleep control
+            // state (cursor on this machine, hardware silenced, cursor
+            // hidden) is stale — end the session so this machine returns
+            // to its user and the reconnect starts fresh and local.
+            // (The platform backend clears the flag; a healthy session
+            // never sees it.)
+            if shared.injector.lock().unwrap().system_resumed() {
+                log_warn!("system resumed (sleep/wake) — ending the session so this machine returns to local control");
                 break;
             }
             match transport.recv()? {

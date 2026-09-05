@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use kvmshare_log::{log_debug, log_error, log_info, log_trace, log_warn};
 use kvmshare_protocol::id::errors;
@@ -131,6 +131,18 @@ pub struct Liveness {
     /// platform creates and owns the thread that writes it.
     pub capture_tick_ms: Arc<AtomicU64>,
 }
+
+/// Read timeout on each client's TCP control channel. The client sends
+/// a keepalive every 2 s, so this window only paces the reader — it does
+/// not drop anyone.
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// A client silent for longer than this is gone (asleep, wedged, or
+/// dead — TCP alone often survives sleep and crashes, so without a
+/// liveness timeout the session would believe a dead machine still has
+/// the cursor and keep this machine's input isolated and its cursor
+/// hidden after the client's next resume). The keepalive cadence is
+/// 2 s; this is five missed keepalives.
+const CLIENT_SILENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the supervisor wakes to check the heartbeats.
 const SUPERVISOR_POLL: Duration = Duration::from_millis(500);
@@ -709,7 +721,10 @@ impl Client {
         addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
         seqs: Arc<Mutex<HashMap<u8, u32>>>,
     ) -> io::Result<()> {
-        let mut transport = Transport::new(stream)?;
+        // Timed reads: a client that stops sending (sleep, wedge, crash)
+        // must be noticed and dropped so the session returns home — see
+        // [`CLIENT_SILENT_TIMEOUT`].
+        let mut transport = Transport::with_read_timeout(stream, Some(CLIENT_READ_TIMEOUT))?;
 
         // 1. Handshake: expect Hello with a matching protocol version.
         let (name, info) = match transport.recv()? {
@@ -780,10 +795,26 @@ impl Client {
         let engine2 = engine.clone();
         let clipboard2 = clipboard.clone();
         thread::spawn(move || {
+            let mut last_seen = Instant::now();
             loop {
                 let msg = match reader.recv() {
-                    Ok(RecvResult::Msg(msg)) => msg,
-                    Ok(RecvResult::NoData) => continue,
+                    Ok(RecvResult::Msg(msg)) => {
+                        last_seen = Instant::now();
+                        msg
+                    }
+                    Ok(RecvResult::NoData) => {
+                        // Silence within the read window. Keepalives land
+                        // every 2 s; a silence far beyond that means the
+                        // client is not coming back (it slept through its
+                        // keepalives, wedged, or died) — drop it so the
+                        // session returns home instead of believing a
+                        // dead machine still has the cursor.
+                        if last_seen.elapsed() > CLIENT_SILENT_TIMEOUT {
+                            log_debug!("client {}: silent for {CLIENT_SILENT_TIMEOUT:?} — dropping", c2.name);
+                            break;
+                        }
+                        continue;
+                    }
                     Ok(RecvResult::Eof) | Err(_) => break,
                 };
                 match msg {
