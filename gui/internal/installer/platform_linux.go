@@ -85,6 +85,7 @@ func integrateDesktop(dir string) error {
 	return EnsureInputAccess()
 }
 
+
 // ensureInputAccess is the --input-access entry point and the post-install
 // step. Grant-only-if-missing, self-elevating: installs, updates, GUI
 // startups and `make install` may call it unconditionally — it stays
@@ -95,7 +96,7 @@ func integrateDesktop(dir string) error {
 // the devices as the real user; as root (the pkexec re-exec) it inspects
 // node ownership against the elevating user, because root can open
 // anything and an open-based probe would always answer "granted".
-func EnsureInputAccess() error {
+func ensureInputAccess() error {
 	if os.Geteuid() == 0 {
 		u, err := elevatingUser()
 		if err != nil {

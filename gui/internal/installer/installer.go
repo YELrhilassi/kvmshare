@@ -48,6 +48,13 @@ func logf(fn func(string, ...any), format string, args ...any) {
 	}
 }
 
+// EnsureInputAccess grants the desktop user access to the physical input
+// devices (Linux: a udev rule applied via pkexec; grant-only-if-missing so
+// it is safe to call unconditionally). A no-op on other platforms.
+func EnsureInputAccess() error {
+	return ensureInputAccess()
+}
+
 func phasef(fn func(string, float64), label string, p float64) {
 	if fn != nil {
 		fn(label, p)
