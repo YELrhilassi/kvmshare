@@ -62,6 +62,11 @@ func main() {
 	// prompt, never again after. Runs in the background.
 	core.ensureInputAccess()
 
+	// UAC prompts must be answerable with the shared mouse/keyboard
+	// (Windows): the elevated GUI moves them to the normal desktop once,
+	// and the uninstall restores the original policy.
+	core.ensureUacAnswerable()
+
 	assets, err := fs.Sub(dist, "frontend/dist")
 	if err != nil {
 		log.Fatalf("kvmshare: embedded frontend: %v", err)

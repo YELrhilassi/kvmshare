@@ -86,6 +86,19 @@ func integrateDesktop(dir string) error {
 }
 
 
+// IsElevated reports whether this process can write privileged system
+// locations (root). The Linux uninstall already falls back gracefully
+// without it, so this only drives Windows' self-elevation; Linux keeps
+// its existing best-effort behavior.
+func IsElevated() bool {
+	return os.Geteuid() == 0
+}
+
+// SelfElevate is a no-op on Linux: the uninstall keeps its existing
+// behavior (user files always removed; the udev rule removed when run
+// with privileges).
+func SelfElevate([]string) error { return nil }
+
 // ensureInputAccess is the --input-access entry point and the post-install
 // step. Grant-only-if-missing, self-elevating: installs, updates, GUI
 // startups and `make install` may call it unconditionally — it stays

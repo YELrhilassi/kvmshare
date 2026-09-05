@@ -51,6 +51,16 @@ func main() {
 	}
 
 	if *uninstall {
+		// On Windows the uninstall restores the UAC prompt policy (an
+		// HKLM write), so the whole uninstall re-runs elevated — one
+		// consent prompt, exactly like installing. Other platforms have
+		// no privileged step and run in place.
+		if !installer.IsElevated() {
+			if err := installer.SelfElevate([]string{"--uninstall"}); err != nil {
+				fatal(err)
+			}
+			return
+		}
 		if err := installer.Uninstall(printf); err != nil {
 			fatal(err)
 		}

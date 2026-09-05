@@ -6,6 +6,11 @@ package installer
 // no-ops. Windows is handled by integrate_windows.go, Linux (input-device
 // access) by integrate_linux.go.
 
+// IsElevated and SelfElevate: no elevation concept needed on platforms
+// with no privileged steps; the uninstall simply removes the user files.
+func IsElevated() bool { return true }
+func SelfElevate([]string) error { return nil }
+
 import "fmt"
 
 // integrateDesktop is a no-op outside Windows/Linux.

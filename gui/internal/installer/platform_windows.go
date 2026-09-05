@@ -17,6 +17,7 @@ import (
 	"strings"
 	"unicode/utf16"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
 	"kvmshare/gui/internal/selfupdate"
@@ -51,6 +52,150 @@ func removeDesktopIntegration(dir string) error {
 	removeShortcuts()
 	_ = registry.DeleteKey(registry.CURRENT_USER, uninstallKey)
 	_ = os.Remove(filepath.Join(dir, icoName))
+	// Put the UAC prompt policy back the way it was before kvmshare
+	// moved it to the normal desktop (best-effort: nothing to restore
+	// when kvmshare never changed it).
+	if err := restoreUacPolicy(); err != nil {
+		return fmt.Errorf("restore UAC policy: %w", err)
+	}
+	return nil
+}
+
+// IsElevated reports whether this process runs with an elevated token
+// (needed to write HKLM — the UAC policy lives there).
+func IsElevated() bool {
+	return windows.GetCurrentProcessToken().IsElevated()
+}
+
+// SelfElevate re-runs this binary elevated (one UAC consent prompt) and
+// waits for it to finish. Used by --uninstall so the UAC policy restore
+// (HKLM) always succeeds, mirroring how the Linux side re-executes
+// itself through pkexec for privileged steps.
+func SelfElevate(args []string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = "'" + strings.ReplaceAll(a, "'", "''") + "'"
+	}
+	script := fmt.Sprintf(
+		"Start-Process -FilePath '%s' -ArgumentList %s -Verb RunAs -Wait",
+		strings.ReplaceAll(exe, "'", "''"),
+		strings.Join(quoted, ","),
+	)
+	return runPS(script)
+}
+
+// UAC consent prompts normally appear on the Winlogon secure desktop — a
+// protected desktop that **no** process can inject input into, not even
+// an elevated one. A KVM machine whose only mouse and keyboard is the
+// shared stream therefore cannot answer them. The standard fix (used by
+// Barrier, TeamViewer and other remote-control tools) is to make prompts
+// appear on the normal desktop instead: there consent.exe runs at the
+// same integrity level as the elevated client, so SendInput reaches it
+// and the shared cursor can click Yes / type credentials.
+//
+// This writes `PromptOnSecureDesktop = 0` (HKLM, the GUI that calls it
+// is elevated) and remembers the previous value under kvmshare's own
+// registry key so `--uninstall` can restore it exactly.
+const (
+	// The policy that decides where UAC consent prompts appear.
+	uacPoliciesKey = `SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`
+	// Where kvmshare remembers the value it replaced, for uninstall.
+	uacPrevKey = `SOFTWARE\kvmshare`
+	// The value names under uacPrevKey: the old PromptOnSecureDesktop
+	// value, and whether it existed at all (absent means the default
+	// "secure desktop on", restored by deleting the value).
+	uacPrevValue    = "PromptOnSecureDesktopPrev"
+	uacPrevExisted  = "PromptOnSecureDesktopExisted"
+	uacPolicyValue  = "PromptOnSecureDesktop"
+)
+
+// EnsureUacAnswerable makes UAC prompts answerable by the shared input.
+// Idempotent: once the policy is already 0, nothing happens. Best-effort
+// contract for callers — failures are logged, never fatal; without it
+// the client's desktop watchdog still releases local input as a safety
+// net, the prompt just cannot be answered remotely.
+func EnsureUacAnswerable() error {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, uacPoliciesKey, registry.QUERY_VALUE)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", uacPoliciesKey, err)
+	}
+	cur, _, qerr := k.GetIntegerValue(uacPolicyValue)
+	k.Close()
+	if qerr == nil && cur == 0 {
+		return nil // already on the normal desktop — nothing to do
+	}
+	// Remember what to restore: the previous value, or 1 (the default
+	// when absent — deleting the value restores that default).
+	prev := uint64(1)
+	existed := false
+	if qerr == nil {
+		prev = cur
+		existed = true
+	}
+	if err := rememberUacPrev(prev, existed); err != nil {
+		return err
+	}
+	wk, err := registry.OpenKey(registry.LOCAL_MACHINE, uacPoliciesKey, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("open %s for write: %w", uacPoliciesKey, err)
+	}
+	defer wk.Close()
+	return wk.SetDWordValue(uacPolicyValue, 0)
+}
+
+func rememberUacPrev(prev uint64, existed bool) error {
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, uacPrevKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	// PromptOnSecureDesktop is a DWORD; its range is 0/1 so a DWORD
+	// always holds the previous value.
+	if err := k.SetDWordValue(uacPrevValue, uint32(prev)); err != nil {
+		return err
+	}
+	ex := uint32(0)
+	if existed {
+		ex = 1
+	}
+	return k.SetDWordValue(uacPrevExisted, ex)
+}
+
+// restoreUacPolicy undoes EnsureUacAnswerable: the policy returns to the
+// value kvmshare found (or is deleted when it never existed), and the
+// memory key is dropped. No-op when kvmshare never changed the policy.
+func restoreUacPolicy() error {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, uacPrevKey, registry.QUERY_VALUE)
+	if err != nil {
+		if err == registry.ErrNotExist {
+			return nil // kvmshare never changed it (or already restored)
+		}
+		return err
+	}
+	prev, _, err := k.GetIntegerValue(uacPrevValue)
+	existed, _, _ := k.GetIntegerValue(uacPrevExisted)
+	k.Close()
+	if err != nil {
+		return err
+	}
+
+	pk, err := registry.OpenKey(registry.LOCAL_MACHINE, uacPoliciesKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer pk.Close()
+	if existed != 0 {
+		if err := pk.SetDWordValue(uacPolicyValue, uint32(prev)); err != nil {
+			return err
+		}
+	} else if err := pk.DeleteValue(uacPolicyValue); err != nil && err != registry.ErrNotExist {
+		return err
+	}
+	_ = registry.DeleteKey(registry.LOCAL_MACHINE, uacPrevKey)
 	return nil
 }
 
