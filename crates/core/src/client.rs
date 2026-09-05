@@ -166,6 +166,11 @@ const CURSOR_BEACON_INTERVAL: Duration = Duration::from_millis(8);
 /// and wakes at this cadence when idle (to notice shutdown). Frames
 /// themselves wake it immediately — this is not a poll.
 const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(8);
+/// How often the sync thread re-checks the display geometry (rare
+/// event; the poll exists so a resolution change is noticed without
+/// restarting). Kept long so this thread rarely touches the injector
+/// lock — a display query must never contend with cursor placement.
+const SCREEN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Consecutive 100 ms probe windows where the cursor was commanded to
 /// move but did not (away from a screen edge) before the client treats
 /// injected input as blocked and recovers. ~600 ms: long enough that a
@@ -612,6 +617,10 @@ fn motion_loop(shared: Arc<Shared>, own_id: u8) {
             } else if let Some((dx, dy)) = m.follower.correct((rx, ry)) {
                 inj.move_rel(dx, dy);
             }
+            // Telemetry is collected under the locks but logged only
+            // after they are released — a slow log sink must never hold
+            // up the next placement.
+            let mut trace_line: Option<String> = None;
             if m.probe.due() {
                 let (ex, ey) = m.follower.error((rx, ry));
                 let (frames, ticks) = (m.frames_win, m.ticks_win);
@@ -650,13 +659,16 @@ fn motion_loop(shared: Arc<Shared>, own_id: u8) {
                     }
                 }
                 m.probe.sample((rx, ry), &mut |rx, ry, ax, ay, _exp_x, _exp_y, gx, gy| {
-                    log_trace!(
+                    trace_line = Some(format!(
                         "motion req=({rx},{ry}) act=({ax},{ay}) err=({ex},{ey}) real=({gx},{gy}) frames={frames} ticks={ticks}"
-                    );
+                    ));
                 });
             }
             drop(m);
             drop(inj);
+            if let Some(line) = trace_line {
+                log_trace!("{line}");
+            }
             if last_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
                 last_beacon = Instant::now();
                 if let Err(e) = send_beacon(&shared, own_id, rx, ry) {
@@ -710,15 +722,22 @@ fn udp_loop(shared: Arc<Shared>, own_id: u8) {
 /// channel, which sends them on its next wake.
 fn sync_loop(shared: Arc<Shared>, tx: Sender<Message>) {
     let mut last_info = shared.injector.lock().unwrap().screen_info();
+    let mut last_screen_check = Instant::now();
     let mut last_clip_check = Instant::now();
     let mut last_clip_seen: Option<(String, Vec<u8>)> = None;
     while !shared.stop.load(Ordering::Relaxed) {
-        // Resolution changes are noticed at a slow cadence; a monitor
-        // query is a couple of cheap syscalls.
-        let info = shared.injector.lock().unwrap().screen_info();
-        if info != last_info {
-            let _ = tx.send(Message::ScreenInfo { info });
-            last_info = info;
+        // Resolution changes are rare. A monitor query every
+        // SCREEN_POLL_INTERVAL is plenty, and it keeps this thread off
+        // the injector lock almost all the time — a display query (which
+        // can stall on a busy driver) must never serialize with the
+        // motion thread's placements.
+        if last_screen_check.elapsed() >= SCREEN_POLL_INTERVAL {
+            last_screen_check = Instant::now();
+            let info = shared.injector.lock().unwrap().screen_info();
+            if info != last_info {
+                let _ = tx.send(Message::ScreenInfo { info });
+                last_info = info;
+            }
         }
         // Push local clipboard changes up to the server. This read is the
         // one call that can legitimately stall (another process holding

@@ -29,6 +29,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -79,6 +80,15 @@ static COMPONENT: OnceLock<String> = OnceLock::new();
 /// The control file currently being watched (re-targetable: a later
 /// [`init`] with a different path points the watcher at it).
 static CONTROL: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// The outbound log queue. Every line is pushed here by [`write_line`]
+/// and drained by a single dedicated writer thread, so **no caller ever
+/// blocks on log I/O**: a slow disk, antivirus scanning a growing log
+/// file, or a wedged stderr pipe delays only the writer, never the
+/// cursor-steering or input threads that emit the lines. The queue is
+/// bounded and drops the newest line when full, so a stuck writer can
+/// never grow memory without limit — losing a few log lines under
+/// extreme backpressure is the right trade against freezing a cursor.
+static SINK: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
 
 /// How often the control file is re-read. Cheap (one tiny file), and
 /// 400 ms keeps level changes feeling instant.
@@ -130,8 +140,41 @@ pub fn set_enabled(on: bool) {
     *ENABLED.lock().unwrap() = on;
 }
 
+/// Spawn the writer thread on first use and return its queue handle.
+/// The thread captures stderr for its whole life, so the handle the
+/// process was launched with (a file, a pipe, a console) is preserved.
+fn sink() -> Option<mpsc::SyncSender<String>> {
+    if let Some(tx) = SINK.get() {
+        return Some(tx.clone());
+    }
+    let (tx, rx) = mpsc::sync_channel(16_384);
+    match SINK.set(tx.clone()) {
+        Ok(()) => {
+            std::thread::Builder::new()
+                .name("kvmshare-log-writer".into())
+                .spawn(move || {
+                    while let Ok(line) = rx.recv() {
+                        // The lock is taken per line, never held across
+                        // the loop: the writer thread is the only regular
+                        // writer, but other stderr users (panics,
+                        // eprintln) must never deadlock on it.
+                        let mut out = std::io::stderr().lock();
+                        let _ = writeln!(out, "{line}");
+                    }
+                })
+                .ok();
+        }
+        // Another thread won the race and installed its own channel.
+        Err(_) => {}
+    }
+    Some(tx)
+}
+
 /// Emit one line if logging is enabled and `lvl` is within the current
 /// level. Exposed for the macros below.
+///
+/// The caller only ever formats the line and pushes it onto the queue
+/// (microseconds, never blocking); the writer thread owns all I/O.
 pub fn write_line(lvl: Level, args: std::fmt::Arguments<'_>) {
     if !enabled() || lvl > level() {
         return;
@@ -143,8 +186,12 @@ pub fn write_line(lvl: Level, args: std::fmt::Arguments<'_>) {
     let (h, m, s) = ((ms / 3600_000) % 24, (ms / 60_000) % 60, (ms / 1000) % 60);
     let ms = ms % 1000;
     let component = COMPONENT.get().map(String::as_str).unwrap_or("kvmshare");
-    let mut out = std::io::stderr().lock();
-    let _ = writeln!(out, "{h:02}:{m:02}:{s:02}.{ms:03} {} {component}: {}", lvl.label(), args);
+    let line = format!("{h:02}:{m:02}:{s:02}.{ms:03} {} {component}: {}", lvl.label(), args);
+    // The channel is bounded; a full queue drops the line rather than
+    // blocking the caller (see [`SINK`]).
+    if let Some(tx) = sink() {
+        let _ = tx.try_send(line);
+    }
 }
 
 /// `log_error!`, `log_warn!`, `log_info!`, `log_debug!`, `log_trace!` —
