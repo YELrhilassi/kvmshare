@@ -92,6 +92,22 @@ impl Transport {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
                     return Ok(RecvResult::NoData);
                 }
+                // A reset is not an error to the peer — it means the peer
+                // is gone (its socket closed with data in flight, or the
+                // OS tore the connection down). The session outcome is
+                // the same as a clean EOF: nothing more will arrive.
+                // Treating it as `Eof` keeps the client's reconnect loop
+                // quiet (no spurious "session ended: connection reset")
+                // and the server's per-client teardown identical for
+                // abrupt and graceful disconnects.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    return Ok(RecvResult::Eof);
+                }
                 Err(e) => return Err(e),
             };
             self.read_buf.extend_from_slice(&scratch[..n]);

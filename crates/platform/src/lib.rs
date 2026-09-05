@@ -68,6 +68,32 @@ pub fn server(display: Option<&str>) -> Result<(Receiver<Message>, Box<dyn Engin
     }
 }
 
+/// Raise this process's scheduling priority above ordinary apps.
+///
+/// A kvmshare role owns the user's cursor: its motion loop wakes every
+/// few milliseconds and every recovery watchdog depends on being
+/// scheduled. At normal priority a busy app can starve it for seconds;
+/// at the priority Task Scheduler launches processes with (BelowNormal
+/// on some configurations) it is starved constantly — the exact failure
+/// behind "the cursor freezes whenever I click or start something on the
+/// client". High priority (not realtime — that could stall the whole
+/// machine) keeps the motion and watchdog threads scheduled without
+/// risking the OS. Best effort everywhere: failing is never fatal.
+#[allow(dead_code)]
+pub fn raise_priority() {
+    #[cfg(target_os = "windows")]
+    windows::raise_priority();
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: setpriority(PRIO_PROCESS, 0, …) targets this process.
+        // Negative niceness needs privilege; as an unprivileged user it
+        // fails harmlessly and the process keeps its normal class.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, -10);
+        }
+    }
+}
+
 /// Build the client-side platform: an input injector and the standalone
 /// clipboard service. They are returned separately because the clipboard
 /// lives on its own lock and thread in the client — a clipboard call

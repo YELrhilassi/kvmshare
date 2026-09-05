@@ -14,6 +14,7 @@ kvmshare-log = { workspace = true }
 x11rb = { version = "0.13", features = ["allow-unsafe-code", "xinput", "xfixes", "xtest"] }
 arboard = "3.4"
 evdev = "0.13"
+libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 # Raw Input lives directly in `Win32_UI_Input` (no separate
 # Win32_UI_Input_RawInput feature); the RI_MOUSE_*/RI_KEY_* constants
@@ -25,6 +26,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
+  "Win32_System_Threading", # SetPriorityClass — a KVM role must outrank busy apps
   "Win32_UI_HiDpi",
   "Win32_UI_Input",
   "Win32_UI_Input_KeyboardAndMouse",

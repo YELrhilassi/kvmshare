@@ -30,6 +30,9 @@ fn run() -> Result<(), String> {
         &args.log_level.unwrap_or_else(kvmshare_log::level_from_env_or_default),
         args.log_ctl,
     )?;
+    // This role drives the user's cursor on a millisecond cadence; it
+    // must be scheduled above whatever else the machine is doing.
+    kvmshare_platform::raise_priority();
 
     // One role per machine, enforced at the OS level: refuse to start if
     // a client is running here, and hold our own lock for the process

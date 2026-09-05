@@ -33,6 +33,19 @@ use kvmshare_core::client::Injector;
 use kvmshare_core::server::Engine;
 use kvmshare_protocol::message::Message;
 
+/// Raise this process above ordinary applications (see the docs on
+/// [`crate::raise_priority`]). Called on both server and client start;
+/// idempotent and best-effort.
+pub fn raise_priority() {
+    use windows_sys::Win32::System::Threading as thr;
+    // SAFETY: GetCurrentProcess returns the process's pseudo-handle;
+    // HIGH_PRIORITY_CLASS (not realtime) keeps our millisecond-paced
+    // loops scheduled ahead of busy apps without risking the machine.
+    unsafe {
+        let _ = thr::SetPriorityClass(thr::GetCurrentProcess(), thr::HIGH_PRIORITY_CLASS);
+    }
+}
+
 /// Make the process per-monitor DPI aware. Idempotent and process-wide;
 /// called on both server and client start so all coordinates are
 /// physical pixels. Failing is not fatal (older systems fall back to
@@ -58,6 +71,7 @@ impl Server {
     /// Start raw-input capture and build the engine. `display` is
     /// meaningless on Windows and ignored (kept for a uniform signature).
     pub fn start(_display: Option<&str>) -> Result<Self, String> {
+        raise_priority();
         set_dpi_aware();
         // 1 ms timer resolution: the capture and session loops are paced
         // in milliseconds, and Windows' coarse default timer would turn
@@ -75,6 +89,7 @@ impl Server {
 pub fn client_injector(
     _display: Option<&str>,
 ) -> Result<(Box<dyn Injector>, Box<dyn kvmshare_core::client::Clipboard>), String> {
+    raise_priority();
     set_dpi_aware();
     // 1 ms timer resolution for the motion tick and beacon cadence (see
     // [`timer`] and [`Server::start`]).

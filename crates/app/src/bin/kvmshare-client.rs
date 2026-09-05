@@ -32,6 +32,11 @@ fn run() -> Result<(), String> {
         &args.log_level.unwrap_or_else(kvmshare_log::level_from_env_or_default),
         args.log_ctl,
     )?;
+    // The client drives this machine's cursor on a millisecond cadence;
+    // it must outrank busy apps (and the BelowNormal priority Task
+    // Scheduler launches with), or anything the user does on this
+    // machine can starve the cursor.
+    kvmshare_platform::raise_priority();
 
     // One role per machine, enforced at the OS level: refuse to start if
     // a server is running here, and hold our own lock for the process

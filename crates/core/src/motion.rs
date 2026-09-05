@@ -17,7 +17,6 @@
 //! over-moving OS is corrected back, a lost frame is pushed forward, and
 //! no replay queue exists for a backlog to form in.
 
-use std::time::Instant;
 
 /// Minimum gap between forwarded motion messages. ~250 Hz keeps motion
 /// perfectly smooth while cutting frame count 4x (and far more for very
@@ -120,8 +119,6 @@ impl GainTracker {
 pub struct PendingMotion {
     fx: f64,
     fy: f64,
-    /// When the last motion message was sent (rate limiter).
-    last_send: Option<Instant>,
 }
 
 impl PendingMotion {
@@ -150,25 +147,20 @@ impl PendingMotion {
         Some((ix, iy))
     }
 
-    /// Forward accumulated motion at [`MOTION_PERIOD`] cadence. Emits a
-    /// message via `send` when whole pixels are due. Called from the
-    /// calling loop at its poll cadence, so motion is never held back
-    /// longer than one period.
+    /// Forward whatever whole pixels have accumulated, immediately.
+    ///
+    /// The caller invokes this once per drain pass (the evdev reader
+    /// after reading every device, the X11 capture once per poll), so
+    /// events that arrive in the same pass coalesce into one message and
+    /// nothing is ever held back waiting for a cadence. Holding motion
+    /// for a fixed period (the old behaviour) added up to a period of
+    /// latency *and* batched events into bursts — the wire then delivered
+    /// clumps, and a clumped command stream is exactly the stutter the
+    /// eye sees. Emitting per pass keeps the stream as even as the hand.
     pub fn flush(&mut self, send: &mut dyn FnMut(i32, i32)) {
-        let Some((ix, iy)) = self.take_whole() else { return };
-        let now = Instant::now();
-        let due = match self.last_send {
-            Some(t) => now.duration_since(t) >= MOTION_PERIOD,
-            None => true,
-        };
-        if !due {
-            // Not time yet: put the pixels back for the next flush.
-            self.fx += ix as f64;
-            self.fy += iy as f64;
-            return;
+        if let Some((ix, iy)) = self.take_whole() {
+            send(ix, iy);
         }
-        self.last_send = Some(now);
-        send(ix, iy);
     }
 
     /// Whether whole pixels are pending (a non-zero amount of motion
