@@ -18,6 +18,7 @@ pub mod layout;
 pub mod motion;
 pub mod server;
 pub mod session;
+pub mod time;
 pub mod transport;
 pub mod udp;
 

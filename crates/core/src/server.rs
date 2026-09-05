@@ -37,14 +37,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use kvmshare_log::{log_debug, log_error, log_info, log_trace, log_warn};
 use kvmshare_protocol::id::errors;
-use kvmshare_protocol::message::{Layout, Message};
+use kvmshare_protocol::message::{Layout, Message, ScreenInfo};
 
 use crate::layout::Layout as Desktop;
 use crate::session::{Action, Session};
+use crate::time::now_ms;
 use crate::transport::{RecvResult, Transport};
 use crate::udp;
 
@@ -155,16 +156,6 @@ const SUPERVISOR_STALL_MS: u64 = 3000;
 /// for a restart. Distinct from a crash (1) so the manager can tell a
 /// deliberate recovery from a failure.
 pub const EXIT_RESTART: i32 = 66;
-
-/// Milliseconds since the epoch (UTC). [`Liveness`] ticks are compared
-/// in this domain; the exact epoch does not matter, only that all ticks
-/// share it.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 /// The watchdog for the server's input path. While the cursor is on a
 /// client, the local machine must be able to bring it home: a wedged
@@ -311,33 +302,24 @@ impl Server {
                 .expect("cannot spawn server supervisor")
         };
         // Accept clients on a background thread.
-        let (listener, session, clients, active, engine_accept, clipboard_accept) = (
-            self.listener.try_clone()?,
-            self.session.clone(),
-            self.clients.clone(),
-            self.active.clone(),
-            engine.clone(),
-            clipboard.clone(),
-        );
+        let listener = self.listener.try_clone()?;
+        let ctx = Arc::new(ClientCtx {
+            session: self.session.clone(),
+            clients: self.clients.clone(),
+            active: self.active.clone(),
+            engine: engine.clone(),
+            clipboard,
+            addrs: self.udp_addrs.clone(),
+            seqs: self.udp_seqs.clone(),
+        });
         let udp_accept = self.udp.clone();
-        let addrs_accept = self.udp_addrs.clone();
-        let seqs_accept = self.udp_seqs.clone();
+        let ctx_accept = ctx.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
                         let addr = s.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
-                        if let Err(e) = Client::spawn(
-                            s,
-                            session.clone(),
-                            clients.clone(),
-                            active.clone(),
-                            engine_accept.clone(),
-                            clipboard_accept.clone(),
-                            udp_accept.clone(),
-                            addrs_accept.clone(),
-                            seqs_accept.clone(),
-                        ) {
+                        if let Err(e) = Client::spawn(s, ctx_accept.clone(), udp_accept.clone()) {
                             log_warn!("client {addr}: {e}");
                         }
                     }
@@ -347,16 +329,8 @@ impl Server {
         });
 
         // Route the UDP cursor stream on its own thread.
-        let (session_udp, clients_udp, active_udp, engine_udp) = (
-            self.session.clone(),
-            self.clients.clone(),
-            self.active.clone(),
-            engine.clone(),
-        );
-        let addrs_udp = self.udp_addrs.clone();
-        let seqs_udp = self.udp_seqs.clone();
         let udp_sock = self.udp.clone();
-        thread::spawn(move || udp_receiver(udp_sock, session_udp, clients_udp, active_udp, engine_udp, addrs_udp, seqs_udp));
+        thread::spawn(move || udp_receiver(udp_sock, ctx));
 
         // Main loop: process local input. The engine lock is taken per
         // event (not held for the whole loop) so other threads — client
@@ -366,66 +340,9 @@ impl Server {
         // the app-layer control channel (hot reload).
         loop {
             liveness.loop_tick_ms.store(now_ms(), Ordering::Relaxed);
-            let msg_start = std::time::Instant::now();
             match input.recv_timeout(CONTROL_POLL) {
-                Ok(msg) => {
-                    // Every message (motion deltas + position beacons from
-                    // the capture) goes straight to the session. Nothing
-                    // here touches the engine: the platform feeds the
-                    // real pointer position through its own beacons, and
-                    // per-event X round-trips would stall the cursor the
-                    // moment the local desktop gets busy.
-                    //
-                    // First, feed the pointer-gain measurement: raw
-                    // deltas vs the real-position beacons give the
-                    // server's own px-per-count, which the session
-                    // applies to forwarded motion so the client's cursor
-                    // mirrors the server's.
-                    match &msg {
-                        Message::MouseMoveRel { dx, dy } => self.gain.lock().unwrap().on_delta(*dx, *dy),
-                        Message::MouseMoveAbs { x, y } => {
-                            let g = self.gain.lock().unwrap().on_beacon(*x, *y);
-                            self.session.lock().unwrap().set_gain(g);
-                        }
-                        _ => {}
-                    }
-                    let actions = { self.session.lock().unwrap().on_local_event(msg) };
-                    // Diagnostic: the engine lock serializes the whole
-                    // input path; if another thread holds it for a long
-                    // time (a slow platform call under the lock), every
-                    // motion event queues behind it — the exact shape of
-                    // a client cursor freeze. Flag any long wait.
-                    let lock_wait = std::time::Instant::now();
-                    let mut engine = engine.lock().unwrap();
-                    let waited = lock_wait.elapsed();
-                    if waited > std::time::Duration::from_millis(10) {
-                        log_warn!("input loop: engine lock held {waited:?} by another thread");
-                    }
-                    for action in actions {
-                        self.execute(action, &mut engine)?;
-                    }
-                    let took = msg_start.elapsed();
-                    if took > std::time::Duration::from_millis(15) {
-                        log_warn!("input loop: message processing took {took:?}");
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    // Drain the app-layer control channel, then apply each
-                    // command on this (serialized) thread.
-                    let cmds: Vec<Control> = {
-                        let mut control = self.control.lock().unwrap();
-                        let mut v = Vec::new();
-                        if let Some(rx) = control.as_mut() {
-                            while let Ok(cmd) = rx.try_recv() {
-                                v.push(cmd);
-                            }
-                        }
-                        v
-                    };
-                    for cmd in cmds {
-                        self.apply_control(cmd, &engine)?;
-                    }
-                }
+                Ok(msg) => self.handle_local_input(msg, &engine)?,
+                Err(RecvTimeoutError::Timeout) => self.drain_controls(&engine)?,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -433,6 +350,73 @@ impl Server {
         // (its whole point is recovering a wedged thread), so this join
         // is just a graceful-session cleanup.
         let _ = supervisor.join();
+        Ok(())
+    }
+
+    /// One local input message: feed the pointer-gain measurement, run
+    /// it through the session, and apply whatever the session decided.
+    ///
+    /// Every message (motion deltas + position beacons from the capture)
+    /// goes straight to the session. Nothing here touches the engine
+    /// beyond the apply step: the platform feeds the real pointer
+    /// position through its own beacons, and per-event X round-trips
+    /// would stall the cursor the moment the local desktop gets busy.
+    /// The engine lock is held only for the apply step, so other threads
+    /// (clipboard, beacon crossings) can reach the engine between events.
+    fn handle_local_input(
+        &self,
+        msg: Message,
+        engine: &Mutex<Box<dyn Engine>>,
+    ) -> io::Result<()> {
+        // First, feed the pointer-gain measurement: raw deltas vs the
+        // real-position beacons give the server's own px-per-count,
+        // which the session applies to forwarded motion so the client's
+        // cursor mirrors the server's.
+        match &msg {
+            Message::MouseMoveRel { dx, dy } => self.gain.lock().unwrap().on_delta(*dx, *dy),
+            Message::MouseMoveAbs { x, y } => {
+                let g = self.gain.lock().unwrap().on_beacon(*x, *y);
+                self.session.lock().unwrap().set_gain(g);
+            }
+            _ => {}
+        }
+        let actions = { self.session.lock().unwrap().on_local_event(msg) };
+        // Diagnostic: the engine lock serializes the whole input path;
+        // if another thread holds it for a long time (a slow platform
+        // call under the lock), every motion event queues behind it —
+        // the exact shape of a client cursor freeze. Flag any long wait.
+        let started = std::time::Instant::now();
+        let mut engine = engine.lock().unwrap();
+        let waited = started.elapsed();
+        if waited > std::time::Duration::from_millis(10) {
+            log_warn!("input loop: engine lock held {waited:?} by another thread");
+        }
+        for action in actions {
+            self.execute(action, &mut engine)?;
+        }
+        let took = started.elapsed();
+        if took > std::time::Duration::from_millis(15) {
+            log_warn!("input loop: message processing took {took:?}");
+        }
+        Ok(())
+    }
+
+    /// Drain the app-layer control channel (hot reload) and apply each
+    /// command on this (serialized) thread.
+    fn drain_controls(&self, engine: &Arc<Mutex<Box<dyn Engine>>>) -> io::Result<()> {
+        let cmds: Vec<Control> = {
+            let mut control = self.control.lock().unwrap();
+            let mut v = Vec::new();
+            if let Some(rx) = control.as_mut() {
+                while let Ok(cmd) = rx.try_recv() {
+                    v.push(cmd);
+                }
+            }
+            v
+        };
+        for cmd in cmds {
+            self.apply_control(cmd, engine)?;
+        }
         Ok(())
     }
 
@@ -607,15 +591,7 @@ fn apply_action(
 /// beacon fires — a beacon that parks the real cursor on a wall mid-push
 /// must not wait for the next motion frame, which may never come (the
 /// user stopped exactly at the wall).
-fn udp_receiver(
-    udp: Arc<UdpSocket>,
-    session: Arc<Mutex<Session>>,
-    clients: Arc<Mutex<HashMap<u8, Arc<Client>>>>,
-    active: Arc<Mutex<Option<u8>>>,
-    engine: Arc<Mutex<Box<dyn Engine>>>,
-    addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
-    seqs: Arc<Mutex<HashMap<u8, u32>>>,
-) {
+fn udp_receiver(udp: Arc<UdpSocket>, ctx: Arc<ClientCtx>) {
     let mut buf = [0u8; 1500];
     loop {
         match udp.recv_from(&mut buf) {
@@ -625,11 +601,8 @@ fn udp_receiver(
                 // address happens here too — the first datagram is the
                 // registration the client sends right after the
                 // handshake.
-                {
-                    let clients = clients.lock().unwrap();
-                    if !clients.contains_key(&d.id) {
-                        continue;
-                    }
+                if !ctx.clients.lock().unwrap().contains_key(&d.id) {
+                    continue;
                 }
                 // Learn or verify the datagram's source. The first
                 // datagram from a client teaches us its address; a
@@ -643,14 +616,14 @@ fn udp_receiver(
                 // high value and every fresh beacon (starting at 1) is
                 // judged stale: the live session is deafened.
                 {
-                    let mut addrs = addrs.lock().unwrap();
+                    let mut addrs = ctx.addrs.lock().unwrap();
                     match addrs.get(&d.id) {
                         None => {
                             addrs.insert(d.id, from);
                             log_debug!("client {} registered UDP stream from {from}", d.id);
                         }
                         Some(addr) if *addr != from => {
-                            seqs.lock().unwrap().remove(&d.id);
+                            ctx.seqs.lock().unwrap().remove(&d.id);
                             addrs.insert(d.id, from);
                             log_debug!("client {} re-registered UDP stream from {from}", d.id);
                         }
@@ -662,7 +635,7 @@ fn udp_receiver(
                         // Stale or duplicate beacons are dropped: a late
                         // "at the wall" report must never arm a crossing.
                         {
-                            let mut seqs = seqs.lock().unwrap();
+                            let mut seqs = ctx.seqs.lock().unwrap();
                             let last = seqs.entry(d.id).or_default();
                             if !udp::is_newer(d.seq, *last) {
                                 continue;
@@ -675,11 +648,11 @@ fn udp_receiver(
                         // outward delta in the main loop or — when the
                         // beacon parks the cursor on a wall mid-push —
                         // right here, on the park itself.
-                        let actions = { session.lock().unwrap().on_remote_beacon(d.id, x, y) };
+                        let actions = { ctx.session.lock().unwrap().on_remote_beacon(d.id, x, y) };
                         if !actions.is_empty() {
-                            if let Ok(mut engine) = engine.lock() {
+                            if let Ok(mut engine) = ctx.engine.lock() {
                                 for a in actions {
-                                    if let Err(e) = apply_action(a, &active, &clients, &mut engine) {
+                                    if let Err(e) = apply_action(a, &ctx.active, &ctx.clients, &mut engine) {
                                         log_warn!("beacon crossing for client {}: {e}", d.id);
                                     }
                                 }
@@ -709,174 +682,198 @@ fn udp_receiver(
     }
 }
 
+/// Shared state one connected client's threads need. Bundled once at
+/// accept time so neither the handshake nor the service loop carries a
+/// nine-parameter signature, and so adding per-client state is a one-
+/// place change.
+struct ClientCtx {
+    session: Arc<Mutex<Session>>,
+    clients: Arc<Mutex<HashMap<u8, Arc<Client>>>>,
+    active: Arc<Mutex<Option<u8>>>,
+    engine: Arc<Mutex<Box<dyn Engine>>>,
+    clipboard: ServerClipboard,
+    /// UDP routing state: per-client datagram addresses and the
+    /// anti-replay sequence counters. Owned jointly by the writer
+    /// (address) and the UDP receiver (address + sequence).
+    addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
+    seqs: Arc<Mutex<HashMap<u8, u32>>>,
+}
+
+impl ClientCtx {
+    /// The current layout snapshot in wire form (for Welcome /
+    /// ScreenInfo replies).
+    fn layout_snapshot(&self) -> Layout {
+        let s = self.session.lock().unwrap();
+        Layout { screens: s.layout().screens.clone() }
+    }
+
+    /// Unregister the client everywhere and, if it had the cursor,
+    /// bring the session home. Called by the reader thread exactly once
+    /// when the control channel dies (EOF, error, or silence timeout).
+    /// Dropping the last `Sender` of the outbound queue ends the writer
+    /// thread, and the socket with it.
+    fn teardown(&self, id: u8, name: &str) {
+        log_info!("client {name} disconnected");
+        self.clients.lock().unwrap().remove(&id);
+        self.addrs.lock().unwrap().remove(&id);
+        self.seqs.lock().unwrap().remove(&id);
+
+        {
+            let mut act = self.active.lock().unwrap();
+            if *act == Some(id) {
+                *act = None;
+            }
+        }
+        let action = self.session.lock().unwrap().on_client_disconnected(id);
+        if let Action::SwitchToLocal { .. } = action {
+            if let Ok(mut engine) = self.engine.lock() {
+                let _ = apply_action(action, &self.active, &self.clients, &mut engine);
+            }
+        }
+    }
+}
+
 impl Client {
+    /// Full accept path for one connection: handshake, registration and
+    /// the reader thread. Each stage is its own function below.
     fn spawn(
         stream: TcpStream,
-        session: Arc<Mutex<Session>>,
-        clients: Arc<Mutex<HashMap<u8, Arc<Client>>>>,
-        active: Arc<Mutex<Option<u8>>>,
-        engine: Arc<Mutex<Box<dyn Engine>>>,
-        clipboard: ServerClipboard,
+        ctx: Arc<ClientCtx>,
         udp: Arc<UdpSocket>,
-        addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
-        seqs: Arc<Mutex<HashMap<u8, u32>>>,
     ) -> io::Result<()> {
         // Timed reads: a client that stops sending (sleep, wedge, crash)
         // must be noticed and dropped so the session returns home — see
         // [`CLIENT_SILENT_TIMEOUT`].
         let mut transport = Transport::with_read_timeout(stream, Some(CLIENT_READ_TIMEOUT))?;
+        let (id, name, info) = exchange_hello(&mut transport, &ctx)?;
+        ctx.session.lock().unwrap().update_screen_info(id, info);
 
-        // 1. Handshake: expect Hello with a matching protocol version.
-        let (name, info) = match transport.recv()? {
-            RecvResult::Msg(Message::Hello { version, name, info }) => {
-                if version != kvmshare_protocol::VERSION {
-                    let _ = transport.send(&Message::Error {
-                        code: errors::VERSION_MISMATCH,
-                        text: format!(
-                            "server speaks v{}, client speaks v{version}",
-                            kvmshare_protocol::VERSION
-                        ),
-                    });
-                    return Err(io::Error::other("version mismatch"));
-                }
-                (name, info)
-            }
-            RecvResult::Msg(_) => return Err(io::Error::other("expected hello")),
-            RecvResult::Eof | RecvResult::NoData => return Err(io::Error::other("client closed before hello")),
-        };
-
-        // 2. The client's screen id comes from the layout, matched by name.
-        let id = match session.lock().unwrap().assign_screen_id(&name) {
-            Some(id) => id,
-            None => {
-                let _ = transport.send(&Message::Error {
-                    code: errors::NAME_CONFLICT,
-                    text: format!("no screen named \"{name}\" in the layout"),
-                });
-                return Err(io::Error::other(format!("unknown client name {name}")));
-            }
-        };
-        // The client's real screen shape (may differ from the config).
-        session.lock().unwrap().update_screen_info(id, info);
-
-        // 3. Send Welcome + current layout, then hand both sockets to a
-        //    writer thread. The transport stays the writer's; the reader
-        //    gets its own lock-free socket clone (TCP is full-duplex), so
-        //    it can block on recv while the writer sends freely.
-        let layout = {
-            let s = session.lock().unwrap();
-            Layout { screens: s.layout().screens.clone() }
-        };
+        // Send Welcome + current layout, then split the transport: the
+        // writer keeps the sending half; the reader gets its own lock-
+        // free socket clone (TCP is full-duplex), so it can block on
+        // recv while the writer sends freely.
         transport.send(&Message::Welcome {
             server_version: kvmshare_protocol::VERSION,
-            layout: layout.clone(),
+            layout: ctx.layout_snapshot(),
             own_screen_id: id,
         })?;
-        let mut reader = transport.reader()?;
+        let reader = transport.reader()?;
         let (out_tx, out_rx) = mpsc::channel::<Outbound>();
-        // The reader thread owns teardown, so it needs the UDP routing
-        // state too (the writer gets the originals).
-        let addrs2 = addrs.clone();
-        let seqs2 = seqs.clone();
-        spawn_writer(id, transport, udp, addrs, out_rx);
+        spawn_writer(id, transport, udp, ctx.addrs.clone(), out_rx);
+
         let client = Arc::new(Client { id, name, out: out_tx });
-        clients.lock().unwrap().insert(id, client.clone());
+        ctx.clients.lock().unwrap().insert(id, client.clone());
         // Stable marker for the GUI's notification watcher (kept in sync
-        // with the "disconnected" line below): "client X connected".
+        // with the "disconnected" line in `teardown`): "client X connected".
         log_info!("client {} connected", client.name);
-
-        // 4. Service the client's TCP control channel until it goes away.
-        //    On EOF (or error), unregister and give the session a chance
-        //    to return home if this was the active client.
-        let c2 = client.clone();
-        let clients2 = clients.clone();
-        let active2 = active.clone();
-        let session2 = session.clone();
-        let engine2 = engine.clone();
-        let clipboard2 = clipboard.clone();
-        thread::spawn(move || {
-            let mut last_seen = Instant::now();
-            loop {
-                let msg = match reader.recv() {
-                    Ok(RecvResult::Msg(msg)) => {
-                        last_seen = Instant::now();
-                        msg
-                    }
-                    Ok(RecvResult::NoData) => {
-                        // Silence within the read window. Keepalives land
-                        // every 2 s; a silence far beyond that means the
-                        // client is not coming back (it slept through its
-                        // keepalives, wedged, or died) — drop it so the
-                        // session returns home instead of believing a
-                        // dead machine still has the cursor.
-                        if last_seen.elapsed() > CLIENT_SILENT_TIMEOUT {
-                            log_debug!("client {}: silent for {CLIENT_SILENT_TIMEOUT:?} — dropping", c2.name);
-                            break;
-                        }
-                        continue;
-                    }
-                    Ok(RecvResult::Eof) | Err(_) => break,
-                };
-                match msg {
-                    Message::KeepAlive => {}
-                    Message::ScreenInfo { info } => {
-                        // The client's resolution changed: rebuild the
-                        // layout so edge math stays correct, then reply.
-                        let layout = {
-                            let mut s = session2.lock().unwrap();
-                            s.update_screen_info(c2.id, info);
-                            Layout { screens: s.layout().screens.clone() }
-                        };
-                        enqueue(&clients2, c2.id, Message::Layout { layout });
-                    }
-                    Message::Clipboard { mime, data } => {
-                        // Content copied on the client reaches the
-                        // server's local clipboard. Applied through the
-                        // clipboard service's own lock: `set` can block
-                        // (selection ownership handshakes), and it must
-                        // never hold the engine lock that serializes
-                        // every cursor motion.
-                        log_debug!("clipboard from {}: {} ({} bytes)", c2.name, mime, data.len());
-                        if let Ok(mut cb) = clipboard2.lock() {
-                            cb.set(&mime, &data);
-                        }
-                    }
-                    // Defensive: current clients send beacons over UDP;
-                    // keep the TCP arm for robustness (mixed or older
-                    // peers, transport fallbacks).
-                    Message::CursorPos { x, y } => {
-                        session2.lock().unwrap().on_remote_beacon(c2.id, x, y);
-                    }
-                    _ => {}
-                }
-            }
-
-            log_info!("client {} disconnected", c2.name);
-            // Unregister and give the session a chance to return home if
-            // this was the active client. Dropping the last `Sender` of
-            // the outbound queue ends the writer thread (its channel
-            // closes and the socket goes with it). The UDP routing state
-            // goes too — a later reconnect re-registers its (fresh)
-            // address and sequence space.
-            clients2.lock().unwrap().remove(&c2.id);
-            addrs2.lock().unwrap().remove(&c2.id);
-            seqs2.lock().unwrap().remove(&c2.id);
-
-            {
-                let mut act = active2.lock().unwrap();
-                if *act == Some(c2.id) {
-                    *act = None;
-                }
-            }
-            let action = session2.lock().unwrap().on_client_disconnected(c2.id);
-            if let Action::SwitchToLocal { .. } = action {
-                if let Ok(mut engine) = engine2.lock() {
-                    let _ = apply_action(action, &active2, &clients2, &mut engine);
-                }
-            }
-        });
-
+        service_client(client, reader, ctx);
         Ok(())
+    }
+}
+
+/// Handshake: expect Hello with a matching protocol version, then
+/// assign the screen id from the layout, matched by name.
+fn exchange_hello(
+    transport: &mut Transport,
+    ctx: &ClientCtx,
+) -> io::Result<(u8, String, ScreenInfo)> {
+    let (name, info) = match transport.recv()? {
+        RecvResult::Msg(Message::Hello { version, name, info }) => {
+            if version != kvmshare_protocol::VERSION {
+                let _ = transport.send(&Message::Error {
+                    code: errors::VERSION_MISMATCH,
+                    text: format!(
+                        "server speaks v{}, client speaks v{version}",
+                        kvmshare_protocol::VERSION
+                    ),
+                });
+                return Err(io::Error::other("version mismatch"));
+            }
+            (name, info)
+        }
+        RecvResult::Msg(_) => return Err(io::Error::other("expected hello")),
+        RecvResult::Eof | RecvResult::NoData => {
+            return Err(io::Error::other("client closed before hello"))
+        }
+    };
+    let id = match ctx.session.lock().unwrap().assign_screen_id(&name) {
+        Some(id) => id,
+        None => {
+            let _ = transport.send(&Message::Error {
+                code: errors::NAME_CONFLICT,
+                text: format!("no screen named \"{name}\" in the layout"),
+            });
+            return Err(io::Error::other(format!("unknown client name {name}")));
+        }
+    };
+    Ok((id, name, info))
+}
+
+/// The reader thread: services one client's TCP control channel until it
+/// goes away, then tears the client down. Blocking IO is plenty for a
+/// KVM — a handful of control messages per second.
+fn service_client(client: Arc<Client>, mut reader: Transport, ctx: Arc<ClientCtx>) {
+    thread::spawn(move || {
+        let mut last_seen = Instant::now();
+        loop {
+            let msg = match reader.recv() {
+                Ok(RecvResult::Msg(msg)) => {
+                    last_seen = Instant::now();
+                    msg
+                }
+                Ok(RecvResult::NoData) => {
+                    // Silence within the read window. Keepalives land
+                    // every 2 s; a silence far beyond that means the
+                    // client is not coming back (it slept through its
+                    // keepalives, wedged, or died) — drop it so the
+                    // session returns home instead of believing a
+                    // dead machine still has the cursor.
+                    if last_seen.elapsed() > CLIENT_SILENT_TIMEOUT {
+                        log_debug!("client {}: silent for {CLIENT_SILENT_TIMEOUT:?} — dropping", client.name);
+                        break;
+                    }
+                    continue;
+                }
+                Ok(RecvResult::Eof) | Err(_) => break,
+            };
+            handle_client_message(&client, msg, &ctx);
+        }
+        ctx.teardown(client.id, &client.name);
+    });
+}
+
+/// Dispatch one inbound control message from a client.
+fn handle_client_message(client: &Client, msg: Message, ctx: &ClientCtx) {
+    match msg {
+        Message::KeepAlive => {}
+        Message::ScreenInfo { info } => {
+            // The client's resolution changed: rebuild the
+            // layout so edge math stays correct, then reply.
+            {
+                let mut s = ctx.session.lock().unwrap();
+                s.update_screen_info(client.id, info);
+            }
+            enqueue(&ctx.clients, client.id, Message::Layout { layout: ctx.layout_snapshot() });
+        }
+        Message::Clipboard { mime, data } => {
+            // Content copied on the client reaches the
+            // server's local clipboard. Applied through the
+            // clipboard service's own lock: `set` can block
+            // (selection ownership handshakes), and it must
+            // never hold the engine lock that serializes
+            // every cursor motion.
+            log_debug!("clipboard from {}: {} ({} bytes)", client.name, mime, data.len());
+            if let Ok(mut cb) = ctx.clipboard.lock() {
+                cb.set(&mime, &data);
+            }
+        }
+        // Defensive: current clients send beacons over UDP;
+        // keep the TCP arm for robustness (mixed or older
+        // peers, transport fallbacks).
+        Message::CursorPos { x, y } => {
+            ctx.session.lock().unwrap().on_remote_beacon(client.id, x, y);
+        }
+        _ => {}
     }
 }
 
