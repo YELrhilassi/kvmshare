@@ -12,7 +12,7 @@
 //!   while the other role is running.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -103,16 +103,22 @@ pub fn acquire_in(dir: &Path, role: &str) -> Result<RoleGuard, String> {
         }
     }
 
-    // Record our pid inside the lock file so a controller (the GUI) can
-    // signal this instance later — e.g. to stop a background server.
-    // The write is best-effort: the flock itself is the source of truth
-    // for "running", and a failure to record the pid must not stop the
-    // role from running. But it is logged loudly (see below), because a
-    // missing pid degrades the GUI's stop-by-pid to a stop-by-name
-    // fallback.
-    let mut f = ours;
-    if let Err(e) = f.set_len(0).and_then(|_| writeln!(f, "{}", std::process::id())).and_then(|_| f.flush()) {
-        eprintln!("kvmshare: could not record pid in {}: {e} (the GUI will fall back to stopping by process name)", ours_path.display());
+    // Record our pid in a **separate** `<role>.pid` file (never inside
+    // the locked `<role>.lock`) so a controller (the GUI) can signal
+    // this instance later — e.g. to stop a background server. On Windows
+    // the lock is a byte-range `LockFileEx`, which blocks *reads* of the
+    // locked range by other handles: a pid written into the lock file
+    // would be unreadable by the GUI (it would see pid 0 and fall back
+    // to stopping by name). A plain pid file beside the lock avoids that
+    // entirely and works identically on Unix. The write is best-effort:
+    // the flock itself is the source of truth for "running", and a
+    // failure to record the pid must not stop the role from running.
+    // But it is logged loudly (see below), because a missing pid
+    // degrades the GUI's stop-by-pid to a stop-by-name fallback.
+    let f = ours;
+    let pid_path = dir.join(format!("{role}.pid"));
+    if let Err(e) = std::fs::write(&pid_path, format!("{}\n", std::process::id())) {
+        eprintln!("kvmshare: could not record pid in {}: {e} (the GUI will fall back to stopping by process name)", pid_path.display());
     }
 
     Ok(RoleGuard { _file: f })

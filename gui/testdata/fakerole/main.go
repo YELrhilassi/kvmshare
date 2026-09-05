@@ -75,11 +75,12 @@ func main() {
 	}
 	probe.Close()
 
-	if err := ours.Truncate(0); err != nil {
-		fmt.Fprintln(os.Stderr, "fakerole: truncate:", err)
-		os.Exit(2)
-	}
-	if _, err := fmt.Fprintf(ours, "%d\n", os.Getpid()); err != nil {
+	// Record the pid in a dedicated `.pid` file, mirroring the real
+	// guard: the lock file is lock-only (its locked range is unreadable
+	// by other handles on Windows, which is where the GUI reads the pid
+	// from).
+	pidPath := filepath.Join(dir, role+".pid")
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, "fakerole: write pid:", err)
 		os.Exit(2)
 	}

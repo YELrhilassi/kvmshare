@@ -99,6 +99,13 @@ func setupTray(app *application.App, core *App, win *application.WebviewWindow) 
 	})
 	menu.AddSeparator()
 	menu.Add("Quit").OnClick(func(*application.Context) {
+		// Quitting must not strand the role: a running server or client
+		// would keep sharing input with the other machine (and, on
+		// Windows, keep the elevated client's input gate on) with no
+		// tray left to control it. Stop everything first; on a stubborn
+		// process, quit anyway — a background role is better than a GUI
+		// that refuses to leave.
+		_ = core.StopAll()
 		app.Quit()
 	})
 	systemTray.SetMenu(menu)

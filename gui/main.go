@@ -114,9 +114,9 @@ func main() {
 	// present (roles keep running and the app stays reachable). With no
 	// tray host — no session bus, or no StatusNotifierWatcher — hiding
 	// would strand the app invisibly (the classic ghost-instance trap),
-	// so closing quits the GUI instead. Roles are independent background
-	// processes either way: quitting the GUI never stops them, and a
-	// later launch adopts them again.
+	// so closing quits the GUI instead, and quitting stops the roles too
+	// (a running role with no tray to control it strands the other
+	// machine's cursor and, on Windows, keeps the input gate on).
 	window.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
 		if trayHostAvailable() {
 			window.Hide()
@@ -126,6 +126,7 @@ func main() {
 		// No tray: cancel the default close (which would destroy the
 		// window and leave a windowless zombie process) and quit cleanly.
 		e.Cancel()
+		_ = core.StopAll()
 		app.Quit()
 	})
 

@@ -419,6 +419,43 @@ func TestStopIsFast(t *testing.T) {
 	}
 }
 
+// The tray's Quit must leave nothing behind: every role process is
+// stopped, whichever role is running.
+func TestStopAllStopsRunningRoles(t *testing.T) {
+	a, _ := newTestApp(t)
+	if _, err := a.ServerStart(); err != nil {
+		t.Fatal(err)
+	}
+	if !a.ServerRunning() {
+		t.Fatal("server should be running")
+	}
+	if err := a.StopAll(); err != nil {
+		t.Fatal(err)
+	}
+	if a.ServerRunning() {
+		t.Fatal("StopAll must stop the running server")
+	}
+	if a.ClientRunning() {
+		t.Fatal("StopAll must leave no client running")
+	}
+
+	// Same for the client role.
+	s := a.GetSettings()
+	s.ClientAddr = "127.0.0.1:24800"
+	if err := a.SetSettings(s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ClientStart(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.StopAll(); err != nil {
+		t.Fatal(err)
+	}
+	if a.ClientRunning() {
+		t.Fatal("StopAll must stop the running client")
+	}
+}
+
 func TestRoleSwitchStopsOldProcess(t *testing.T) {
 	a, _ := newTestApp(t)
 	if _, err := a.ServerStart(); err != nil {
@@ -588,12 +625,18 @@ func TestSingleInstanceWritesPid(t *testing.T) {
 	if _, err := a.SingleInstance(); err != nil {
 		t.Fatalf("first instance should get the lock: %v", err)
 	}
-	raw, err := os.ReadFile(a.instanceLockPath)
+	// The pid lives in the dedicated pid file (the byte-range lock on
+	// the lock file blocks reads of it on Windows), and must be the
+	// value a later instance reads to raise this one.
+	raw, err := os.ReadFile(a.rolePidPath("gui"))
 	if err != nil {
-		t.Fatalf("lock file readable: %v", err)
+		t.Fatalf("pid file readable: %v", err)
 	}
 	var pid int
 	if _, err := fmt.Sscanf(string(raw), "%d", &pid); err != nil || pid <= 1 {
-		t.Fatalf("lock file should record our pid, got %q", raw)
+		t.Fatalf("pid file should record our pid, got %q", raw)
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("pid file records %d, want %d", pid, os.Getpid())
 	}
 }

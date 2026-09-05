@@ -346,6 +346,67 @@ fn client_reconnect_is_not_deafened_by_stale_udp_sequences() {
 }
 
 #[test]
+fn crossing_after_idle_is_not_dropped_by_the_beacon_watchdog() {
+    let h = start_server();
+
+    // A raw peer that registers (TCP + UDP) like a real client but only
+    // starts beaconing well after the server activates it — the shape of
+    // a real LAN client, whose first beacon lands tens of milliseconds
+    // after the crossing, never within the watchdog's ~1 ms first check.
+    // (On localhost a full client's immediate beacon can beat the check,
+    // hiding the race this guards against.)
+    let mut tcp = Transport::new(TcpStream::connect(("127.0.0.1", h.port)).unwrap()).unwrap();
+    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    tcp.send(&Message::Hello { version: VERSION, name: "hp".into(), info }).unwrap();
+    let id = match tcp.recv().unwrap() {
+        RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => own_screen_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    assert_eq!(id, 1);
+    let udp_sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    udp_sock.connect(("127.0.0.1", h.port)).unwrap();
+    udp_sock.send(&udp::pack(id, 0, &Message::KeepAlive)).unwrap(); // UDP registration
+    h.wait_for_clients(1);
+
+    // Idle on the server side past the active-beacon timeout (1.5 s).
+    // The client's beacons only flow while it is active, so its UDP
+    // "last heard" goes stale during this stretch — exactly the state
+    // that used to make the beacon watchdog drop the client the instant
+    // it was activated again.
+    thread::sleep(Duration::from_millis(2000));
+
+    // Cross onto hp.
+    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+    assert!(
+        calls(&h.engine_calls).iter().any(|c| c == "cursor false"),
+        "server should hide its cursor (crossed onto hp)"
+    );
+
+    // The client stays silent for a beat (real network: its first beacon
+    // takes a few ms to come back). Without the activation reset, the
+    // watchdog drops it within ~1 ms — its registration timestamp is
+    // already >1.5 s stale — and the local cursor is restored. With the
+    // reset it is granted the full watchdog window.
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !calls(&h.engine_calls).iter().any(|c| c == "cursor true"),
+        "client must survive the activation gap without beaconing"
+    );
+
+    // Now it beacons normally and must stay alive: a wedge drop would
+    // restore the local cursor.
+    for _ in 0..10 {
+        udp_sock.send(&udp::pack(id, 1, &Message::CursorPos { x: 1871, y: 540 })).unwrap();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !calls(&h.engine_calls).iter().any(|c| c == "cursor true"),
+        "client must stay alive while beaconing"
+    );
+}
+
+#[test]
 fn client_disconnect_returns_cursor_home() {
     let h = start_server();
 

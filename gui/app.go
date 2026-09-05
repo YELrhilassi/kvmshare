@@ -162,7 +162,7 @@ func (a *App) SingleInstance() (raised bool, err error) {
 	if err := tryLockFile(f); err != nil {
 		f.Close()
 		// Someone else holds the lock. Ask that instance (its pid is
-		// recorded in the file) to show itself; give it a moment to
+		// recorded in the pid file) to show itself; give it a moment to
 		// write the pid in case it is still starting up.
 		for i := 0; i < 10; i++ {
 			if pid := a.pidFromLock("gui"); pid > 0 {
@@ -175,11 +175,10 @@ func (a *App) SingleInstance() (raised bool, err error) {
 		}
 		return false, fmt.Errorf("kvmshare is already running on this machine")
 	}
-	// We hold the lock: record our pid so a later launch can raise us.
-	_, _ = f.Seek(0, 0)
-	_ = f.Truncate(0)
-	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
-	_ = f.Sync()
+	// We hold the lock: record our pid in the dedicated pid file so a
+	// later launch can raise us (the lock file itself is lock-only — its
+	// byte-range lock on Windows blocks reads by other handles).
+	_ = os.WriteFile(a.rolePidPath("gui"), []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644)
 	a.instanceLock = f
 	return false, nil
 }

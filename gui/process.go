@@ -84,6 +84,14 @@ func (a *App) roleLockPath(role string) string {
 	return filepath.Join(a.stateDir, role+".lock")
 }
 
+// rolePidPath returns where the role records its pid. Kept out of the
+// lock file on purpose: on Windows the lock is a byte-range LockFileEx,
+// which blocks reads of the locked range by other handles — a pid inside
+// the lock file would read back as empty (pid 0) and break stop-by-pid.
+func (a *App) rolePidPath(role string) string {
+	return filepath.Join(a.stateDir, role+".pid")
+}
+
 // roleActive reports whether a kvmshare process of `role` is running on
 // this machine — ours or not (detected by probing the role's flock).
 func (a *App) roleActive(role string) bool {
@@ -99,10 +107,13 @@ func (a *App) roleActive(role string) bool {
 	return true // another process holds it
 }
 
-// pidFromLock returns the pid a running instance recorded in its lock
-// file (0 when unknown).
+// pidFromLock returns the pid a running instance recorded for its role
+// (0 when unknown). Read from the dedicated `.pid` file — the lock file
+// itself cannot be read reliably on Windows (byte-range lock), and the
+// pid is only consulted while the role lock is actually held, so a
+// stale pid file (left by a crash) is never acted on.
 func (a *App) pidFromLock(role string) int {
-	raw, err := os.ReadFile(a.roleLockPath(role))
+	raw, err := os.ReadFile(a.rolePidPath(role))
 	if err != nil {
 		return 0
 	}
@@ -403,6 +414,24 @@ func (a *App) StopActive() error {
 		return a.ClientStop()
 	}
 	return a.ServerStop()
+}
+
+// StopAll stops every role process on this machine (server and client —
+// a machine runs at most one, so at most one is actually running). Used
+// by the tray's Quit, which must leave nothing sharing input behind:
+// quitting the GUI with a role still running strands the other machine's
+// cursor (and, on Windows, the elevated client's input gate).
+func (a *App) StopAll() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var first error
+	if err := a.stopRoleLocked(roleServer); err != nil && first == nil {
+		first = err
+	}
+	if err := a.stopRoleLocked(roleClient); err != nil && first == nil {
+		first = err
+	}
+	return first
 }
 
 func (a *App) currentMode() Mode {

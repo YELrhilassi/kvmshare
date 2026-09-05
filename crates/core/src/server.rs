@@ -215,6 +215,13 @@ pub struct Server {
     /// datagrams are dropped, so an out-of-order "at the wall" report can
     /// never arm a crossing the user did not push for).
     udp_seqs: Arc<Mutex<HashMap<u8, u32>>>,
+    /// Client id → when its cursor stream was last heard (monotonic ms).
+    /// The active client beacons every few ms; a stream gone silent is
+    /// the signature of a wedged client — see the beacon watchdog in
+    /// [`udp_receiver`]. Reset to "now" at the moment the session
+    /// activates a client, so the client's first beacons (which only
+    /// flow while it is active) can never be judged late.
+    last_heard: Arc<Mutex<HashMap<u8, u64>>>,
     /// App-layer control messages (hot reload). `None` disables them.
     /// In a `Mutex` so `Server` stays `Sync` (the channel itself is not).
     control: Mutex<Option<Receiver<Control>>>,
@@ -256,6 +263,7 @@ impl Server {
             active: Arc::new(Mutex::new(None)),
             udp_addrs: Arc::new(Mutex::new(HashMap::new())),
             udp_seqs: Arc::new(Mutex::new(HashMap::new())),
+            last_heard: Arc::new(Mutex::new(HashMap::new())),
             control: Mutex::new(control),
             gain: Arc::new(std::sync::Mutex::new(crate::motion::GainTracker::new())),
         })
@@ -311,7 +319,7 @@ impl Server {
             clipboard,
             addrs: self.udp_addrs.clone(),
             seqs: self.udp_seqs.clone(),
-            last_heard: Arc::new(Mutex::new(HashMap::new())),
+            last_heard: self.last_heard.clone(),
         });
         let udp_accept = self.udp.clone();
         let ctx_accept = ctx.clone();
@@ -501,7 +509,7 @@ impl Server {
 
     /// Apply a session [`Action`] to the world.
     fn execute(&self, action: Action, engine: &mut MutexGuard<'_, Box<dyn Engine>>) -> io::Result<()> {
-        apply_action(action, &self.active, &self.clients, engine)
+        apply_action(action, &self.active, &self.clients, &self.last_heard, engine)
     }
 }
 
@@ -529,6 +537,7 @@ fn apply_action(
     action: Action,
     active: &Arc<Mutex<Option<u8>>>,
     clients: &Arc<Mutex<HashMap<u8, Arc<Client>>>>,
+    last_heard: &Mutex<HashMap<u8, u64>>,
     engine: &mut MutexGuard<'_, Box<dyn Engine>>,
 ) -> io::Result<()> {
     match action {
@@ -549,6 +558,16 @@ fn apply_action(
                 enqueue(clients, old, Message::Leave { screen_id: old });
             }
             *active.lock().unwrap() = Some(to);
+            // The client's beacons only flow while it is active, so its
+            // "last heard" goes stale the moment the cursor comes home.
+            // Without this reset the beacon watchdog (which fires on
+            // silence *while active*) would judge the freshly activated
+            // client dead before its first beacon can arrive — dropping
+            // every crossing that follows an idle stretch. Reset the
+            // clock here so the client gets the full watchdog window to
+            // start beaconing; a stream that then goes silent is a real
+            // wedge and still gets caught.
+            last_heard.lock().unwrap().insert(to, now_ms());
             log_debug!("cursor switched to client {to} at ({x},{y})");
             // `Enter` carries the entry point; the client places its
             // cursor there itself (absolute placement is reserved for
@@ -693,7 +712,9 @@ fn udp_receiver(udp: Arc<UdpSocket>, ctx: Arc<ClientCtx>) {
                         if !actions.is_empty() {
                             if let Ok(mut engine) = ctx.engine.lock() {
                                 for a in actions {
-                                    if let Err(e) = apply_action(a, &ctx.active, &ctx.clients, &mut engine) {
+                                    if let Err(e) =
+                                        apply_action(a, &ctx.active, &ctx.clients, &ctx.last_heard, &mut engine)
+                                    {
                                         log_warn!("beacon crossing for client {}: {e}", d.id);
                                     }
                                 }
@@ -774,7 +795,7 @@ impl ClientCtx {
         let action = self.session.lock().unwrap().on_client_disconnected(id);
         if let Action::SwitchToLocal { .. } = action {
             if let Ok(mut engine) = self.engine.lock() {
-                let _ = apply_action(action, &self.active, &self.clients, &mut engine);
+                let _ = apply_action(action, &self.active, &self.clients, &self.last_heard, &mut engine);
             }
         }
     }
