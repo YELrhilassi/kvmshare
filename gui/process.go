@@ -235,6 +235,18 @@ const maxRestarts = 3
 // the consecutive-restart budget.
 const restartBudgetResetAfter = 2 * time.Minute
 
+// conflictError reports whether a failed start died because the *other*
+// role still held its lock (the Rust binaries refuse to run alongside
+// the opposite role). The message carries the binary's own log tail, so
+// the match covers both the reason line and the log path form.
+func conflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "already running") || strings.Contains(s, "is locked")
+}
+
 func (a *App) ServerStart() (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -250,10 +262,22 @@ func (a *App) ServerStart() (bool, error) {
 		return false, err
 	}
 	p, err := a.spawnServerLocked()
-	if err != nil {
-		return false, err
+	if err == nil {
+		err = a.checkStarted(p, a.serverLogPath, "server")
 	}
-	if err := a.checkStarted(p, a.serverLogPath, "server"); err != nil {
+	// The stop reported the client gone, yet the fresh server still died
+	// on its lock — the opposite role reappeared in the gap (a stop that
+	// landed just after our last probe, a lingering second instance).
+	// Clean up harder and try once more before surfacing the error.
+	if conflictError(err) {
+		if stopErr := a.stopRoleLocked(roleClient); stopErr == nil {
+			p, err = a.spawnServerLocked()
+			if err == nil {
+				err = a.checkStarted(p, a.serverLogPath, "server")
+			}
+		}
+	}
+	if err != nil {
 		return false, err
 	}
 	a.serverProc = p
@@ -378,10 +402,21 @@ func (a *App) ClientStart() (bool, error) {
 	a.writeLogCtlLocked(roleClient)
 	args = append(args, "--logctl", filepath.Join(a.stateDir, roleClient+".logctl"))
 	p, err := a.spawn(a.clientPath, a.clientLogPath, args...)
-	if err != nil {
-		return false, err
+	if err == nil {
+		err = a.checkStarted(p, a.clientLogPath, "client")
 	}
-	if err := a.checkStarted(p, a.clientLogPath, "client"); err != nil {
+	// Same conflict-retry as ServerStart: a server that reappeared in
+	// the gap between our cleanup and the client's start must not turn
+	// into a confusing "exited immediately" error.
+	if conflictError(err) {
+		if stopErr := a.stopRoleLocked(roleServer); stopErr == nil {
+			p, err = a.spawn(a.clientPath, a.clientLogPath, args...)
+			if err == nil {
+				err = a.checkStarted(p, a.clientLogPath, "client")
+			}
+		}
+	}
+	if err != nil {
 		return false, err
 	}
 	a.clientProc = p

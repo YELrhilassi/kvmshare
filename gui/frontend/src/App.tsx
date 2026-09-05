@@ -38,7 +38,13 @@ export default function App() {
       await api().SetSettings({ ...s, mode: m });
       setMode(m);
     } catch {
-      /* keep current mode */
+      // The backend rejected the switch — reload what it actually has so
+      // the UI can never drift from it (selection and running state stay
+      // truthful even when a save fails).
+      api()
+        .GetSettings()
+        .then((s) => setMode(s.mode))
+        .catch(() => {});
     }
   };
 

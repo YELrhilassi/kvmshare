@@ -456,7 +456,12 @@ func TestStopAllStopsRunningRoles(t *testing.T) {
 	}
 }
 
-func TestRoleSwitchStopsOldProcess(t *testing.T) {
+// Changing the selected mode must NOT stop the running role: a toggle
+// is a selection, and the running role keeps working until the user
+// actually starts the other one (whose start stops it — see
+// TestStartingOneRoleStopsTheOther). Stopping on a mere toggle would
+// kill a working session the instant someone clicks the other chip.
+func TestModeToggleKeepsRunningRole(t *testing.T) {
 	a, _ := newTestApp(t)
 	if _, err := a.ServerStart(); err != nil {
 		t.Fatal(err)
@@ -465,16 +470,29 @@ func TestRoleSwitchStopsOldProcess(t *testing.T) {
 		t.Fatal("server should be running")
 	}
 
-	// Switching to client mode must stop the server: a machine runs one
-	// role at a time.
+	// Toggling to client mode is a selection: the server keeps running.
 	s := a.GetSettings()
 	s.Mode = ModeClient
 	s.ClientAddr = "127.0.0.1:24800"
 	if err := a.SetSettings(s); err != nil {
 		t.Fatal(err)
 	}
-	if a.ServerRunning() {
-		t.Fatal("role switch must stop the server process")
+	if !a.ServerRunning() {
+		t.Fatal("toggling mode must not stop the running server")
+	}
+	if a.settings.Mode != ModeClient {
+		t.Fatal("the selected mode should now be client")
+	}
+
+	// Toggling back to server is also just a selection — the running
+	// server keeps running, and a toggle spawns nothing (no duplicate).
+	s2 := a.GetSettings()
+	s2.Mode = ModeServer
+	if err := a.SetSettings(s2); err != nil {
+		t.Fatal(err)
+	}
+	if !a.ServerRunning() {
+		t.Fatal("server should still be running after toggling back")
 	}
 }
 

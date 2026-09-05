@@ -294,32 +294,22 @@ func (a *App) SetSettings(s Settings) error {
 	if !validLogLevel(s.LogLevel) {
 		return fmt.Errorf("unknown log level %q (use error, warn, info, debug or trace)", s.LogLevel)
 	}
-	changed := a.settings.Mode != s.Mode
 	a.settings = s
 	a.saveSettingsLocked()
 	// The level/enabled the user picked must apply to the running
 	// instance (hot reload) and to whichever role starts next.
 	a.writeLogCtlLocked(roleServer)
 	a.writeLogCtlLocked(roleClient)
-	if changed {
-		// Switching roles: the old role's instance is no longer wanted.
-		// A role that refuses to stop (e.g. an elevated process outranking
-		// the GUI) must surface as an error — otherwise the new role's
-		// start would fail against its lock with no explanation.
-		var err error
-		if s.Mode == ModeClient {
-			err = a.stopRoleLocked(roleServer)
-		} else {
-			err = a.stopRoleLocked(roleClient)
-		}
-		if err != nil {
-			return err
-		}
-		// Becoming the server means input isolation applies: make sure
-		// the system grant exists (silent once granted).
-		if s.Mode == ModeServer {
-			a.ensureInputAccess()
-		}
+	// Changing mode is a *selection*, not a command to stop anything:
+	// the role currently running on this machine keeps running until the
+	// user starts the other one. Starting a role stops the opposite role
+	// first (ServerStart / ClientStart) — cleanup belongs at the moment
+	// it matters, so toggling never silently kills a working session.
+	if s.Mode == ModeServer {
+		// Becoming the server means input isolation applies when it
+		// starts: make sure the system grant exists (silent once
+		// granted, and it never prompts when access already works).
+		a.ensureInputAccess()
 	}
 	return nil
 }
