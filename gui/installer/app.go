@@ -33,14 +33,14 @@ type Snapshot struct {
 
 // Installer is the Wails-bound service.
 type Installer struct {
-	mu      sync.Mutex
-	latest  string
-	busy    bool
-	phase   string
+	mu       sync.Mutex
+	latest   string
+	busy     bool
+	phase    string
 	progress float64
-	log     []string
-	err     string
-	done    bool
+	log      []string
+	err      string
+	done     bool
 }
 
 // NewInstaller builds the service and primes the latest-version check.

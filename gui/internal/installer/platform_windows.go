@@ -41,17 +41,9 @@ func integrateDesktop(dir string) error {
 	if err := registerUninstall(dir); err != nil {
 		problems = append(problems, fmt.Sprintf("uninstall entry: %v", err))
 	}
-	// A sample layout config on first install only — the server refuses
-	// to start without one (its --config must exist). The GUI also
-	// creates it on demand, so both fresh installs and upgrades are
-	// covered; existing layouts are never overwritten.
-	if home, err := os.UserHomeDir(); err == nil {
-		if err := selfupdate.EnsureServerConfig(
-			filepath.Join(home, ".config", "kvmshare", "kvmshare-server.toml"),
-		); err != nil {
-			problems = append(problems, fmt.Sprintf("sample config: %v", err))
-		}
-	}
+	// No layout config is written at install time: the server owns it and
+	// creates a machine-accurate default (this machine's real name +
+	// display, no invented clients) on its first start.
 	if len(problems) > 0 {
 		return fmt.Errorf("desktop integration had issues: %s", strings.Join(problems, "; "))
 	}
@@ -119,9 +111,9 @@ const (
 	// The value names under uacPrevKey: the old PromptOnSecureDesktop
 	// value, and whether it existed at all (absent means the default
 	// "secure desktop on", restored by deleting the value).
-	uacPrevValue    = "PromptOnSecureDesktopPrev"
-	uacPrevExisted  = "PromptOnSecureDesktopExisted"
-	uacPolicyValue  = "PromptOnSecureDesktop"
+	uacPrevValue   = "PromptOnSecureDesktopPrev"
+	uacPrevExisted = "PromptOnSecureDesktopExisted"
+	uacPolicyValue = "PromptOnSecureDesktop"
 )
 
 // EnsureUacAnswerable makes UAC prompts answerable by the shared input.
@@ -238,15 +230,15 @@ func registerUninstall(dir string) error {
 		version = "0.0.0"
 	}
 	vals := map[string]string{
-		"DisplayName":       "kvmshare",
-		"DisplayVersion":    strings.TrimPrefix(version, "v"),
-		"DisplayIcon":       filepath.Join(dir, "kvmshare-gui.exe"),
-		"InstallLocation":   dir,
-		"Publisher":         "kvmshare",
-		"UninstallString":   filepath.Join(dir, "kvmshare-install.exe") + " --uninstall",
-		"URLInfoAbout":      "https://github.com/YELrhilassi/kvmshare",
-		"NoModify":          "1",
-		"NoRepair":          "1",
+		"DisplayName":          "kvmshare",
+		"DisplayVersion":       strings.TrimPrefix(version, "v"),
+		"DisplayIcon":          filepath.Join(dir, "kvmshare-gui.exe"),
+		"InstallLocation":      dir,
+		"Publisher":            "kvmshare",
+		"UninstallString":      filepath.Join(dir, "kvmshare-install.exe") + " --uninstall",
+		"URLInfoAbout":         "https://github.com/YELrhilassi/kvmshare",
+		"NoModify":             "1",
+		"NoRepair":             "1",
 		"QuietUninstallString": filepath.Join(dir, "kvmshare-install.exe") + " --uninstall",
 	}
 	for name, value := range vals {

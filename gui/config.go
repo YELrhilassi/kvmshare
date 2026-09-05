@@ -133,13 +133,19 @@ func (a *App) SaveConfig(cfg Config) error {
 }
 
 // defaultConfig is shown when no config file exists yet (never written
-// until the user saves).
+// until the user saves). It describes this machine only — the real
+// server binary creates the same shape (its own name + display) on its
+// first start, so the two defaults agree and no invented client screens
+// ever appear.
 func defaultConfig() Config {
+	name := "server"
+	if h, err := os.Hostname(); err == nil && strings.TrimSpace(h) != "" {
+		name = strings.TrimSpace(h)
+	}
 	return Config{
 		Port: defaultPort,
 		Screens: []Screen{
-			{Name: "server", Width: defaultScreenW, Height: defaultScreenH, X: 0, Y: 0},
-			{Name: "client", Width: defaultScreenW, Height: defaultScreenH, X: -defaultScreenW, Y: 0},
+			{Name: name, Width: defaultScreenW, Height: defaultScreenH, X: 0, Y: 0},
 		},
 	}
 }

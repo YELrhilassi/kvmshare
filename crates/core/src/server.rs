@@ -437,11 +437,13 @@ impl Server {
         engine: &Arc<Mutex<Box<dyn Engine>>>,
     ) -> io::Result<()> {
         let Control::Reload(layout) = cmd;
-        let screen_count = layout.screens.len();
-        log_info!("layout reloaded: {screen_count} screens");
+        log_info!("layout reloaded: {} screens", layout.screens.len());
 
         // 1. Let the session adopt the new layout; it may ask us to bring
-        //    the cursor home (it was on a client).
+        //    the cursor home (it was on a client). The session keeps any
+        //    dynamically admitted client the config still does not name
+        //    (see [`Session::swap_layout`]), so an unrelated edit never
+        //    kicks a live client off.
         let actions = { self.session.lock().unwrap().swap_layout(layout) };
         {
             let mut engine = engine.lock().unwrap();
@@ -813,7 +815,7 @@ impl Client {
         // must be noticed and dropped so the session returns home — see
         // [`CLIENT_SILENT_TIMEOUT`].
         let mut transport = Transport::with_read_timeout(stream, Some(CLIENT_READ_TIMEOUT))?;
-        let (id, name, info) = exchange_hello(&mut transport, &ctx)?;
+        let (id, name, info, admitted) = exchange_hello(&mut transport, &ctx)?;
         ctx.session.lock().unwrap().update_screen_info(id, info);
 
         // Send Welcome + current layout, then split the transport: the
@@ -834,17 +836,34 @@ impl Client {
         // Stable marker for the GUI's notification watcher (kept in sync
         // with the "disconnected" line in `teardown`): "client X connected".
         log_info!("client {} connected", client.name);
+        if admitted {
+            // The client was not in the layout and was admitted
+            // dynamically. Every already-connected client must learn the
+            // new screen map; the newcomer's Welcome already carries it.
+            log_info!(
+                "client {} was not in the layout — admitted dynamically; pin it in the Layout page to make the position permanent",
+                client.name
+            );
+            let layout = ctx.layout_snapshot();
+            for c in ctx.clients.lock().unwrap().values() {
+                let _ = c.out.send(route(Message::Layout { layout: layout.clone() }));
+            }
+        }
         service_client(client, reader, ctx);
         Ok(())
     }
 }
 
-/// Handshake: expect Hello with a matching protocol version, then
-/// assign the screen id from the layout, matched by name.
+/// Handshake: expect Hello with a matching protocol version, then find
+/// the client a screen. A client whose name is not in the layout is
+/// admitted dynamically (see [`Session::admit_client`]) instead of being
+/// rejected — a fresh pair of machines works before either has been
+/// configured. The only refusals left are a protocol version mismatch
+/// and a name that collides with the server's own screen.
 fn exchange_hello(
     transport: &mut Transport,
     ctx: &ClientCtx,
-) -> io::Result<(u8, String, ScreenInfo)> {
+) -> io::Result<(u8, String, ScreenInfo, bool)> {
     let (name, info) = match transport.recv()? {
         RecvResult::Msg(Message::Hello { version, name, info }) => {
             if version != kvmshare_protocol::VERSION {
@@ -864,17 +883,17 @@ fn exchange_hello(
             return Err(io::Error::other("client closed before hello"))
         }
     };
-    let id = match ctx.session.lock().unwrap().assign_screen_id(&name) {
-        Some(id) => id,
+    let (id, admitted) = match ctx.session.lock().unwrap().admit_client(&name, info.clone()) {
+        Some(admitted) => admitted,
         None => {
             let _ = transport.send(&Message::Error {
                 code: errors::NAME_CONFLICT,
-                text: format!("no screen named \"{name}\" in the layout"),
+                text: format!("a machine cannot connect as \"{name}\" — that is this server's own screen"),
             });
-            return Err(io::Error::other(format!("unknown client name {name}")));
+            return Err(io::Error::other(format!("client name {name} conflicts with the local screen")));
         }
     };
-    Ok((id, name, info))
+    Ok((id, name, info, admitted))
 }
 
 /// The reader thread: services one client's TCP control channel until it

@@ -426,11 +426,18 @@ fn client_disconnect_returns_cursor_home() {
 }
 
 #[test]
-fn unknown_client_name_is_rejected() {
-    let h = start_server();
+fn unknown_client_is_admitted_dynamically() {
+    // A client the layout has never heard of is admitted on the spot
+    // (placed right of the desktop) instead of being rejected — a fresh
+    // pair of machines works before either has been configured.
+    let h = start_server(); // pc at origin, hp configured to the left
     let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
-    let err = Client::connect(&format!("127.0.0.1:{}", h.port), "not-in-layout", info).unwrap_err();
-    assert!(err.to_string().contains("no screen named"), "got: {err}");
+    let client = Client::connect(&format!("127.0.0.1:{}", h.port), "not-in-layout", info).unwrap();
+    // pc=0 and hp=1 are taken; the newcomer gets the next free id and
+    // the server registered it.
+    assert_eq!(client.own_id(), 2);
+    h.wait_for_clients(1);
+    assert_eq!(h.server.client_count(), 1);
 }
 
 #[test]

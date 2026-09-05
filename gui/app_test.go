@@ -118,13 +118,14 @@ func TestConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Screens) != 2 {
-		t.Fatalf("default config screens = %d, want 2", len(cfg.Screens))
+	// The default describes this machine only — no invented client
+	// screens (clients are admitted when they connect).
+	if len(cfg.Screens) != 1 {
+		t.Fatalf("default config screens = %d, want 1", len(cfg.Screens))
 	}
 
 	cfg.Screens[0].Name = "pc"
-	cfg.Screens[1].Name = "hp"
-	cfg.Screens[1].X = -1920
+	cfg.Screens = append(cfg.Screens, Screen{Name: "hp", Width: 1920, Height: 1080, X: -1920, Y: 0})
 	if err := a.SaveConfig(cfg); err != nil {
 		t.Fatal(err)
 	}

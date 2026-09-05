@@ -72,7 +72,7 @@
 
 use std::time::{Duration, Instant};
 
-use kvmshare_protocol::message::{Message, Rect};
+use kvmshare_protocol::message::{Message, Rect, Screen, ScreenInfo};
 
 use crate::layout::{Direction, Layout};
 use crate::Mode;
@@ -275,6 +275,14 @@ pub struct Session {
     /// accumulate and flush as whole pixels, so a 0.5 px/count gain never
     /// truncates slow motion away and never biases it upward).
     gain_rem: (f64, f64),
+    /// Screens admitted at runtime for clients the configured layout had
+    /// no screen for (see [`Session::admit_client`]). They live in
+    /// [`Self::layout`] alongside the configured screens while their
+    /// client is around; a config reload keeps the ones the config still
+    /// does not name and drops the ones the user has since pinned (or
+    /// removed) — so a Layout-page edit is authoritative, and a dynamic
+    /// client never flaps on an unrelated reload.
+    dynamic: Vec<Screen>,
 }
 
 impl Session {
@@ -294,6 +302,7 @@ impl Session {
             remote_pushing: None,
             gain: 1.0,
             gain_rem: (0.0, 0.0),
+            dynamic: Vec::new(),
         }
     }
 
@@ -319,6 +328,55 @@ impl Session {
         self.layout.screens.iter().find(|s| s.id != 0 && s.name == name).map(|s| s.id)
     }
 
+    /// Admit a client into the session's layout, dynamically if needed.
+    ///
+    /// A client whose name already maps to a configured screen is left
+    /// untouched (`admitted == false`). A client with no screen yet — a
+    /// machine the layout has never seen — is admitted on the spot: a
+    /// screen is created from its *reported* geometry and placed to the
+    /// right of the current desktop, so the very first connection of a
+    /// fresh pair of machines already works with zero layout
+    /// configuration. The Layout page is where a permanent position is
+    /// pinned; until then the screen exists only in the running session
+    /// (a config reload keeps it while the client stays connected and
+    /// drops it once the client is gone).
+    ///
+    /// Returns `None` only when the name collides with the server's own
+    /// screen (id 0 — a machine cannot connect to itself) or when every
+    /// screen id is taken.
+    pub fn admit_client(&mut self, name: &str, info: ScreenInfo) -> Option<(u8, bool)> {
+        if let Some(id) = self.assign_screen_id(name) {
+            return Some((id, false));
+        }
+        // The local screen is this server's own identity; its name is
+        // never assignable to a remote.
+        if self.layout.screens.iter().any(|s| s.id == 0 && s.name == name) {
+            return None;
+        }
+        let used: std::collections::HashSet<u8> = self.layout.screens.iter().map(|s| s.id).collect();
+        let id = (1u8..=u8::MAX).find(|c| !used.contains(c))?;
+        // Reported geometry is physical pixels; the layout works in
+        // logical ones (same conversion as [`Self::update_screen_info`]).
+        let w = (info.width as f32 / info.scale.max(0.1)) as i32;
+        let h = (info.height as f32 / info.scale.max(0.1)) as i32;
+        // To the right of everything currently on the desktop — the
+        // plug-and-play default, collision-free because no existing
+        // screen extends further right. The user rearranges it later in
+        // the Layout page; `normalized()` then snaps it like any
+        // GUI-built layout.
+        let x = self.layout.screens.iter().map(|s| s.rect.x + s.rect.w).max().unwrap_or(0);
+        let y = self.local.y;
+        let screen = Screen {
+            id,
+            name: name.to_owned(),
+            rect: Rect { x, y, w: w.max(1), h: h.max(1) },
+        };
+        self.dynamic.push(screen.clone());
+        self.layout.screens.push(screen);
+        self.layout = self.layout.normalized();
+        Some((id, true))
+    }
+
     /// A client reported a new screen shape: resize its rect in the
     /// layout (position stays). Used to keep edge math correct after
     /// resolution/scale changes.
@@ -338,6 +396,13 @@ impl Session {
     /// the virtual cursor is re-anchored to the local center without
     /// moving the physical one. A layout whose local screen (id 0) is
     /// missing is rejected and leaves the session untouched.
+    ///
+    /// The incoming layout is authoritative for everything it names. A
+    /// dynamically admitted client whose screen the config still does
+    /// not provide rides along (so an unrelated layout edit never kicks
+    /// it off); one the user has since pinned into the config — or
+    /// removed — is dropped, because its configured copy (or its
+    /// absence) now rules.
     pub fn swap_layout(&mut self, layout: Layout) -> Vec<Action> {
         let local = match layout.find(0) {
             Some(s) => s.rect,
@@ -345,6 +410,18 @@ impl Session {
         };
         let was_remote = self.cursor.mode != Mode::Local;
         let (cx, cy) = local.center();
+
+        let mut layout = layout;
+        let mut kept = Vec::with_capacity(self.dynamic.len());
+        for s in self.dynamic.drain(..) {
+            let pinned = layout.screens.iter().any(|d| d.name == s.name);
+            if !pinned {
+                layout.screens.push(s.clone());
+                kept.push(s);
+            }
+        }
+        self.dynamic = kept;
+        layout = layout.normalized();
         self.layout = layout;
         self.local = local;
         self.cursor = Cursor { x: cx, y: cy, mode: Mode::Local };

@@ -46,8 +46,8 @@ chmod +x kvmshare-install
 The installer is a compiled Go binary (no shell scripts): it downloads
 the release archive for your platform, verifies it against the
 release's `SHA256SUMS`, installs the binaries to `~/.local/bin`, and
-writes the desktop entry, icon and a sample config on first install.
-Running it again updates everything in place.
+writes the desktop entry and icon. Running it again updates everything
+in place.
 
 Alternatively, the GUI has the same machinery built in: the version
 line on the Home page checks GitHub for a newer release and installs +
@@ -62,8 +62,8 @@ libwebkitgtk60-devel`).
 
 ```bash
 make build       # compile everything (release Rust + GUI)
-make install     # copy binaries to ~/.local/bin, config to ~/.config/kvmshare,
-                 # launcher to ~/.local/share/applications
+make install     # copy binaries to ~/.local/bin, launcher to ~/.local/share/applications
+                 # (the server creates its layout config on first start)
 ```
 
 After `make install`, `kvmshare-server`, `kvmshare-client` and `kvmshare-gui`
@@ -97,24 +97,34 @@ Other targets: `make test` (full Rust **and** Go GUI suites), `make clean`,
 
 ### Server (the machine whose keyboard/mouse is shared)
 
+There is nothing to configure to get started: the first time the server
+runs it creates its layout at
+`~/.config/kvmshare/kvmshare-server.toml` describing **this machine
+only** — its real hostname and display geometry — and logs that it did
+so. Clients are then **admitted dynamically**: the first machine that
+connects is placed to the right of the server's screen and works
+immediately. Pin a permanent position any time from the GUI's Layout
+page (the change applies live, no restart) or by editing the file:
+
 ```toml
-# kvmshare-server.toml — the virtual desktop. The FIRST screen is this
-# machine (the server). Client names must match the client's hostname
-# (or whatever --name the client was started with).
+# kvmshare-server.toml — the virtual desktop. The FIRST screen is always
+# this machine (the server). Each client screen is matched by the name
+# the client sends (its hostname, or --name). Positions are relative to
+# the server screen: x < 0 = to the LEFT, x > 0 = to the RIGHT.
 port = 24800
 
 [[screens]]
-name = "pc"
+name = "this-host"
 width = 1920
 height = 1080
 x = 0
 y = 0
 
 [[screens]]
-name = "hp"
+name = "laptop"
 width = 1920
 height = 1080
-x = -1920   # hp sits to the LEFT of pc
+x = -1920   # laptop sits to the LEFT of the server
 y = 0
 ```
 
@@ -125,11 +135,12 @@ kvmshare-server --config kvmshare-server.toml
 ### Client (a machine being controlled)
 
 ```bash
-kvmshare-client pc:24800            # name defaults to this machine's hostname
-kvmshare-client pc:24800 --name hp  # ...or be explicit
+kvmshare-client 192.168.1.86:24800          # name defaults to this machine's hostname
+kvmshare-client 192.168.1.86:24800 --name laptop  # ...or be explicit
 ```
 
-That's it: move the cursor to the left edge of pc and it slides onto hp.
+That's it: move the cursor to the edge of the server's screen next to
+the client and it slides onto the client.
 
 ### GUI
 

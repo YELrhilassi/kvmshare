@@ -39,6 +39,72 @@ fn assign_screen_id_matches_by_name() {
 }
 
 #[test]
+fn admit_known_client_does_not_change_the_layout() {
+    let mut s = two_screens();
+    let before = s.layout().clone();
+    let (id, admitted) = s
+        .admit_client("hp", kvmshare_protocol::message::ScreenInfo { width: 1920, height: 1080, scale: 1.0 })
+        .unwrap();
+    assert_eq!((id, admitted), (1, false));
+    assert_eq!(s.layout(), &before);
+}
+
+#[test]
+fn admit_unknown_client_places_it_right_of_the_desktop() {
+    let mut s = two_screens(); // pc at origin, hp to the left (x=-1920)
+    let (id, admitted) = s
+        .admit_client("mac", kvmshare_protocol::message::ScreenInfo { width: 2560, height: 1440, scale: 1.0 })
+        .unwrap();
+    assert_eq!((id, admitted), (2, true));
+    let mac = s.layout().find(2).unwrap();
+    // Right of the rightmost edge (pc's right edge at x=1920), so it
+    // can never overlap an existing screen.
+    assert_eq!(mac.rect.x, 1920);
+    assert_eq!((mac.rect.w, mac.rect.h), (2560, 1440));
+    // Existing screens are untouched.
+    assert_eq!(s.layout().find(0).unwrap().rect.x, 0);
+    assert_eq!(s.layout().find(1).unwrap().rect.x, -1920);
+}
+
+#[test]
+fn admit_unknown_client_keeps_its_id_across_reconnects() {
+    let mut s = two_screens();
+    let (id, _) = s
+        .admit_client("mac", kvmshare_protocol::message::ScreenInfo { width: 2560, height: 1440, scale: 1.0 })
+        .unwrap();
+    // A reconnect with the same name resolves to the same screen; the
+    // caller separately applies the fresh geometry report.
+    let (again, admitted) = s
+        .admit_client("mac", kvmshare_protocol::message::ScreenInfo { width: 1920, height: 1080, scale: 1.0 })
+        .unwrap();
+    assert_eq!(again, id);
+    assert!(!admitted);
+    assert_eq!(s.layout().find(id).unwrap().rect.w, 2560); // untouched
+}
+
+#[test]
+fn admit_client_scales_reported_physical_pixels_to_logical() {
+    let mut s = two_screens();
+    // A 150%-scaled 4K display reports physical pixels; the layout
+    // works in logical ones.
+    let (id, admitted) = s
+        .admit_client("hi", kvmshare_protocol::message::ScreenInfo { width: 3840, height: 2160, scale: 1.5 })
+        .unwrap();
+    assert!(admitted);
+    assert_eq!(s.layout().find(id).unwrap().rect.w, 2560);
+    assert_eq!(s.layout().find(id).unwrap().rect.h, 1440);
+}
+
+#[test]
+fn admit_client_refuses_the_local_screen_name() {
+    let mut s = two_screens(); // the local screen is "pc"
+    let got = s.admit_client("pc", kvmshare_protocol::message::ScreenInfo { width: 1920, height: 1080, scale: 1.0 });
+    assert_eq!(got, None);
+    // Nothing was added.
+    assert_eq!(s.layout().screens.len(), 2);
+}
+
+#[test]
 fn update_screen_info_resizes_rect() {
     let mut s = two_screens();
     s.update_screen_info(1, kvmshare_protocol::message::ScreenInfo { width: 2560, height: 1440, scale: 1.0 });

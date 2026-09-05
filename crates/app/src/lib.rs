@@ -37,7 +37,13 @@ pub const DEFAULT_SCREEN_H: u32 = 1080;
 /// remaining screens are clients, matched by the name a client sends in
 /// its `Hello` (by default its hostname). Positions are relative to the
 /// server screen: a client to the left has a negative `x`.
-#[derive(Debug, Clone, serde::Deserialize)]
+///
+/// A config describes **one machine's role as a server**. It is loaded
+/// and hot-reloaded only by that machine's server process, so the
+/// server layout never collides with the same machine acting as a
+/// client (a client obeys the *remote* server's layout, which it
+/// receives on the wire).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
@@ -45,7 +51,7 @@ pub struct Config {
     pub screens: Vec<ScreenConfig>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScreenConfig {
     pub name: String,
     #[serde(default = "default_width")]
@@ -122,30 +128,73 @@ impl Config {
         Layout::new(screens).normalized()
     }
 
-    /// A default two-machine config, handy for first runs and tests.
-    pub fn example() -> Self {
+    /// A default config describing *this machine only*: the server's own
+    /// screen under its real hostname and its real display geometry, and
+    /// no invented clients. Clients are admitted dynamically when they
+    /// connect and can be pinned into a permanent position from the
+    /// Layout page — a machine-accurate starting point beats a sample
+    /// that assumes someone else's two-machine desktop.
+    pub fn for_this_machine() -> Self {
+        let (w, h) = match kvmshare_platform::primary_display() {
+            // ScreenInfo carries physical pixels + DPI scale; layout
+            // coordinates are logical, so divide (same conversion the
+            // running session applies to client reports).
+            Some(info) => {
+                let s = info.scale.max(0.1);
+                ((info.width as f32 / s) as u32, (info.height as f32 / s) as u32)
+            }
+            None => (DEFAULT_SCREEN_W, DEFAULT_SCREEN_H),
+        };
         Self {
             port: DEFAULT_PORT,
-            screens: vec![
-                ScreenConfig {
-                    name: "server".into(),
-                    width: DEFAULT_SCREEN_W,
-                    height: DEFAULT_SCREEN_H,
-                    x: 0,
-                    y: 0,
-                    scale: 1.0,
-                },
-                ScreenConfig {
-                    name: "client".into(),
-                    width: DEFAULT_SCREEN_W,
-                    height: DEFAULT_SCREEN_H,
-                    x: -(DEFAULT_SCREEN_W as i32),
-                    y: 0,
-                    scale: 1.0,
-                },
-            ],
+            screens: vec![ScreenConfig {
+                name: hostname(),
+                width: w.max(1),
+                height: h.max(1),
+                x: 0,
+                y: 0,
+                scale: 1.0,
+            }],
         }
     }
+
+    /// Load the config at `path`, creating a machine-accurate default
+    /// (`[`Config::for_this_machine`]`) when nothing is there yet. The
+    /// caller learns whether the file was created so it can say so.
+    ///
+    /// This is the only path a *first* server start goes through: a
+    /// missing config is never an error (the server would otherwise die
+    /// on a file it was about to create) and never a stale copy of
+    /// another machine's layout.
+    pub fn load_or_create(path: &Path) -> Result<(Self, bool), String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let cfg: Config = toml::from_str(&text)
+                    .map_err(|e| format!("parse {}: {e}", path.display()))?;
+                cfg.validate()?;
+                Ok((cfg, false))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let cfg = Self::for_this_machine();
+                let text = toml::to_string_pretty(&cfg)
+                    .map_err(|e| format!("encode default config: {e}"))?;
+                atomic_write(path, &text)?;
+                Ok((cfg, true))
+            }
+            Err(e) => Err(format!("read {}: {e}", path.display())),
+        }
+    }
+}
+
+/// Write `text` to `path` atomically (temp file + rename), creating
+/// parent directories. The running server watches this file, so it must
+/// never observe a torn write.
+fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -252,20 +301,30 @@ pub fn with_default_port(host: &str, default_port: u16) -> String {
 // Host name
 // ---------------------------------------------------------------------------
 
-/// The machine's host name, used as the default client name.
+/// The machine's host name, used as the default client name and as the
+/// name of a server's own screen in a freshly created layout. The OS
+/// query itself lives in `kvmshare-platform` (per-OS); here we only add
+/// the cheap portable hints on top and settle on a neutral placeholder
+/// if even the OS refuses.
 pub fn hostname() -> String {
     if let Ok(h) = std::env::var("HOSTNAME") {
         if !h.is_empty() {
             return h;
         }
     }
+    #[cfg(target_os = "linux")]
     if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
         let h = h.trim().to_owned();
         if !h.is_empty() {
             return h;
         }
     }
-    "client".into()
+    let h = kvmshare_platform::hostname();
+    if h.is_empty() {
+        "client".into()
+    } else {
+        h
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -133,13 +133,21 @@ impl Win32Injector {
     }
 }
 
+/// The primary display's geometry the way the injector reports it
+/// (physical pixels + DPI scale). A free function so the server can ask
+/// for the same numbers before any injector exists — it builds its
+/// default layout from this on first run.
+pub(super) fn system_screen_info() -> ScreenInfo {
+    let (w, h) = Win32Injector::screen_size();
+    // SAFETY: GetDpiForSystem is available on Windows 10 1607+;
+    // older systems fail and we fall back to 96 (scale 1.0).
+    let scale = (unsafe { hidpi::GetDpiForSystem() } as f64 / 96.0) as f32;
+    ScreenInfo { width: w.max(0) as u32, height: h.max(0) as u32, scale }
+}
+
 impl Injector for Win32Injector {
     fn screen_info(&mut self) -> ScreenInfo {
-        let (w, h) = Self::screen_size();
-        // SAFETY: GetDpiForSystem is available on Windows 10 1607+;
-        // older systems fail and we fall back to 96 (scale 1.0).
-        let scale = (unsafe { hidpi::GetDpiForSystem() } as f64 / 96.0) as f32;
-        ScreenInfo { width: w.max(0) as u32, height: h.max(0) as u32, scale }
+        system_screen_info()
     }
 
     fn move_cursor(&mut self, x: i32, y: i32) {

@@ -73,3 +73,19 @@ pub fn client_injector(
         Box::new(injector::X11Clipboard::new(display)),
     ))
 }
+
+/// The primary display's real geometry (physical pixels), read with a
+/// short-lived X connection of its own so it can be queried before the
+/// capture/engine connections exist (the server builds its default
+/// layout from this before starting the platform). Best-effort: `None`
+/// when no display is reachable.
+pub fn primary_display() -> Option<kvmshare_protocol::message::ScreenInfo> {
+    use x11rb::connection::Connection;
+    let (conn, _) = x11rb::rust_connection::RustConnection::connect(None).ok()?;
+    let root = conn.setup().roots.first()?;
+    Some(kvmshare_protocol::message::ScreenInfo {
+        width: root.width_in_pixels as u32,
+        height: root.height_in_pixels as u32,
+        scale: 1.0,
+    })
+}

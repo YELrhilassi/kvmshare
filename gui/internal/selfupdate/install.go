@@ -25,25 +25,6 @@ var IconBytes []byte
 //go:embed assets/kvmshare.desktop
 var desktopEntry []byte
 
-//go:embed assets/kvmshare-server.toml
-var sampleConfig []byte
-
-// EnsureServerConfig writes the sample server config to `path` when
-// nothing is there yet. Existing layouts are never touched — the sample
-// is only a starting point the layout editor refines. Every entry point
-// that can precede a server start calls this, so a server binary is
-// never spawned with a --config pointing at a file that does not exist
-// (which would make it exit immediately with a confusing read error).
-func EnsureServerConfig(path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil // already configured — leave the user's layout alone
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, sampleConfig, 0o644)
-}
-
 // InstallDir is where release binaries land.
 //
 //	Linux:  ~/.local/bin        (already on PATH for most setups)
@@ -158,13 +139,10 @@ func installExtras() error {
 			}
 		}
 	}
-	// Sample config on first install only — existing layouts must survive
-	// updates untouched.
-	cfg := filepath.Join(home, ".config", "kvmshare", "kvmshare-server.toml")
-	if _, err := os.Stat(cfg); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(cfg), 0o755); err == nil {
-			_ = os.WriteFile(cfg, sampleConfig, 0o644)
-		}
-	}
+	// No server-layout sample is written here: the server owns its layout
+	// config and creates a machine-accurate default (this machine's real
+	// name + display, no invented clients) on its first start — a fresh
+	// install connects as a client, and the layout file appears when this
+	// machine first serves.
 	return nil
 }

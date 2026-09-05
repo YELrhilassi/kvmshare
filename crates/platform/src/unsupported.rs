@@ -41,3 +41,7 @@ pub fn client(
 ) -> Result<(Box<dyn Injector>, Box<dyn Clipboard>), String> {
     Err(MSG.into())
 }
+
+pub fn primary_display() -> Option<kvmshare_protocol::message::ScreenInfo> {
+    None
+}

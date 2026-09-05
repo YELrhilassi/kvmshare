@@ -27,8 +27,6 @@ import (
 	"runtime"
 	"sync"
 	"time"
-
-	"kvmshare/gui/internal/selfupdate"
 )
 
 // Mode is what this machine does in the KVM.
@@ -103,12 +101,12 @@ func NewApp() *App {
 	home, _ := os.UserHomeDir()
 
 	// An explicit KVMSHARE_CONFIG wins as-is (the operator owns it).
-	// Otherwise the canonical per-user location is used and **created
-	// when missing**: a server must never be spawned with a --config
-	// pointing at a file that does not exist, or it exits immediately
-	// (Config::load is fatal) with a confusing error. The sample is a
-	// starting layout the layout editor refines — first run only, the
-	// user's layout is never overwritten.
+	// Otherwise the canonical per-user location is used. The GUI does
+	// **not** pre-create this file: the server owns its layout config
+	// and creates a machine-accurate default itself on first start (this
+	// machine's real name + display, no invented clients), so the GUI and
+	// the server can never disagree about who wrote it first. The Layout
+	// page simply shows a placeholder view until that file exists.
 	configPath := firstNonEmpty(os.Getenv("KVMSHARE_CONFIG"))
 	if configPath == "" {
 		if home != "" {
@@ -117,7 +115,6 @@ func NewApp() *App {
 			// No home at all (rare): fall back next to the executable.
 			configPath = filepath.Join(dir, "kvmshare-server.toml")
 		}
-		_ = selfupdate.EnsureServerConfig(configPath)
 	}
 
 	serverPath := firstNonEmpty(os.Getenv("KVMSHARE_SERVER"))

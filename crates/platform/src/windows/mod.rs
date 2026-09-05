@@ -67,6 +67,35 @@ pub fn secure_desktop_active() -> bool {
     isolation::secure_desktop_active()
 }
 
+/// The primary display's real geometry (physical pixels + DPI scale),
+/// used to build machine-accurate default layouts on first run. This
+/// process is per-monitor DPI aware (see [`set_dpi_aware`]), so the
+/// metrics are physical — same space [`injector`] reports.
+pub fn primary_display() -> Option<kvmshare_protocol::message::ScreenInfo> {
+    Some(injector::system_screen_info())
+}
+
+/// The computer name via `GetComputerNameW` (the host name Windows
+/// actually uses). Best-effort: an empty string when the call fails.
+pub fn hostname() -> String {
+    use windows_sys::Win32::System::WindowsProgramming as wp;
+    // SAFETY: GetComputerNameW writes into `buf` and tells us the real
+    // length (chars, excluding the terminator); `buf` outlives the call.
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { wp::GetComputerNameW(buf.as_mut_ptr(), &mut len) };
+    if ok == 0 {
+        return String::new();
+    }
+    // COMPUTERNAME can differ from the FQDN computer name; prefer the
+    // short form Windows displays everywhere.
+    let short = String::from_utf16_lossy(&buf[..len as usize]).trim().to_owned();
+    if !short.is_empty() {
+        return short;
+    }
+    String::new()
+}
+
 /// The server-side Windows platform: local input capture + local cursor
 /// engine + the standalone clipboard service.
 pub struct Server {

@@ -85,7 +85,6 @@ func integrateDesktop(dir string) error {
 	return EnsureInputAccess()
 }
 
-
 // IsElevated reports whether this process can write privileged system
 // locations (root). The Linux uninstall already falls back gracefully
 // without it, so this only drives Windows' self-elevation; Linux keeps

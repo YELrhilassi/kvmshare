@@ -40,15 +40,28 @@ fn run() -> Result<(), String> {
     let _guard: RoleGuard = guard::acquire(guard::ROLE_SERVER)?;
 
     // Config → layout → session (the switching brain). When no --config
-    // is given, fall back to the standard locations.
+    // is given, fall back to the standard locations. A config that does
+    // not exist yet is never an error: the server creates a
+    // machine-accurate default (this machine's real name + display, no
+    // invented clients) and says so — a server must never die on a file
+    // it is about to create, and never inherit some other machine's
+    // layout. The Layout page is where the user pins clients in
+    // permanently; until then each client is admitted dynamically on
+    // its first connect.
     let config_path = args.config.unwrap_or_else(default_config_path);
-    let cfg = Config::load(&config_path)?;
+    let (cfg, created) = Config::load_or_create(&config_path)?;
     let port = if args.port != 0 { args.port } else { cfg.port };
     log_info!(
         "layout {} screens (local: {}), listening on :{port}",
         cfg.screens.len(),
         cfg.screens[0].name
     );
+    if created {
+        log_info!(
+            "no layout at {} — created a default describing this machine only; clients are added dynamically on first connect and can be pinned in the Layout page",
+            config_path.display()
+        );
+    }
 
     // Platform: capture local input + control the local cursor, and the
     // standalone clipboard service (its own lock — see the poller docs).

@@ -119,6 +119,54 @@ pub fn secure_desktop_active() -> bool {
     }
 }
 
+/// The local machine's primary display geometry (physical pixels + DPI
+/// scale). The server builds its first-run default layout from this, so
+/// a freshly configured machine always describes *itself* correctly —
+/// never a copy of some other machine's layout. Best-effort: `None`
+/// when no display is reachable (headless); callers fall back to sane
+/// defaults.
+pub fn primary_display() -> Option<kvmshare_protocol::message::ScreenInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        x11::primary_display()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::primary_display()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        unsupported::primary_display()
+    }
+}
+
+/// The local machine's host name, straight from the OS. Used as the
+/// default client name and as the name of a server's own screen in a
+/// freshly created layout. Returns an empty string only if the OS call
+/// fails; callers decide the placeholder.
+pub fn hostname() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        windows::hostname()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes at most `buf.len()` bytes and
+        // NUL-terminates; `buf` outlives the call.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            return String::from_utf8_lossy(&buf[..end]).trim().to_owned();
+        }
+        String::new()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        String::new()
+    }
+}
+
 /// Build the client-side platform: an input injector and the standalone
 /// clipboard service. They are returned separately because the clipboard
 /// lives on its own lock and thread in the client — a clipboard call
