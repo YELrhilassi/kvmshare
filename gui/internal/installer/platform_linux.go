@@ -1,6 +1,6 @@
 //go:build linux
 
-package main
+package installer
 
 // Linux system integration for the installer: input-device access.
 //
@@ -82,7 +82,7 @@ func elevatingUser() (*user.User, error) {
 // Failure is a warning, never an install failure — without the rule the
 // software still works, only raw-event leaks to raw-reading apps remain.
 func integrateDesktop(dir string) error {
-	return ensureInputAccess()
+	return EnsureInputAccess()
 }
 
 // ensureInputAccess is the --input-access entry point and the post-install
@@ -95,7 +95,7 @@ func integrateDesktop(dir string) error {
 // the devices as the real user; as root (the pkexec re-exec) it inspects
 // node ownership against the elevating user, because root can open
 // anything and an open-based probe would always answer "granted".
-func ensureInputAccess() error {
+func EnsureInputAccess() error {
 	if os.Geteuid() == 0 {
 		u, err := elevatingUser()
 		if err != nil {

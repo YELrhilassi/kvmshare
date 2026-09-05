@@ -1,13 +1,12 @@
 // kvmshare-install — the one file you download to get kvmshare on a
-// machine (and the file the release installer runs to update it).
+// machine from a terminal or script (the GUI installer is a Wails window
+// with the same engine behind it — see gui/installer).
 //
 // It fetches the latest release archive for this platform from GitHub,
 // verifies its checksum against the release's SHA256SUMS, extracts it,
-// and installs the binaries plus per-platform desktop integration (Linux:
-// desktop entry + icon + sample config; Windows: Start Menu and desktop
-// shortcuts, app icon, Add/Remove Programs entry). Running it again
-// updates everything in place. A --local directory installs straight from
-// a folder of built binaries, no network needed (used for testing).
+// and installs the binaries plus per-platform desktop integration. This
+// CLI keeps every verb for scripting; the GUI installer covers the same
+// ground interactively.
 //
 //	kvmshare-install                 install the latest release
 //	kvmshare-install --version v0.1.0   install a specific version
@@ -21,12 +20,11 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
+	"kvmshare/gui/internal/installer"
 	"kvmshare/gui/internal/selfupdate"
 )
 
@@ -41,19 +39,19 @@ func main() {
 	flag.Parse()
 
 	// Privileged subcommand: invoked by this same binary through pkexec
-	// after a normal install (see integrate_linux.go on Linux). Grant-
+	// after a normal install (see platform_linux.go on Linux). Grant-
 	// only-if-missing so callers (install, update, GUI startup, make
 	// install) can invoke it unconditionally without ever re-prompting
 	// once granted.
 	if *inputAccess {
-		if err := ensureInputAccess(); err != nil {
+		if err := installer.EnsureInputAccess(); err != nil {
 			fatal(err)
 		}
 		return
 	}
 
 	if *uninstall {
-		if err := uninstallAll(); err != nil {
+		if err := installer.Uninstall(printf); err != nil {
 			fatal(err)
 		}
 		return
@@ -62,11 +60,11 @@ func main() {
 	dir := selfupdate.InstallDir()
 
 	if *local != "" {
-		if err := installLocal(*local); err != nil {
+		if err := installer.InstallLocal(*local, printf); err != nil {
 			fatal(err)
 		}
 	} else {
-		rel, err := selfupdate.FetchRelease(os.Getenv("KVMSHARE_UPSTREAM"))
+		rel, err := installer.Check(os.Getenv("KVMSHARE_UPSTREAM"))
 		if err != nil {
 			fatal(err)
 		}
@@ -82,18 +80,22 @@ func main() {
 		} else {
 			fmt.Printf("kvmshare-install: installing %s\n", tag)
 		}
-		if err := installRelease(tag, rel); err != nil {
+		if err := installer.Install(installer.Options{
+			Tag:      tag,
+			Upstream: os.Getenv("KVMSHARE_UPSTREAM"),
+			Log:      printf,
+		}); err != nil {
 			fatal(err)
 		}
 	}
 
-	if err := integrateDesktop(dir); err != nil {
+	if err := installer.Integrate(dir, printf); err != nil {
 		fmt.Printf("kvmshare-install: warning: %v\n", err)
 	}
 	fmt.Printf("kvmshare-install: done — binaries in %s\n", dir)
 	if runtime.GOOS == "windows" {
 		fmt.Println("Launching kvmshare-gui...")
-		if err := launchGUI(dir); err != nil {
+		if err := installer.Launch(dir); err != nil {
 			fmt.Printf("kvmshare-install: launch failed: %v (start it manually)\n", err)
 		}
 	} else {
@@ -101,153 +103,8 @@ func main() {
 	}
 }
 
-// installRelease downloads `tag`'s archive for this platform (reusing the
-// `rel` metadata), verifies it, extracts and applies it.
-func installRelease(tag string, rel *selfupdate.Release) error {
-	tmp, err := os.MkdirTemp("", "kvmshare-install-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmp)
-
-	// If the pinned tag is not the latest release we fetched, its
-	// metadata (asset URLs) may differ — refetch by tag.
-	if tag != rel.Tag {
-		r2, err := selfupdate.FetchReleaseTag(os.Getenv("KVMSHARE_UPSTREAM"), tag)
-		if err != nil {
-			return err
-		}
-		rel = r2
-	}
-
-	asset, err := rel.AssetFor()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("kvmshare-install: downloading %s (%d bytes)\n", asset.Name, asset.Size)
-	archive := filepath.Join(tmp, asset.Name)
-	if err := selfupdate.Download(asset.URL, archive); err != nil {
-		return err
-	}
-
-	sums, err := selfupdate.FetchChecksums(rel)
-	if err != nil {
-		return err
-	}
-	expected, ok := sums[asset.Name]
-	if !ok {
-		return fmt.Errorf("SHA256SUMS has no entry for %s", asset.Name)
-	}
-	if err := selfupdate.VerifyFile(archive, expected); err != nil {
-		return err
-	}
-	fmt.Println("kvmshare-install: checksum ok")
-
-	extracted, err := selfupdate.Extract(archive, tmp)
-	if err != nil {
-		return err
-	}
-	written, err := selfupdate.Apply(extracted)
-	if err != nil {
-		return err
-	}
-	for _, p := range written {
-		fmt.Printf("kvmshare-install:   %s\n", p)
-	}
-	return nil
-}
-
-func uninstallAll() error {
-	dir := selfupdate.InstallDir()
-	removed := 0
-	for _, bin := range selfupdate.Binaries() {
-		p := filepath.Join(dir, bin)
-		if _, err := os.Stat(p); err == nil {
-			if err := os.Remove(p); err != nil {
-				return fmt.Errorf("remove %s: %w", p, err)
-			}
-			fmt.Printf("kvmshare-install: removed %s\n", p)
-			removed++
-		}
-	}
-	if err := removeDesktopIntegration(dir); err != nil {
-		fmt.Printf("kvmshare-install: warning cleaning desktop integration: %v\n", err)
-	}
-	if removed == 0 {
-		fmt.Println("kvmshare-install: nothing installed")
-	}
-	return nil
-}
-
-// installLocal installs from a directory that already contains the built
-// binaries (e.g. a dist/ folder or a manually extracted archive). Used for
-// testing before a release is published and for fully offline installs.
-//
-// The sources are staged as copies in a temp dir: Apply renames binaries
-// into place (fast, atomic on Windows), and renaming would otherwise
-// consume the user's source directory.
-func installLocal(dir string) error {
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return err
-	}
-	st, err := os.Stat(abs)
-	if err != nil {
-		return err
-	}
-	if !st.IsDir() {
-		return fmt.Errorf("--local %s is not a directory", abs)
-	}
-
-	tmp, err := os.MkdirTemp("", "kvmshare-local-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmp)
-
-	extracted := make(map[string]string, len(selfupdate.Binaries()))
-	for _, bin := range selfupdate.Binaries() {
-		src := filepath.Join(abs, bin)
-		if _, err := os.Stat(src); err != nil {
-			return fmt.Errorf("--local dir is missing %s", bin)
-		}
-		staged := filepath.Join(tmp, bin)
-		if err := copyFile(src, staged); err != nil {
-			return fmt.Errorf("stage %s: %w", bin, err)
-		}
-		extracted[bin] = staged
-	}
-	fmt.Printf("kvmshare-install: installing from %s\n", abs)
-	written, err := selfupdate.Apply(extracted)
-	if err != nil {
-		return err
-	}
-	for _, p := range written {
-		fmt.Printf("kvmshare-install:   %s\n", p)
-	}
-	return nil
-}
-
-// copyFile copies src to dst (used to stage --local sources so the
-// install's renames never touch the user's files).
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	return os.Chmod(dst, 0o755)
+func printf(format string, args ...any) {
+	fmt.Printf("kvmshare-install: "+format+"\n", args...)
 }
 
 func fatal(err error) {

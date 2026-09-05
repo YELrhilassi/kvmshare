@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>kvmshare installer</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #18181b;
+    --chrome: #09090b;
+    --card: #27272a;
+    --card-hi: #2f2f33;
+    --border: rgba(255, 255, 255, 0.09);
+    --fg: #fafafa;
+    --muted: #a1a1aa;
+    --primary: #e4e4e7;
+    --primary-fg: #18181b;
+    --destructive: #f87171;
+    --ok: #4ade80;
+    --radius: 12px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--chrome);
+    color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 24px 20px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 16px; }
+
+  /* Header */
+  header { display: flex; align-items: center; gap: 14px; padding: 4px 2px; }
+  .logo {
+    width: 44px; height: 44px; border-radius: 11px; flex: none;
+    background: linear-gradient(135deg, #3b3b40, #27272a);
+    border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .logo svg { width: 26px; height: 26px; }
+  h1 { font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
+  .tagline { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+
+  /* Cards */
+  .card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  .row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .row + .row { margin-top: 10px; }
+  .label { color: var(--muted); font-size: 12.5px; }
+  .value { font-variant-numeric: tabular-nums; font-size: 13.5px; }
+  .value code {
+    font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+    font-size: 12px; color: var(--fg); background: var(--card); padding: 2px 7px; border-radius: 6px;
+  }
+
+  /* Buttons */
+  .actions { display: flex; flex-direction: column; gap: 10px; }
+  button {
+    font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--border);
+    transition: filter 0.12s ease, opacity 0.12s ease, transform 0.05s ease;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btn-primary {
+    background: var(--primary); color: var(--primary-fg);
+    border: none; font-weight: 600; font-size: 15px; padding: 13px 16px;
+  }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.06); }
+  .btn-ghost {
+    background: transparent; color: var(--fg); padding: 10px 16px; font-size: 13.5px;
+  }
+  .btn-ghost:hover:not(:disabled) { background: var(--card); }
+  .btn-danger {
+    background: transparent; color: var(--destructive); padding: 10px 16px; font-size: 13.5px;
+    border-color: rgba(248, 113, 113, 0.25);
+  }
+  .btn-danger:hover:not(:disabled) { background: rgba(248, 113, 113, 0.08); }
+
+  /* Progress */
+  #progressCard { display: none; }
+  .progress-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 9px; }
+  #phase { color: var(--fg); font-size: 13px; }
+  #pct { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .bar {
+    height: 7px; border-radius: 999px; background: var(--card);
+    overflow: hidden; border: 1px solid var(--border);
+  }
+  .bar > div {
+    height: 100%; width: 0%;
+    background: var(--primary); border-radius: 999px;
+    transition: width 0.25s ease;
+  }
+
+  /* Log */
+  #logCard { display: none; }
+  #log {
+    font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+    font-size: 11.5px; line-height: 1.55; color: #d4d4d8;
+    background: var(--chrome); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; max-height: 180px; overflow-y: auto; white-space: pre-wrap;
+    word-break: break-all;
+  }
+  #logCard.visible { display: block; }
+
+  /* Error / done banners */
+  #banner { display: none; font-size: 13px; padding: 11px 14px; border-radius: 10px; }
+  #banner.error { display: block; color: var(--destructive); background: rgba(248,113,113,0.07); border: 1px solid rgba(248,113,113,0.25); }
+  #banner.done { display: block; color: var(--ok); background: rgba(74,222,128,0.07); border: 1px solid rgba(74,222,128,0.25); }
+
+  footer { color: var(--muted); font-size: 11.5px; text-align: center; margin-top: 2px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#e4e4e7" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2.5" y="5" width="13" height="9" rx="2.2" />
+          <path d="M8.5 5v9M5.5 17.5h4M7.5 17.5v2.2" />
+          <path d="M17 13.5c2.5-1.6 4-3.4 4.5-5.5" />
+          <circle cx="18.6" cy="16.4" r="2.6" />
+        </svg>
+      </div>
+      <div>
+        <h1>kvmshare</h1>
+        <div class="tagline">Share one keyboard and mouse across your machines.</div>
+      </div>
+    </header>
+
+    <div id="banner"></div>
+
+    <div class="card">
+      <div class="row">
+        <span class="label">Latest release</span>
+        <span class="value"><code id="latest">checking…</code></span>
+      </div>
+      <div class="row">
+        <span class="label">Install location</span>
+        <span class="value" id="dir">…</span>
+      </div>
+      <div class="row">
+        <span class="label">Status</span>
+        <span class="value" id="status">—</span>
+      </div>
+    </div>
+
+    <div class="card" id="progressCard">
+      <div class="progress-head">
+        <span id="phase">Working…</span>
+        <span id="pct">0%</span>
+      </div>
+      <div class="bar"><div id="fill"></div></div>
+    </div>
+
+    <div class="card" id="logCard">
+      <div class="label" style="margin-bottom:8px">Progress</div>
+      <div id="log"></div>
+    </div>
+
+    <div class="actions">
+      <button class="btn-primary" id="installBtn">Install kvmshare</button>
+      <div style="display:flex; gap:10px">
+        <button class="btn-ghost" id="launchBtn" style="flex:1">Launch</button>
+        <button class="btn-danger" id="uninstallBtn" style="flex:1">Uninstall</button>
+      </div>
+    </div>
+
+    <footer id="footer"></footer>
+  </div>
+
+<script>
+"use strict";
+const SVC = "main.Installer";
+
+async function runtime() {
+  if (!window.wails?.Call?.ByName) {
+    try { await import(/* webpackIgnore: true */ "/wails/runtime.js"); } catch (e) {}
+  }
+  const deadline = Date.now() + 5000;
+  while (!window.wails?.Call?.ByName) {
+    if (Date.now() > deadline) throw new Error("wails runtime did not load");
+    await new Promise(r => setTimeout(r, 25));
+  }
+  return window.wails.Call;
+}
+async function call(method, ...args) {
+  const r = await runtime();
+  return r.ByName(SVC + "." + method, ...args);
+}
+
+const $ = id => document.getElementById(id);
+let busy = false;
+let done = false;
+
+function render(s) {
+  busy = s.Busy;
+  $("latest").textContent = s.Latest ? s.Latest : "unknown";
+  $("dir").textContent = "…"; // filled by dir() below
+  $("status").textContent = s.Busy ? s.Phase : (s.Installed ? "installed" : "not installed");
+
+  const btn = $("installBtn");
+  btn.disabled = busy;
+  btn.textContent = s.Busy ? "Working…" : (s.Installed ? "Update to " + (s.Latest || "latest") : "Install kvmshare");
+
+  $("launchBtn").disabled = busy || !s.Installed;
+  $("uninstallBtn").disabled = busy || !s.Installed;
+
+  $("progressCard").style.display = s.Busy ? "block" : "none";
+  if (s.Busy) {
+    $("phase").textContent = s.Phase || "Working…";
+    $("pct").textContent = Math.round((s.Progress || 0) * 100) + "%";
+    $("fill").style.width = (s.Progress || 0) * 100 + "%";
+  }
+
+  const banner = $("banner");
+  banner.className = "";
+  banner.textContent = "";
+  if (s.Error) {
+    banner.className = "error";
+    banner.textContent = s.Error;
+  } else if (s.Done && !s.Busy) {
+    banner.className = "done";
+    banner.textContent = "kvmshare installed. You're all set.";
+  }
+
+  if (s.Log && s.Log.length) {
+    $("logCard").classList.add("visible");
+    const log = $("log");
+    log.textContent = s.Log.join("\n");
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+async function poll() {
+  try {
+    render(await call("Snapshot"));
+  } catch (e) {
+    $("status").textContent = "connecting…";
+  }
+  setTimeout(poll, 220);
+}
+
+async function boot() {
+  try {
+    const [v, p] = await Promise.all([call("AppVersion"), call("Platform")]);
+    $("footer").textContent = "kvmshare installer · " + (v === "dev" ? "development build" : v) + " · " + p;
+    $("dir").textContent = await call("InstallDir");
+  } catch (e) {}
+  poll();
+}
+
+$("installBtn").addEventListener("click", () => {
+  if (busy) return;
+  call("InstallLatest").catch(() => {});
+});
+$("launchBtn").addEventListener("click", () => call("Launch").catch(() => {}));
+$("uninstallBtn").addEventListener("click", () => {
+  if (busy || !confirm("Remove kvmshare from this machine?")) return;
+  call("Uninstall").catch(() => {});
+});
+
+boot();
+</script>
+</body>
+</html>

@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package installer
 
 // Windows desktop integration for the installer: the .ico, Start Menu and
 // desktop shortcuts, the Add/Remove Programs entry, and launching the GUI

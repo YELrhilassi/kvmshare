@@ -106,25 +106,6 @@ input-access:
 	cd gui && ./kvmshare-install --input-access
 	@echo "input access granted — isolation engages without a restart"
 
-## Grant the desktop user read access to physical input devices so the
-## server can isolate them while the cursor is on a client. Installs a
-## udev rule (the uaccess tag makes elogind/logind grant the active seat
-## user an ACL immediately — no group dance, no re-login) and adds the
-## invoking user to the input group as the non-logind fallback. Must run
-## as root:  sudo make input-access
-input-access:
-	@if [ "$$(id -u)" != "0" ]; then \
-		echo "this target must run as root:  sudo make input-access"; exit 1; \
-	fi
-	install -m644 packaging/99-kvmshare-input.rules /etc/udev/rules.d/99-kvmshare-input.rules
-	@if [ -n "$${SUDO_USER:-}" ]; then \
-		echo "adding $${SUDO_USER} to the input group (fallback for non-logind systems)"; \
-		usermod -aG input "$$SUDO_USER" || true; \
-	fi
-	udevadm control --reload-rules
-	udevadm trigger --subsystem-match=input
-	@echo "input access granted — isolation engages without a restart"
-
 ## Watch sources and rebuild + reinstall on every change.
 dev:
 	./scripts/dev.sh
@@ -141,19 +122,23 @@ release:
 	cd gui/frontend && npm install --no-audit --no-fund >/dev/null && npm run build
 	cd gui && $(GO_ENV) $(GO) build -tags production -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-gui .
 	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install ./cmd/kvmshare-install
+	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-installer ./installer
 	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "-H windowsgui $(VERSION_LDFLAGS)" -o kvmshare-gui.exe .
 	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install.exe ./cmd/kvmshare-install
+	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "-H windowsgui $(VERSION_LDFLAGS)" -o kvmshare-installer.exe ./installer
 	@rm -rf dist
 	@mkdir -p dist/kvmshare_$(VERSION)_linux_amd64 dist/kvmshare_$(VERSION)_windows_amd64
-	cp $(SERVER_BIN) $(CLIENT_BIN) gui/kvmshare-gui gui/kvmshare-install dist/kvmshare_$(VERSION)_linux_amd64/
+	cp $(SERVER_BIN) $(CLIENT_BIN) gui/kvmshare-gui gui/kvmshare-install gui/kvmshare-installer dist/kvmshare_$(VERSION)_linux_amd64/
 	tar -C dist -czf dist/kvmshare_$(VERSION)_linux_amd64.tar.gz kvmshare_$(VERSION)_linux_amd64
 	cp gui/kvmshare-install dist/kvmshare-install_$(VERSION)_linux_amd64
+	cp gui/kvmshare-installer dist/kvmshare-installer_$(VERSION)_linux_amd64
 	@if [ -n "$(MINGW)" ]; then \
 		echo "mingw-w64 found — building Windows binaries"; \
 		$(CARGO) build --release --target $(WIN_TARGET); \
-		cp target/$(WIN_TARGET)/release/kvmshare-server.exe target/$(WIN_TARGET)/release/kvmshare-client.exe gui/kvmshare-gui.exe gui/kvmshare-install.exe dist/kvmshare_$(VERSION)_windows_amd64/; \
+		cp target/$(WIN_TARGET)/release/kvmshare-server.exe target/$(WIN_TARGET)/release/kvmshare-client.exe gui/kvmshare-gui.exe gui/kvmshare-install.exe gui/kvmshare-installer.exe dist/kvmshare_$(VERSION)_windows_amd64/; \
 		( cd dist && zip -qr kvmshare_$(VERSION)_windows_amd64.zip kvmshare_$(VERSION)_windows_amd64 ); \
 		cp gui/kvmshare-install.exe dist/kvmshare-install_$(VERSION)_windows_amd64.exe; \
+		cp gui/kvmshare-installer.exe dist/kvmshare-installer_$(VERSION)_windows_amd64.exe; \
 	else \
 		echo "note: x86_64-w64-mingw32-gcc not found — Windows server/client binaries omitted (install mingw-w64, then make release includes them)"; \
 		rm -rf dist/kvmshare_$(VERSION)_windows_amd64; \
@@ -173,7 +158,8 @@ publish: release
 	gh release create $(VERSION) \
 		dist/kvmshare_$(VERSION)_linux_amd64.tar.gz \
 		dist/kvmshare-install_$(VERSION)_linux_amd64 \
-		$(if $(MINGW),dist/kvmshare_$(VERSION)_windows_amd64.zip dist/kvmshare-install_$(VERSION)_windows_amd64.exe) \
+		dist/kvmshare-installer_$(VERSION)_linux_amd64 \
+		$(if $(MINGW),dist/kvmshare_$(VERSION)_windows_amd64.zip dist/kvmshare-install_$(VERSION)_windows_amd64.exe dist/kvmshare-installer_$(VERSION)_windows_amd64.exe) \
 		dist/SHA256SUMS \
 		--title "kvmshare $(VERSION)" \
 		--notes "Portable kvmshare release. Download the installer for your platform (or the full archive) and run it — it fetches and verifies everything itself."

@@ -1,6 +1,6 @@
 //go:build !windows && !linux
 
-package main
+package installer
 
 // Desktop integration on platforms without a native hook (macOS, BSDs):
 // no-ops. Windows is handled by integrate_windows.go, Linux (input-device
