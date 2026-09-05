@@ -167,6 +167,12 @@ func (a *App) stopRoleLocked(role string) error {
 	} else {
 		a.clientProc = stopProc(a.clientProc)
 	}
+	roleBin := func() string {
+		if role == roleServer {
+			return filepath.Base(a.serverPath)
+		}
+		return filepath.Base(a.clientPath)
+	}()
 	deadline := time.Now().Add(4 * time.Second)
 	for a.roleActive(role) && time.Now().Before(deadline) {
 		if pid := a.pidFromLock(role); pid > 0 {
@@ -178,6 +184,9 @@ func (a *App) stopRoleLocked(role string) error {
 				_ = forceKillPid(pid)
 			}
 		}
+		// A lock file with no pid (a crash between locking and
+		// writing it) leaves nothing to signal; kill by name instead.
+		_ = killRoleByName(roleBin)
 		time.Sleep(120 * time.Millisecond)
 	}
 	if a.roleActive(role) {

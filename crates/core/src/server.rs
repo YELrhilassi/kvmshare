@@ -311,6 +311,7 @@ impl Server {
             clipboard,
             addrs: self.udp_addrs.clone(),
             seqs: self.udp_seqs.clone(),
+            last_heard: Arc::new(Mutex::new(HashMap::new())),
         });
         let udp_accept = self.udp.clone();
         let ctx_accept = ctx.clone();
@@ -591,6 +592,42 @@ fn apply_action(
 /// beacon fires — a beacon that parks the real cursor on a wall mid-push
 /// must not wait for the next motion frame, which may never come (the
 /// user stopped exactly at the wall).
+/// How long the active client's cursor stream may go silent before the
+/// server drops it. The client beacons every ~8 ms while active, so this
+/// is generous — a healthy stream can never trip it, and a genuinely
+/// wedged client (its motion loop stuck, even though TCP keepalives
+/// still flow) is caught in about a second. The drop returns control
+/// home instead of leaving the cursor stranded on a client that cannot
+/// move it.
+const ACTIVE_BEACON_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Drop the active client when its cursor stream has been silent for
+/// [`ACTIVE_BEACON_TIMEOUT`]. Called from the UDP receiver whenever the
+/// stream is quiet. Mirrors the TCP silence drop in the reader thread —
+/// but catches what that cannot: a client whose motion loop is wedged
+/// while its control thread (and keepalives) are still alive.
+fn check_active_beacon_staleness(ctx: &ClientCtx) {
+    let active = *ctx.active.lock().unwrap();
+    let Some(id) = active else { return };
+    let now = now_ms();
+    let last = ctx.last_heard.lock().unwrap().get(&id).copied();
+    let Some(last) = last else { return };
+    if now.saturating_sub(last) <= ACTIVE_BEACON_TIMEOUT.as_millis() as u64 {
+        return;
+    }
+    log_warn!(
+        "client {id}: cursor stream silent for {ACTIVE_BEACON_TIMEOUT:?} while active — dropping so control returns home"
+    );
+    // The reader thread's normal teardown path does the unregister +
+    // return-home; triggering it from here (a forced disconnect) is the
+    // same idempotent cleanup.
+    let name = {
+        let clients = ctx.clients.lock().unwrap();
+        clients.get(&id).map(|c| c.name.clone()).unwrap_or_default()
+    };
+    ctx.teardown(id, &name);
+}
+
 fn udp_receiver(udp: Arc<UdpSocket>, ctx: Arc<ClientCtx>) {
     let mut buf = [0u8; 1500];
     loop {
@@ -604,6 +641,10 @@ fn udp_receiver(udp: Arc<UdpSocket>, ctx: Arc<ClientCtx>) {
                 if !ctx.clients.lock().unwrap().contains_key(&d.id) {
                     continue;
                 }
+                // Any datagram from a known client proves its cursor
+                // stream is alive (beacons flow continuously while it is
+                // active). Tracked for the staleness watchdog above.
+                ctx.last_heard.lock().unwrap().insert(d.id, now_ms());
                 // Learn or verify the datagram's source. The first
                 // datagram from a client teaches us its address; a
                 // datagram from a *different* address is either a stale
@@ -671,7 +712,7 @@ fn udp_receiver(udp: Arc<UdpSocket>, ctx: Arc<ClientCtx>) {
             // ~1 ms (crossing latency is invisible at that scale) while
             // the thread still yields the CPU when nothing is flowing.
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                log_trace!("udp receiver idle");
+                check_active_beacon_staleness(&ctx);
                 thread::sleep(Duration::from_millis(1));
             }
             Err(e) => {
@@ -697,6 +738,11 @@ struct ClientCtx {
     /// (address) and the UDP receiver (address + sequence).
     addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
     seqs: Arc<Mutex<HashMap<u8, u32>>>,
+    /// When each client's cursor stream was last heard (monotonic ms).
+    /// The active client beacons every few ms; a stream gone silent is
+    /// the signature of a wedged client — see the beacon watchdog in
+    /// [`udp_receiver`].
+    last_heard: Arc<Mutex<HashMap<u8, u64>>>,
 }
 
 impl ClientCtx {
@@ -717,6 +763,7 @@ impl ClientCtx {
         self.clients.lock().unwrap().remove(&id);
         self.addrs.lock().unwrap().remove(&id);
         self.seqs.lock().unwrap().remove(&id);
+        self.last_heard.lock().unwrap().remove(&id);
 
         {
             let mut act = self.active.lock().unwrap();

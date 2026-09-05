@@ -9,6 +9,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 )
@@ -46,6 +47,14 @@ func signalPid(pid int) error {
 // graceful signal.
 func forceKillPid(pid int) error {
 	return syscall.Kill(pid, syscall.SIGKILL)
+}
+
+// killRoleByName force-kills every process with the role binary's name.
+// The fallback when the lock file carries no pid (a crash between
+// locking and writing): the role lock may be held by a process we cannot
+// address by pid, but its name is stable.
+func killRoleByName(bin string) error {
+	return exec.Command("pkill", "-9", "-x", bin).Run()
 }
 
 // raiseSignal is the "show your window" signal between GUI instances.

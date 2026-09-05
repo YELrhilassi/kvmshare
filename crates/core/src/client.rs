@@ -45,6 +45,7 @@
 //! lives behind the [`Injector`] trait; this module is plain message
 //! dispatch and thread wiring, tested with a fake injector.
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::{TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -245,6 +246,67 @@ struct Shared {
     /// idle NoData cycle). A stalled value while the link is healthy
     /// means the control loop is wedged inside a dispatch.
     tcp_tick_ms: AtomicU64,
+    /// Injection events (buttons, keys, wheel) queued by the TCP thread
+    /// and executed by the motion thread on its own cadence.
+    ///
+    /// Why: a button/key/wheel is an OS call (`SendInput` and friends)
+    /// that can *block* — Windows UI-protection (UIPI) and elevated
+    /// windows can stall it indefinitely. If the TCP thread executed
+    /// injection directly while holding the injector lock, such a stall
+    /// wedges the whole control loop permanently: the thread that must
+    /// act on the supervisor's `stop` is the thread stuck inside the OS
+    /// call, so no recovery is possible. Executing injection on the
+    /// motion thread confines a block to the motion loop — which the
+    /// supervisor, the isolation watchdog, and the server's beacon
+    /// watchdog all recover.
+    events: Mutex<VecDeque<InjectEvent>>,
+}
+
+/// One queued injection event (see [`Shared::events`] for why events are
+/// queued instead of injected from the control thread).
+#[derive(Debug)]
+enum InjectEvent {
+    Button { button: u8, pressed: bool },
+    Wheel { dx: i32, dy: i32 },
+    Key { kind: KeyKind, key: u32 },
+}
+
+/// How many events the queue may hold before the newest is dropped.
+/// Bounded so a wedged motion thread cannot grow memory without limit;
+/// dropping input is preferable to freezing the machine. Far above any
+/// realistic burst (a drag streams a few events per second).
+const EVENT_QUEUE_CAP: usize = 512;
+
+impl Shared {
+    /// Queue one injection event for the motion thread. Bounded: when
+    /// the queue is full the event is dropped (the motion loop is
+    /// wedged, and the recovery paths will restart the session anyway).
+    fn enqueue_event(&self, event: InjectEvent) {
+        let mut q = self.events.lock().unwrap();
+        if q.len() < EVENT_QUEUE_CAP {
+            q.push_back(event);
+        }
+    }
+
+    /// Drain and execute every queued event, in order. Called by the
+    /// motion loop after placing the cursor, with the injector lock
+    /// already held (the loop holds it for placement). A blocking OS
+    /// call inside an event stalls this tick — and only this tick: the
+    /// motion loop is exactly the thread the supervisor and watchdogs
+    /// recover.
+    fn drain_events(&self, inj: &mut Box<dyn Injector>) {
+        let pending: Vec<InjectEvent> = {
+            let mut q = self.events.lock().unwrap();
+            q.drain(..).collect()
+        };
+        for event in pending {
+            match event {
+                InjectEvent::Button { button, pressed } => inj.button(button, pressed),
+                InjectEvent::Wheel { dx, dy } => inj.wheel(dx, dy),
+                InjectEvent::Key { kind, key } => inj.key(kind, key),
+            }
+        }
+    }
 }
 
 /// The cursor-side steering state, guarded by [`Shared::motion`].
@@ -287,7 +349,12 @@ impl MotionState {
     /// Pure computation on this state plus the real position: the caller
     /// holds the locks and releases them before logging, so a slow log
     /// sink can never hold up the next placement.
-    fn probe_window(&mut self, rx: i32, ry: i32, screen: ScreenInfo) -> ProbeReport {
+    ///
+    /// `screen` is queried lazily — only when the pin threshold is
+    /// reached — because on Windows it is a user32 call that can stall
+    /// on a busy desktop. It must never run on every tick of the cursor
+    /// hot path.
+    fn probe_window(&mut self, rx: i32, ry: i32, screen: impl FnOnce() -> ScreenInfo) -> ProbeReport {
         let mut trace = None;
         let mut pinned = false;
         if self.probe.due() {
@@ -313,6 +380,7 @@ impl MotionState {
                 // A cursor legitimately parked at a screen edge is a
                 // wall push (the clamp holds the command), not a
                 // block — only trip away from the edges.
+                let screen = screen();
                 let at_edge = rx <= 1
                     || ry <= 1
                     || rx as i64 >= screen.width as i64 - 2
@@ -411,6 +479,7 @@ impl Client {
             stop: AtomicBool::new(false),
             motion_tick_ms: AtomicU64::new(0),
             tcp_tick_ms: AtomicU64::new(0),
+            events: Mutex::new(VecDeque::new()),
         });
         // The sync thread hands messages (resolution changes, clipboard
         // uploads) to the TCP thread over this channel.
@@ -625,21 +694,24 @@ fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, msg: Message)
             inj.leave();
         }
         // Buttons, keys and wheel are ordering-critical: the cursor
-        // must sit on the command point before the event fires.
+        // must sit on the command point before the event fires. The
+        // motion loop places the cursor on every tick, so executing the
+        // event on that same cadence (via the queue) guarantees the
+        // ordering. Injection is never done from this thread: it is an
+        // OS call that can block (UIPI / elevated windows), and a block
+        // here would wedge the whole control loop unrecoverably — see
+        // [`Shared::events`].
         Message::MouseButton { button, pressed } => {
-            flush_before_event(shared);
             log_trace!("button {button} {}", if pressed { "down" } else { "up" });
-            shared.injector.lock().unwrap().button(button, pressed);
+            shared.enqueue_event(InjectEvent::Button { button, pressed });
         }
         Message::MouseWheel { dx, dy } => {
-            flush_before_event(shared);
             log_trace!("wheel {dx},{dy}");
-            shared.injector.lock().unwrap().wheel(dx, dy);
+            shared.enqueue_event(InjectEvent::Wheel { dx, dy });
         }
         Message::Key { kind, key } => {
-            flush_before_event(shared);
             log_trace!("key {kind:?} {key}");
-            shared.injector.lock().unwrap().key(kind, key);
+            shared.enqueue_event(InjectEvent::Key { kind, key });
         }
         Message::Clipboard { mime, data } => {
             log_debug!("clipboard from server: {} ({} bytes)", mime, data.len());
@@ -695,10 +767,18 @@ fn motion_loop(shared: Arc<Shared>, own_id: u8) {
             } else if let Some((dx, dy)) = m.follower.correct((rx, ry)) {
                 inj.move_rel(dx, dy);
             }
+            // Execute queued injection events (buttons, keys, wheel) at
+            // the placed position, on this thread's cadence — see
+            // [`Shared::events`] for why injection never happens on the
+            // control thread. A block here stalls only the motion loop,
+            // which the supervisor and watchdogs recover.
+            shared.drain_events(&mut inj);
             // Telemetry is collected under the locks but logged only
             // after they are released — a slow log sink must never hold
-            // up the next placement.
-            let report = m.probe_window(rx, ry, inj.screen_info());
+            // up the next placement. The screen query stays lazy: it is
+            // only needed to disambiguate a pin, and it is a user32 call
+            // that can stall on a busy desktop — never on the hot path.
+            let report = m.probe_window(rx, ry, || inj.screen_info());
             if report.pinned {
                 inj.emergency_release();
                 shared.stop.store(true, Ordering::Relaxed);
@@ -826,26 +906,6 @@ fn apply_motion_frame(shared: &Shared, dx: i32, dy: i32) {
         }
     }
     m.probe.requested(dx, dy);
-}
-
-/// Before an ordering-critical event (button, key, wheel) the cursor
-/// must sit on the command point. Absolute backends place it there
-/// exactly — the placement is the loop, and the command is the only
-/// truth. Relative backends flush the follower's residual as one capped
-/// move, so a click lands where the motion pointed without a wedged
-/// cursor dragging it across the screen.
-fn flush_before_event(shared: &Shared) {
-    let mut m = shared.motion.lock().unwrap();
-    let mut inj = shared.injector.lock().unwrap();
-    if inj.absolute_motion() {
-        let (cx, cy) = m.follower.command();
-        inj.move_cursor(cx, cy);
-        return;
-    }
-    let (rx, ry) = inj.cursor_position();
-    if let Some((dx, dy)) = m.follower.flush((rx, ry)) {
-        inj.move_rel(dx, dy);
-    }
 }
 
 /// A final placement at the last command (used when the session ends).

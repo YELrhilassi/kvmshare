@@ -355,3 +355,62 @@ fn absolute_backends_land_exactly_on_the_command_via_tick_placement() {
     assert!(calls.contains(&"enter".to_string()));
     assert!(calls.iter().any(|c| c == "move 100,100"));
 }
+
+#[test]
+fn button_wheel_and_key_are_injected_in_order_on_the_motion_thread() {
+    let port = 39007;
+    let welcome = Message::Welcome {
+        server_version: kvmshare_protocol::VERSION,
+        layout: Layout { screens: vec![] },
+        own_screen_id: 7,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap(); // hello
+        stream.write_all(&welcome.encode()).unwrap();
+        stream.flush().unwrap();
+        let mut reg = [0u8; 512];
+        let (_, from) = udp.recv_from(&mut reg).unwrap();
+        stream
+            .write_all(&Message::Enter { screen_id: 7, x: 50, y: 50 }.encode())
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(80));
+        // Three ordering-critical events in one burst: they must land
+        // in wire order, on the motion thread's cadence.
+        stream.write_all(&Message::MouseButton { button: 1, pressed: true }.encode()).unwrap();
+        stream.write_all(&Message::MouseButton { button: 1, pressed: false }.encode()).unwrap();
+        stream.write_all(&Message::Key { kind: KeyKind::Down, key: 65 }.encode()).unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(300));
+        drop(stream);
+    });
+
+    let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 }).absolute();
+    let calls_handle = injector.calls.clone();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+    let (_tx, rx) = mpsc::channel::<Message>();
+    let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
+
+    let calls = calls_handle.lock().unwrap().clone();
+    // The button/key events execute in wire order, interleaved with the
+    // motion thread's own placement of the command point.
+    let events: Vec<String> = calls
+        .iter()
+        .filter(|c| c.starts_with("button ") || c.starts_with("key "))
+        .cloned()
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            "button 1 true".to_string(),
+            "button 1 false".to_string(),
+            "key Down 65".to_string(),
+        ],
+        "injection events execute in wire order, got {calls:?}"
+    );
+}

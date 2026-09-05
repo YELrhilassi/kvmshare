@@ -105,10 +105,15 @@ pub fn acquire_in(dir: &Path, role: &str) -> Result<RoleGuard, String> {
 
     // Record our pid inside the lock file so a controller (the GUI) can
     // signal this instance later — e.g. to stop a background server.
+    // The write is best-effort: the flock itself is the source of truth
+    // for "running", and a failure to record the pid must not stop the
+    // role from running. But it is logged loudly (see below), because a
+    // missing pid degrades the GUI's stop-by-pid to a stop-by-name
+    // fallback.
     let mut f = ours;
-    let _ = f.set_len(0);
-    let _ = writeln!(f, "{}", std::process::id());
-    let _ = f.flush();
+    if let Err(e) = f.set_len(0).and_then(|_| writeln!(f, "{}", std::process::id())).and_then(|_| f.flush()) {
+        eprintln!("kvmshare: could not record pid in {}: {e} (the GUI will fall back to stopping by process name)", ours_path.display());
+    }
 
     Ok(RoleGuard { _file: f })
 }

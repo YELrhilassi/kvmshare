@@ -84,6 +84,18 @@ func forceKillPid(pid int) error {
 	return nil
 }
 
+// killRoleByName force-kills every process with the role binary's image
+// name. The fallback when the lock file carries no pid (a crash between
+// locking and writing, or an old binary): the role lock may be held by a
+// process we cannot address by pid, but its name is stable.
+func killRoleByName(bin string) error {
+	out, err := exec.Command("taskkill", "/F", "/IM", bin).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("taskkill /IM %s: %v (%s)", bin, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // tryLockFile takes a non-blocking exclusive byte-range lock on the whole
 // file. Returns an error if another process holds it. The lock is
 // released when the handle is closed or the process dies.
