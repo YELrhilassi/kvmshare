@@ -59,6 +59,14 @@ fn set_dpi_aware() {
     }
 }
 
+/// Whether the Winlogon secure desktop (the UAC consent prompt) is
+/// currently the input desktop — a protected desktop no process can
+/// inject into, not even an elevated one. See
+/// [`isolation::secure_desktop_active`] for the full story.
+pub fn secure_desktop_active() -> bool {
+    isolation::secure_desktop_active()
+}
+
 /// The server-side Windows platform: local input capture + local cursor
 /// engine + the standalone clipboard service.
 pub struct Server {

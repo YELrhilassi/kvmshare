@@ -27,6 +27,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Power", # RegisterSuspendResumeNotification — detect sleep/resume
+  "Win32_System_StationsAndDesktops", # OpenInputDesktop — detect the UAC secure desktop
   "Win32_System_Threading", # SetPriorityClass — a KVM role must outrank busy apps
   "Win32_UI_HiDpi",
   "Win32_UI_Input",

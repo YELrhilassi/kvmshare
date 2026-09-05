@@ -10,6 +10,8 @@ gui/kvmshare-gui
 gui/kvmshare-gui.exe
 gui/kvmshare-install
 gui/kvmshare-install.exe
+gui/kvmshare-installer
+gui/kvmshare-installer.exe
 gui/kvmshare-server.log
 
 # Release artifacts (make release)

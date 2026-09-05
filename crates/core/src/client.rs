@@ -139,6 +139,17 @@ pub trait Injector: Send {
     fn system_resumed(&mut self) -> bool {
         false
     }
+    /// Whether the OS currently shows a desktop that cannot receive
+    /// injected input — the UAC secure desktop on Windows. While it is
+    /// up, this machine must return to its user (the prompt needs a
+    /// physical answer and no process can inject into it), so the client
+    /// ends the session and reconnects; the same live poll also drives
+    /// the isolation pump's immediate release. A **live check**, unlike
+    /// [`Injector::system_resumed`]: the session ends for exactly as
+    /// long as the condition holds. Default: never.
+    fn secure_desktop_active(&mut self) -> bool {
+        false
+    }
 }
 
 /// Clipboard access, split from [`Injector`] **on purpose**: reading or
@@ -530,6 +541,16 @@ impl Client {
             // never sees it.)
             if shared.injector.lock().unwrap().system_resumed() {
                 log_warn!("system resumed (sleep/wake) — ending the session so this machine returns to local control");
+                break;
+            }
+            // The UAC secure desktop (Windows): input is being shown a
+            // protected desktop no process can inject into, and the
+            // person at this machine must be able to answer the prompt.
+            // The isolation pump already released local input the moment
+            // it appeared; end the session so control returns home and
+            // this machine is fully back with its user.
+            if shared.injector.lock().unwrap().secure_desktop_active() {
+                log_warn!("Windows secure desktop detected (UAC prompt) — ending the session so control returns home and the prompt can be answered");
                 break;
             }
             match transport.recv()? {

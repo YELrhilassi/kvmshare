@@ -51,7 +51,23 @@ fn run() -> Result<(), String> {
     // (SIGTERM) is what ends the loop. Errors are printed once per state
     // change so a down server doesn't spam the log.
     let mut warned = false;
+    let mut prompt_warned = false;
     loop {
+        // The UAC secure desktop (Windows): while a consent prompt is
+        // up, no injected input can land anywhere, so connecting (or
+        // reconnecting after the session ended for that reason) would
+        // only churn a session into a wall. Wait it out — the person at
+        // this machine answers the prompt, and the loop resumes when the
+        // normal desktop returns.
+        if kvmshare_platform::secure_desktop_active() {
+            if !prompt_warned {
+                log_warn!("Windows secure desktop active (UAC prompt) — waiting for it to be answered before (re)connecting");
+                prompt_warned = true;
+            }
+            thread::sleep(RETRY_DELAY);
+            continue;
+        }
+        prompt_warned = false;
         // Platform: the local injector (moves the cursor, injects keys...)
         // and the standalone clipboard service. They are separate so a
         // clipboard call that stalls can never freeze the cursor.

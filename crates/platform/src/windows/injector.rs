@@ -214,6 +214,15 @@ impl Injector for Win32Injector {
         super::isolation::take_resumed()
     }
 
+    fn secure_desktop_active(&mut self) -> bool {
+        // Live poll, not a latched flag: the run loop asks on every
+        // iteration and ends the session for exactly as long as the UAC
+        // secure desktop is up. The isolation pump independently releases
+        // local input the instant it appears (see isolation.rs), so the
+        // person at the machine can answer the prompt either way.
+        super::isolation::secure_desktop_active()
+    }
+
     fn cursor_position(&mut self) -> (i32, i32) {
         Self::cursor_pos().unwrap_or(self.pos)
     }

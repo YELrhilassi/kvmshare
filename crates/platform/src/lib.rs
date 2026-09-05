@@ -101,6 +101,24 @@ pub fn raise_priority() {
     }
 }
 
+/// Whether the OS currently shows a desktop that cannot receive
+/// injected input — the Winlogon secure desktop on Windows, shown while
+/// a UAC consent prompt is up. The client waits such a state out before
+/// (re)connecting instead of churning a session into a wall it cannot
+/// inject into; the same condition ends an already-running session (see
+/// [`kvmshare_core::client::Injector::secure_desktop_active`]). Other
+/// platforms never report it.
+pub fn secure_desktop_active() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows::secure_desktop_active()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 /// Build the client-side platform: an input injector and the standalone
 /// clipboard service. They are returned separately because the clipboard
 /// lives on its own lock and thread in the client — a clipboard call

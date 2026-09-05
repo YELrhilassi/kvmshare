@@ -59,6 +59,7 @@ use std::thread::{self, JoinHandle};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Power as power;
+use windows_sys::Win32::System::StationsAndDesktops as sd;
 use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
 /// A window handle is a raw pointer, so it is not [`Send`] by default —
@@ -129,6 +130,49 @@ fn ms_now() -> u64 {
 const LLMHF_INJECTED: u32 = 1;
 /// Keyboard events marked as injected.
 const LLKHF_INJECTED: u32 = 16;
+
+/// Set while the Winlogon secure desktop (the UAC consent prompt) is the
+/// input desktop and we have already released isolation for this prompt
+/// episode — the release and its log line happen once per prompt, not on
+/// every 500 ms poll.
+static SECURE_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the Winlogon secure desktop is currently the input desktop.
+/// Windows switches input to it when a UAC consent prompt is shown;
+/// nothing can inject into it — not even an elevated process, it is a
+/// separate protected desktop — so a machine being driven remotely must
+/// hand control back the moment it appears. A **live poll**, not a
+/// latched flag: the client run loop asks this each iteration and ends
+/// the session for exactly as long as the prompt is up. Anything other
+/// than the normal "Default" input desktop (a locked workstation, ...)
+/// is treated the same way — it is equally unreachable.
+pub fn secure_desktop_active() -> bool {
+    // SAFETY: OpenInputDesktop returns a handle this thread owns;
+    // GetUserObjectInformationW(UOI_NAME) writes the desktop name into
+    // the caller's buffer; CloseDesktop releases the handle. All three
+    // are trivial user32 calls with no shared state.
+    unsafe {
+        let desk = sd::OpenInputDesktop(0, 0, sd::DESKTOP_READOBJECTS);
+        if desk.is_null() {
+            return false;
+        }
+        let mut name = [0u16; 64];
+        let mut needed: u32 = 0;
+        let ok = sd::GetUserObjectInformationW(
+            desk,
+            sd::UOI_NAME,
+            name.as_mut_ptr() as *mut core::ffi::c_void,
+            (name.len() * 2) as u32,
+            &mut needed,
+        );
+        sd::CloseDesktop(desk);
+        if ok == 0 {
+            return false;
+        }
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        String::from_utf16_lossy(&name[..len]) != "Default"
+    }
+}
 
 /// Custom message posted to the pump thread's window to end its loop.
 const QUIT_MSG: u32 = wm::WM_APP + 1;
@@ -205,8 +249,40 @@ impl NativeIsolation {
     /// [`WATCHDOG_TIMEOUT_MS`], release local input and restore the
     /// cursor. This is the last line of defense — a client that cannot
     /// steer must never hold this machine's hardware hostage.
+    /// The UAC secure desktop, checked while isolating: Windows switches
+    /// input to the protected Winlogon desktop when a consent prompt is
+    /// shown, and no process can inject into it. A machine being driven
+    /// remotely would be dead to the user *and* dead to the server, so
+    /// local input is released the moment it appears — the person at the
+    /// machine can answer the prompt, and the client run loop (which
+    /// polls [`secure_desktop_active`] itself) hands control back.
+    fn on_secure_desktop() -> bool {
+        if !secure_desktop_active() {
+            SECURE_RELEASED.store(false, Ordering::SeqCst);
+            return false;
+        }
+        if SECURE_RELEASED.swap(true, Ordering::SeqCst) {
+            return true; // already released for this prompt episode
+        }
+        log_warn!(
+            "Windows secure desktop detected (UAC prompt) — releasing local input so it can be answered"
+        );
+        ISOLATE.store(false, Ordering::SeqCst);
+        // SAFETY: ShowCursor is a trivial user32 call.
+        unsafe {
+            wm::ShowCursor(1);
+        }
+        true
+    }
+
     fn watchdog() {
         if !ISOLATE.load(Ordering::SeqCst) {
+            return;
+        }
+        // A prompt must win over everything else: check it before the
+        // steering staleness so a healthy-but-blocked stream still
+        // releases the machine the instant the secure desktop appears.
+        if Self::on_secure_desktop() {
             return;
         }
         let now = ms_now();

@@ -44,12 +44,15 @@ impl Clipboard for NoClipboard {
 /// `pos` is the simulated real cursor position: absolute moves set
 /// it, relative moves shift it (a fake OS without acceleration).
 /// `abs` simulates an absolute-placement backend (SetCursorPos-style):
-/// each relative move lands the whole delta exactly.
+/// each relative move lands the whole delta exactly. `secure`
+/// simulates the Windows UAC secure desktop: a live condition the run
+/// loop polls and ends the session on.
 struct RecordingInjector {
     calls: Arc<Mutex<Vec<String>>>,
     info: Arc<Mutex<ScreenInfo>>,
     pos: Arc<Mutex<(i32, i32)>>,
     abs: bool,
+    secure: Arc<Mutex<bool>>,
 }
 
 impl Default for RecordingInjector {
@@ -59,6 +62,7 @@ impl Default for RecordingInjector {
             info: Arc::new(Mutex::new(ScreenInfo::default())),
             pos: Arc::new(Mutex::new((0, 0))),
             abs: false,
+            secure: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -70,6 +74,7 @@ impl RecordingInjector {
             info: Arc::new(Mutex::new(info)),
             pos: Arc::new(Mutex::new((0, 0))),
             abs: false,
+            secure: Arc::new(Mutex::new(false)),
         }
     }
     fn absolute(mut self) -> Self {
@@ -113,6 +118,9 @@ impl Injector for RecordingInjector {
     }
     fn leave(&mut self) {
         self.calls.lock().unwrap().push("leave".into());
+    }
+    fn secure_desktop_active(&mut self) -> bool {
+        *self.secure.lock().unwrap()
     }
 }
 
@@ -354,6 +362,48 @@ fn absolute_backends_land_exactly_on_the_command_via_tick_placement() {
     );
     assert!(calls.contains(&"enter".to_string()));
     assert!(calls.iter().any(|c| c == "move 100,100"));
+}
+
+#[test]
+fn secure_desktop_ends_the_session() {
+    let port = 39008;
+    let welcome = Message::Welcome {
+        server_version: kvmshare_protocol::VERSION,
+        layout: Layout { screens: vec![] },
+        own_screen_id: 7,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap(); // hello
+        stream.write_all(&welcome.encode()).unwrap();
+        stream.flush().unwrap();
+        // Hold the connection open: only the secure-desktop condition
+        // may end the session, never EOF.
+        let _ = stream.read(&mut buf).unwrap();
+    });
+
+    let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 });
+    let secure_handle = injector.secure.clone();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+    let (_tx, rx) = mpsc::channel::<Message>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let client_thread = thread::spawn(move || {
+        let r = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
+        let _ = done_tx.send(());
+        r
+    });
+    // Let the session establish, then raise the secure-desktop condition
+    // (the Windows UAC prompt). The run loop polls it at least every
+    // READ_TIMEOUT, so the session must end promptly.
+    thread::sleep(Duration::from_millis(150));
+    *secure_handle.lock().unwrap() = true;
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "session did not end when the secure desktop appeared"
+    );
+    assert!(client_thread.join().unwrap().is_ok());
 }
 
 #[test]
