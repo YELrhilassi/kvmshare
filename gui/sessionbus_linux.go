@@ -7,13 +7,12 @@ package main
 // The tray icon, desktop notifications and the WebKitGTK webview all talk
 // to the D-Bus session bus. When the environment provides none — no
 // DBUS_SESSION_BUS_ADDRESS, no /run/user/<uid>/bus (a bare WM started
-// without dbus-launch, as Void's i3 commonly is) — godbus and GDBus
-// autolaunch a *fresh* private bus for every process that asks. Each
-// private bus then grows its own dbus-activated stack (at-spi,
-// xdg-desktop-portal, gvfsd, and a notification daemon) that never dies
-// with the launching app, because the forked bus daemon is reparented to
-// init. Repeated GUI launches therefore left dozens of immortal
-// portal/gvfs/dbus stacks behind.
+// without dbus-launch) — godbus and GDBus autolaunch a *fresh* private
+// bus for every process that asks. Each private bus then grows its own
+// dbus-activated stack (at-spi, xdg-desktop-portal, gvfsd, and a
+// notification daemon) that never dies with the launching app, because
+// the forked bus daemon is reparented to init. Repeated GUI launches
+// therefore left dozens of immortal portal/gvfs/dbus stacks behind.
 //
 // ensureSessionBus runs before anything touches D-Bus and guarantees the
 // env var is set: it adopts an existing session bus when one is

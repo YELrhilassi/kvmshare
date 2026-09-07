@@ -6,8 +6,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -603,11 +603,17 @@ func TestSaveConfigDoesNotStartServer(t *testing.T) {
 }
 
 func TestSingleInstanceLockAndRaise(t *testing.T) {
+	// Raising a hidden window via a signal is a Unix mechanism; Windows
+	// has no signals and falls back to the plain "already running"
+	// error, which TestSingleInstanceLock covers separately.
+	if runtime.GOOS == "windows" {
+		t.Skip("signal-based raise is Unix-only")
+	}
 	// A second launch raises the first with SIGUSR2 (never SIGUSR1 —
 	// JavaScriptCore uses that for GC). In this test both "instances" are
 	// the same process, so ignore the signal (its default action would
 	// terminate the test) and assert the raise contract.
-	signal.Ignore(syscall.SIGUSR2)
+	signal.Ignore(raiseSignal)
 
 	a, _ := newTestApp(t)
 	if raised, err := a.SingleInstance(); err != nil || raised {

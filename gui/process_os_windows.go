@@ -38,6 +38,10 @@ func restartAttrs() *syscall.SysProcAttr {
 const (
 	signalTerm = syscall.Signal(0)
 	signalKill = syscall.Signal(0)
+	// raiseSignal exists for symmetry with Unix so shared code (and
+	// tests) can reference one name; Windows cannot raise (see
+	// raiseInstance) so the value is never delivered.
+	raiseSignal = syscall.Signal(0)
 )
 
 // signalGroup terminates the process (no groups to signal on Windows).

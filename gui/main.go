@@ -116,12 +116,13 @@ func main() {
 	})
 
 	// Closing the window hides it to the tray when a tray is actually
-	// present (roles keep running and the app stays reachable). With no
-	// tray host — no session bus, or no StatusNotifierWatcher — hiding
-	// would strand the app invisibly (the classic ghost-instance trap),
-	// so closing quits the GUI instead, and quitting stops the roles too
-	// (a running role with no tray to control it strands the other
-	// machine's cursor and, on Windows, keeps the input gate on).
+	// present (SNI watcher on the bus, or an XEmbed tray manager like
+	// i3bar's — see tray.go): roles keep running and the app stays
+	// reachable. With no tray host at all, hiding would strand the app
+	// invisibly (the classic ghost-instance trap), so closing quits the
+	// GUI instead, and quitting stops the roles too (a running role with
+	// no tray to control it strands the other machine's cursor and, on
+	// Windows, keeps the input gate on).
 	window.RegisterHook(events.Common.WindowClosing, func(e *application.WindowEvent) {
 		if trayHostAvailable() {
 			window.Hide()
@@ -135,7 +136,12 @@ func main() {
 		app.Quit()
 	})
 
-	setupTray(app, core, window)
+	// The tray is built once the application is running: the Wails SNI
+	// tray requires the app's run loop, and the XEmbed fallback needs
+	// the window to exist (its click handler shows it).
+	app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(*application.ApplicationEvent) {
+		setupTray(app, core, window)
+	})
 	core.StartNotifyWatcher()
 
 	if err := app.Run(); err != nil {
