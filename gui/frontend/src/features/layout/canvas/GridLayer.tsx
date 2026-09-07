@@ -1,9 +1,9 @@
 import { memo } from "react";
 import { gridStyle, WORLD_SPAN } from "@/features/layout/geometry";
 
-// The grid in world coordinates, drawn at 1 screen px at any zoom. The
-// screens sit on top of this; the grid stays deliberately quiet so the
-// screens read as solid surfaces.
+// The dot grid in world coordinates, adaptive at every zoom. The screens
+// sit on top and blur it away behind them, so the canvas reads as a calm
+// surface with a faint texture rather than a wall of lines.
 function GridLayer({ scale }: { scale: number }) {
   const style = gridStyle(scale);
   return (

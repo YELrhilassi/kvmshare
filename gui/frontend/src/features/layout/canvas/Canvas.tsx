@@ -58,6 +58,7 @@ export default function Canvas({
 }: CanvasProps) {
   const [spacePan, setSpacePan] = useState(false);
   const [panning, setPanning] = useState(false);
+  const [dragging, setDragging] = useState(-1); // screen index being dragged
   const spaceRef = useRef(false);
   const lockRef = useRef(lock);
   const snapRef = useRef(snap);
@@ -188,6 +189,7 @@ export default function Canvas({
       const el = e.currentTarget;
       el.setPointerCapture(e.pointerId);
       onSelect(i);
+      setDragging(i);
       dragRef.current = {
         index: i,
         startX: e.clientX,
@@ -221,6 +223,7 @@ export default function Canvas({
     const d = dragRef.current;
     if (!d) return;
     dragRef.current = null;
+    setDragging(-1);
     const nx = parseFloat(d.el.style.left);
     const ny = parseFloat(d.el.style.top);
     if (Number.isNaN(nx) || Number.isNaN(ny)) return;
@@ -238,7 +241,7 @@ export default function Canvas({
       onPointerCancel={onViewportPointerUp}
     >
       <div
-        className="absolute top-0 left-0"
+        className="absolute top-0 left-0 will-change-transform"
         style={{
           transform: `translate(${view.pan.x}px, ${view.pan.y}px) scale(${view.scale})`,
           transformOrigin: "0 0",
@@ -252,6 +255,7 @@ export default function Canvas({
             index={i}
             selected={selected === i}
             lock={lock}
+            dragging={dragging === i}
             scale={view.scale}
             onPointerDown={onScreenPointerDown}
             onPointerMove={onScreenPointerMove}
@@ -262,16 +266,16 @@ export default function Canvas({
 
       {spacePan && !panning && (
         <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2">
-          <span className="flex items-center gap-1.5 rounded-md bg-background/80 px-3 py-1 text-xs text-muted-foreground">
-            <Move className="h-3 w-3" /> drag to pan — release space to edit
+          <span className="flex items-center gap-1.5 rounded-full bg-background/85 px-3 py-1 text-xs text-muted-foreground shadow-sm">
+            <Move className="h-3 w-3" /> panning — release space to edit
           </span>
         </div>
       )}
 
       {lock && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          <span className="rounded-md bg-background/80 px-3 py-1 text-xs text-muted-foreground">
-            layout locked
+        <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2">
+          <span className="rounded-full bg-background/85 px-2.5 py-1 text-[11px] font-medium text-muted-foreground shadow-sm">
+            locked
           </span>
         </div>
       )}

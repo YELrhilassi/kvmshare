@@ -8,18 +8,31 @@ interface Props {
   index: number;
   selected: boolean;
   lock: boolean;
+  dragging: boolean;
   scale: number;
   onPointerDown: (e: React.PointerEvent<HTMLDivElement>, i: number) => void;
   onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => void;
   onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => void;
 }
 
-// One screen on the canvas. Memoized: during a drag the element is moved
-// by direct DOM writes, so this only re-renders when the screen data
-// itself changes. Everything inside is counter-scaled by `scale` so it
-// renders at native size on screen at any zoom.
-function ScreenNode({ screen, index, selected, lock, scale, onPointerDown, onPointerMove, onPointerUp }: Props) {
+// One screen on the canvas. The label and border counter-scale so they
+// render at native size on screen at any zoom; the fill is a soft
+// translucent gradient with backdrop blur so the dot grid behind reads
+// through without becoming noise. Memoized: during a drag the element is
+// moved by direct DOM writes, so this only re-renders on real changes.
+function ScreenNode({
+  screen,
+  index,
+  selected,
+  lock,
+  dragging,
+  scale,
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+}: Props) {
   const inv = 1 / Math.max(scale, 0.0001);
+  const own = index === 0;
 
   return (
     <div
@@ -28,42 +41,58 @@ function ScreenNode({ screen, index, selected, lock, scale, onPointerDown, onPoi
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
       className={cn(
-        "absolute rounded-md transition-shadow select-none",
-        index === 0 ? "border-dashed" : "border-solid",
-        "border-primary/70",
-        selected && "ring-2 ring-ring",
+        "absolute select-none transition-[box-shadow,border-color,filter,opacity]",
+        own ? "border-white/40" : "border-white/25",
+        selected && "border-primary",
         lock ? "cursor-default" : "cursor-grab active:cursor-grabbing",
+        dragging && "screen-dragging",
       )}
       style={{
         left: screen.x,
         top: screen.y,
         width: screen.width,
         height: screen.height,
-        borderWidth: `${2 * inv}px`,
-        backdropFilter: `blur(${5 * inv}px)`,
-        WebkitBackdropFilter: `blur(${5 * inv}px)`,
-        background: index === 0 ? "rgba(255, 255, 255, 0.1)" : "rgba(255, 255, 255, 0.07)",
-        boxShadow: `0 ${4 * inv}px ${18 * inv}px rgba(0, 0, 0, 0.35)`,
+        borderWidth: `${1.5 * inv}px`,
+        borderRadius: `${10 * inv}px`,
+        background: `linear-gradient(180deg, ${
+          own ? "rgba(255,255,255,0.17)" : "rgba(255,255,255,0.1)"
+        }, ${own ? "rgba(255,255,255,0.07)" : "rgba(255,255,255,0.04)"})`,
+        backdropFilter: `blur(${8 * inv}px)`,
+        WebkitBackdropFilter: `blur(${8 * inv}px)`,
+        // The selection ring is drawn here — Tailwind's ring utilities
+        // use box-shadow, which this inline shadow would override.
+        boxShadow: selected
+          ? `0 0 0 ${2 * inv}px var(--ring), 0 ${6 * inv}px ${24 * inv}px rgba(0, 0, 0, 0.4)`
+          : `0 ${4 * inv}px ${16 * inv}px rgba(0, 0, 0, 0.28)`,
       }}
       title={`${screen.name} — ${screen.width}×${screen.height} at ${screen.x},${screen.y}`}
     >
+      {/* Name, centered near the top, always ~12 screen px. */}
       <span
-        className="pointer-events-none absolute top-1 left-1.5 flex items-center gap-1 text-[11px] font-semibold"
-        style={{ transform: `scale(${inv})`, transformOrigin: "top left" }}
+        className="pointer-events-none absolute inset-x-0 top-1.5"
+        style={{ transform: `scale(${inv})`, transformOrigin: "center top" }}
       >
-        {screen.name || "(unnamed)"}
-        {index === 0 && (
-          <span className="rounded bg-primary px-1 py-px text-[9px] font-bold text-primary-foreground">
-            YOUR MACHINE
+        <span className="mx-auto flex w-max items-center gap-1.5">
+          <span className="text-[12px] font-semibold tracking-tight text-white/85">
+            {screen.name || "screen"}
           </span>
-        )}
-        {lock && <Lock className="h-3 w-3 text-muted-foreground" />}
+          {own && (
+            <span className="rounded-full bg-primary px-1.5 py-px text-[9px] font-bold text-primary-foreground">
+              you
+            </span>
+          )}
+          {lock && <Lock className="h-3 w-3 text-white/40" />}
+        </span>
       </span>
+
+      {/* Dimensions, centered at the bottom, always ~9.5 screen px. */}
       <span
-        className="pointer-events-none absolute right-1.5 bottom-1 font-mono text-[10px] text-muted-foreground"
-        style={{ transform: `scale(${inv})`, transformOrigin: "bottom right" }}
+        className="pointer-events-none absolute inset-x-0 bottom-1.5"
+        style={{ transform: `scale(${inv})`, transformOrigin: "center bottom" }}
       >
-        {screen.width}×{screen.height}
+        <span className="mx-auto block w-max font-mono text-[9.5px] text-white/45">
+          {screen.width}×{screen.height}
+        </span>
       </span>
     </div>
   );

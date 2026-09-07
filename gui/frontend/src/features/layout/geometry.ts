@@ -134,25 +134,31 @@ export function placementFor(screens: Screen[]): Screen {
   };
 }
 
-// The grid background: minor cells that stay >= 16 screen px at any zoom
-// plus a fainter 500px major line, all drawn at 1 screen px width.
+// The grid background: a quiet dot grid, not lines. Lines cross the
+// screens and fight with them; dots read as texture and keep the screens
+// as the loudest thing. The cell is the smallest "nice" step whose
+// on-screen pitch stays comfortable (20–40 px), so the grid adapts at
+// every zoom instead of turning into a wall of lines or a mush.
+const GRID_STEPS = [40, 80, 160, 320, 640, 1280, 2560];
+
 export interface GridStyle {
   backgroundImage: string;
   backgroundSize: string;
-  line: string;
 }
 
 export function gridStyle(scale: number): GridStyle {
   const s = Math.max(scale, 0.0001);
-  let cell = 100;
-  while (cell * s < 16 && cell < 5000) cell += 100;
-  const inv = 1 / s;
-  const line = `${inv}px`;
-  const backgroundSize = `${500}px ${500}px, ${500}px ${500}px, ${cell}px ${cell}px, ${cell}px ${cell}px`;
-  const backgroundImage =
-    `linear-gradient(to right, rgba(255,255,255,0.15) ${line}, transparent ${line}),` +
-    `linear-gradient(to bottom, rgba(255,255,255,0.15) ${line}, transparent ${line}),` +
-    `linear-gradient(to right, rgba(255,255,255,0.05) ${line}, transparent ${line}),` +
-    `linear-gradient(to bottom, rgba(255,255,255,0.05) ${line}, transparent ${line})`;
-  return { backgroundImage, backgroundSize, line };
+  let cell = GRID_STEPS[GRID_STEPS.length - 1];
+  for (const step of GRID_STEPS) {
+    if (step * s >= 20) {
+      cell = step;
+      break;
+    }
+  }
+  // The dot stays ~1.8 screen px by counter-scaling its world radius.
+  const r = Math.min(3, Math.max(1, 1.8 / s));
+  return {
+    backgroundImage: `radial-gradient(circle, rgba(255,255,255,0.15) ${r}px, transparent ${r + 0.5}px)`,
+    backgroundSize: `${cell}px ${cell}px`,
+  };
 }

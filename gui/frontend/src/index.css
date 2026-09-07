@@ -80,3 +80,10 @@
     @apply font-sans;
   }
 }
+
+/* A screen being dragged: lifted shadow + slight fade. The drop-shadow
+   rides the translucent fill, so the grid behind stays visible. */
+.screen-dragging {
+  filter: drop-shadow(0 24px 40px rgba(0, 0, 0, 0.5));
+  opacity: 0.9;
+}
