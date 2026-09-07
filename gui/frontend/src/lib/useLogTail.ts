@@ -1,40 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/bridge";
 
-export interface RunningStatus {
-  server: boolean;
-  client: boolean;
-}
-
-// Polls the server/client process state every 2s while a component that
-// uses it is mounted.
-export function useRunning(): RunningStatus {
-  const [status, setStatus] = useState<RunningStatus>({ server: false, client: false });
-
-  useEffect(() => {
-    let alive = true;
-    const tick = async () => {
-      try {
-        const [server, client] = await Promise.all([
-          api().ServerRunning(),
-          api().ClientRunning(),
-        ]);
-        if (alive) setStatus({ server, client });
-      } catch {
-        /* bridge not ready yet */
-      }
-    };
-    void tick();
-    const id = setInterval(tick, 2000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-  }, []);
-
-  return status;
-}
-
 // Live-tail a log file: poll every 1.5s, stick to the bottom unless the
 // user has scrolled up. Pass `undefined` while the log path is unknown.
 export function useLogTail(path: string | undefined, maxLines = 300) {

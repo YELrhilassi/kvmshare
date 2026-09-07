@@ -4,11 +4,8 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 
-export const MIN_ZOOM = 0.05; // real (CSS) scale floor
-export const MAX_ZOOM = 4; // real (CSS) scale ceiling
-
 interface ToolbarProps {
-  percent: number; // zoom level, where 100 = the layout fits the view
+  percent: number;
   minPercent: number;
   maxPercent: number;
   onPercentChange: (percent: number) => void;
@@ -86,7 +83,7 @@ export default function Toolbar({
 
       <span className="hidden text-xs text-muted-foreground xl:inline">
         <Move className="mr-1 inline h-3.5 w-3.5" />
-        drag screens · hold space + drag to pan · wheel to zoom · arrows to nudge
+        drag screens · space + drag to pan · wheel to zoom · arrows to nudge
       </span>
 
       <Button onClick={onAdd} variant="outline" size="sm" disabled={lock}>

@@ -1,33 +1,35 @@
-import { Copy, Trash2 } from "lucide-react";
+import { Copy, Trash2, Plus } from "lucide-react";
 import type { Screen } from "@/lib/bridge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-interface SidePanelProps {
+interface Props {
   screen: Screen | null;
   index: number; // selected screen index, -1 when none
   lock: boolean;
   onPatch: (i: number, patch: Partial<Screen>) => void;
+  onAdd: () => void;
   onDuplicate: () => void;
   onDelete: () => void;
 }
 
-export default function SidePanel({
+export default function ScreenInspector({
   screen,
   index,
   lock,
   onPatch,
+  onAdd,
   onDuplicate,
   onDelete,
-}: SidePanelProps) {
+}: Props) {
   const none = !screen;
   const fieldsDisabled = none || lock;
 
   return (
     <aside className="flex w-72 shrink-0 flex-col border-l">
-      <div className="space-y-4 overflow-y-auto p-4">
-        <div>
+      <div className="space-y-5 overflow-y-auto p-4">
+        <div className="space-y-1">
           <h2 className="text-sm font-semibold">
             {screen ? (
               <>
@@ -43,67 +45,56 @@ export default function SidePanel({
             )}
           </h2>
           <p className="text-xs text-muted-foreground">
-            {screen ? `position ${screen.x}, ${screen.y}` : "Click a screen to edit it."}
+            {screen ? `position ${screen.x}, ${screen.y}` : "Click a screen in the canvas to edit it."}
           </p>
         </div>
 
-        <div className="space-y-2">
+        <div className="grid grid-cols-2 gap-2">
           <div className="space-y-1">
-            <Label htmlFor="s-name" className="text-xs">
+            <Label htmlFor="s-name" className="col-span-2 text-xs">
               Name
             </Label>
             <Input
               id="s-name"
+              className="col-span-2"
               value={screen?.name ?? ""}
               disabled={fieldsDisabled}
               placeholder="e.g. hp"
               onChange={(e) => index >= 0 && onPatch(index, { name: e.target.value })}
             />
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div className="space-y-1">
-              <Label htmlFor="s-w" className="text-xs">
-                Width
-              </Label>
-              <Input
-                id="s-w"
-                type="number"
-                min={320}
-                step={10}
-                value={screen?.width ?? ""}
-                disabled={fieldsDisabled}
-                onChange={(e) =>
-                  index >= 0 && onPatch(index, { width: parseInt(e.target.value, 10) || 0 })
-                }
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="s-h" className="text-xs">
-                Height
-              </Label>
-              <Input
-                id="s-h"
-                type="number"
-                min={240}
-                step={10}
-                value={screen?.height ?? ""}
-                disabled={fieldsDisabled}
-                onChange={(e) =>
-                  index >= 0 && onPatch(index, { height: parseInt(e.target.value, 10) || 0 })
-                }
-              />
-            </div>
+          <div className="space-y-1">
+            <Label htmlFor="s-w" className="text-xs">
+              Width
+            </Label>
+            <Input
+              id="s-w"
+              type="number"
+              min={320}
+              step={10}
+              value={screen?.width ?? ""}
+              disabled={fieldsDisabled}
+              onChange={(e) => index >= 0 && onPatch(index, { width: parseInt(e.target.value, 10) || 0 })}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="s-h" className="text-xs">
+              Height
+            </Label>
+            <Input
+              id="s-h"
+              type="number"
+              min={240}
+              step={10}
+              value={screen?.height ?? ""}
+              disabled={fieldsDisabled}
+              onChange={(e) => index >= 0 && onPatch(index, { height: parseInt(e.target.value, 10) || 0 })}
+            />
           </div>
         </div>
 
         <div className="flex gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="flex-1"
-            disabled={none || lock}
-            onClick={onDuplicate}
-          >
+          <Button variant="outline" size="sm" className="flex-1" disabled={none || lock} onClick={onDuplicate}>
             <Copy className="h-4 w-4" /> Duplicate
           </Button>
           <Button
@@ -117,6 +108,13 @@ export default function SidePanel({
             <Trash2 className="h-4 w-4" /> Delete
           </Button>
         </div>
+
+        {none && (
+          <Button variant="outline" size="sm" className="w-full" disabled={lock} onClick={onAdd}>
+            <Plus className="h-4 w-4" /> Add a screen
+          </Button>
+        )}
+
         {index === 0 && screen && (
           <p className="text-xs text-muted-foreground">
             This screen is your machine — it can't be removed.

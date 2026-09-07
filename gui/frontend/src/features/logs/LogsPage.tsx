@@ -1,35 +1,17 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, type Mode, type Paths } from "@/lib/bridge";
-import { useLogTail, useRunning } from "@/lib/hooks";
+import { useEffect, useState } from "react";
+import { useApp } from "@/app/AppProvider";
+import { api, type Paths } from "@/lib/bridge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import LogViewer from "@/features/logs/LogViewer";
 import { cn } from "@/lib/utils";
 
 // The levels the Rust logger accepts, quietest first. "Trace" is the
 // very-verbose, per-event level.
 const LEVELS = ["error", "warn", "info", "debug", "trace"] as const;
 
-function lineClass(level: string): string {
-  switch (level) {
-    case "ERROR":
-      return "text-red-400";
-    case "WARN":
-      return "text-amber-400";
-    case "DEBUG":
-      return "text-muted-foreground/75";
-    case "TRACE":
-      return "text-muted-foreground/50";
-    default:
-      return "";
-  }
-}
-
-interface Props {
-  mode: Mode;
-}
-
-export default function LogsPage({ mode }: Props) {
-  const running = useRunning();
+export default function LogsPage() {
+  const { mode, running } = useApp();
   const [paths, setPaths] = useState<Paths | null>(null);
   const [level, setLevel] = useState("info");
   const [enabled, setEnabled] = useState(true);
@@ -38,7 +20,6 @@ export default function LogsPage({ mode }: Props) {
 
   // The log of *this machine's* instance — server or client, never both.
   const logPath = paths ? (mode === "server" ? paths.serverLog : paths.clientLog) : undefined;
-  const { log, viewportRef, onScroll, stick, setStick } = useLogTail(logPath, 500);
 
   useEffect(() => {
     void api()
@@ -77,21 +58,7 @@ export default function LogsPage({ mode }: Props) {
     }
   };
 
-  // One colored line per log line; a plain line when there is nothing yet.
-  const lines = useMemo(() => {
-    if (!log) return null;
-    return log.split("\n").map((line, i) => {
-      // Lines are `HH:MM:SS LEVEL component: message` — pull the level.
-      const level = line.split(" ")[1];
-      return (
-        <div key={i} className={cn("min-w-max", lineClass(level))}>
-          {line}
-        </div>
-      );
-    });
-  }, [log]);
-
-  const active = mode === "server" ? running.server : running.client;
+  const active = running[mode];
 
   return (
     <div className="flex h-full flex-col">
@@ -142,28 +109,8 @@ export default function LogsPage({ mode }: Props) {
         )}
       </div>
 
-      <div className="mx-auto min-h-0 w-full max-w-5xl flex-1 px-10 pb-10">
-        <div className="flex h-full flex-col overflow-hidden rounded-md border border-border/70 bg-muted/20">
-          <div className="flex shrink-0 items-center justify-between border-b border-border/60 px-4 py-2 text-[11px] text-muted-foreground/70">
-            <span className="font-mono">{logPath ?? "…"}</span>
-            <button
-              onClick={() => setStick(!stick)}
-              className={cn(
-                "transition-colors hover:text-foreground",
-                stick && "text-foreground",
-              )}
-            >
-              {stick ? "following" : "follow"}
-            </button>
-          </div>
-          <div
-            ref={viewportRef}
-            onScroll={onScroll}
-            className="min-h-0 flex-1 overflow-y-auto p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap"
-          >
-            {lines ?? <span className="text-muted-foreground/50">— no log output yet —</span>}
-          </div>
-        </div>
+      <div className="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col px-10 pb-10">
+        <LogViewer path={logPath} />
       </div>
     </div>
   );

@@ -1,19 +1,20 @@
 import { useEffect, useState } from "react";
+import { useApp } from "@/app/AppProvider";
 import { api, type Settings } from "@/lib/bridge";
 import { DEFAULT_PORT } from "@/lib/constants";
-import { useRunning } from "@/lib/hooks";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Section } from "@/components/Section";
 import { cn } from "@/lib/utils";
 
+// Connection settings for the controlled machine. Start/stop lives on
+// Home — this page only shows a read-only status.
 export default function ClientPage() {
-  const running = useRunning();
+  const { running } = useApp();
   const [settings, setSettings] = useState<Settings | null>(null);
   const [addr, setAddr] = useState("");
   const [name, setName] = useState("");
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -30,24 +31,12 @@ export default function ClientPage() {
   const saveSettings = async () => {
     setError("");
     if (!settings) return;
+    const next = { ...settings, clientAddr: addr.trim(), clientName: name.trim() };
     try {
-      await api().SetSettings({ ...settings, clientAddr: addr.trim(), clientName: name.trim() });
-      setSettings({ ...settings, clientAddr: addr.trim(), clientName: name.trim() });
+      await api().SetSettings(next);
+      setSettings(next);
     } catch (e) {
       setError(String(e));
-    }
-  };
-
-  const toggleClient = async () => {
-    setBusy(true);
-    setError("");
-    try {
-      if (running.client) await api().ClientStop();
-      else await api().ClientStart();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -56,10 +45,12 @@ export default function ClientPage() {
       <div className="mx-auto max-w-2xl px-10 py-16">
         <header className="mb-12 space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">Client</h1>
-          <p className="text-sm text-muted-foreground">Connection settings.</p>
+          <p className="text-sm text-muted-foreground">
+            Settings for the machine controlled from another computer.
+          </p>
         </header>
 
-        <div className="space-y-16">
+        <div className="space-y-14">
           <Section title="Connection">
             <div className="grid max-w-lg grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="space-y-1.5">
@@ -89,19 +80,7 @@ export default function ClientPage() {
             </div>
           </Section>
 
-          <Section
-            title="Status"
-            action={
-              <Button
-                size="sm"
-                variant={running.client ? "outline" : "default"}
-                onClick={toggleClient}
-                disabled={busy}
-              >
-                {running.client ? "Stop" : "Start"}
-              </Button>
-            }
-          >
+          <Section title="Status">
             <div className="flex items-center gap-3">
               <span
                 className={cn(
@@ -109,7 +88,10 @@ export default function ClientPage() {
                   running.client ? "bg-emerald-500" : "bg-muted-foreground/40",
                 )}
               />
-              <span className="text-lg font-medium">{running.client ? "Running" : "Stopped"}</span>
+              <span className="text-lg font-medium">{running.client ? "Connected" : "Not connected"}</span>
+              {!running.client && (
+                <span className="text-xs text-muted-foreground">connect from Home</span>
+              )}
             </div>
             {settings && (
               <p className="text-sm text-muted-foreground">
@@ -118,7 +100,6 @@ export default function ClientPage() {
               </p>
             )}
           </Section>
-
         </div>
       </div>
     </div>

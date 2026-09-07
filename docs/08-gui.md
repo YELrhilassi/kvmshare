@@ -25,10 +25,11 @@ gui/
 │
 ├── frontend/              # Vite + React + TS + shadcn/ui
 │   └── src/
-│       ├── App.tsx        # shell: top bar, page routing, role state
-│       ├── pages/         # Home, Server, Client, Layout, Logs
-│       ├── components/    # LayoutEditor (canvas), Section, ui/*
-│       └── lib/           # bridge.ts (typed Wails calls), hooks, nav
+│       ├── app/           # AppProvider (role + running store), shell, nav
+│       ├── features/      # one folder per page: home/, server/, client/,
+│       │                  #   logs/, layout/ (canvas split into small pieces)
+│       ├── components/    # shared primitives (Section, ui/*)
+│       └── lib/           # bridge.ts (typed Wails calls), net, useLogTail
 │
 ├── cmd/kvmshare-install/  # CLI installer/updater bootstrap
 ├── installer/             # GUI installer (Wails window)
@@ -89,9 +90,13 @@ The GUI is a controller, not a babysitter:
 
 ## 8.3 The Layout page and config editing
 
-**Files: `gui/config.go` (Go), `frontend/src/components/LayoutEditor.tsx`**
+**Files: `gui/config.go` (Go), `frontend/src/features/layout/`**
 
-The Layout page is the canvas where the user arranges the screens:
+The Layout page is the canvas where the user arranges the screens. It
+is split into pure geometry (`geometry.ts`), a document reducer
+(`useLayoutDocument.ts`), a view hook (`useCanvasView.ts`) and three
+presentational pieces (Toolbar, Canvas with GridLayer/ScreenNode,
+ScreenInspector):
 
 - Real screen proportions on a world grid; **zoom is relative** — 100%
   always fits the whole desktop, so the full layout and grid are visible
@@ -154,18 +159,26 @@ The Layout page is the canvas where the user arranges the screens:
   (`window.wails.Call.ByName("main.App.Method", ...)`); one constant
   (`APP_SERVICE`) holds the wire prefix; interfaces mirror the Go
   structs one-to-one.
-- **`App.tsx`** — top bar with a compact nav that only shows pages
-  belonging to the current role (server mode: Home/Server/Layout/Logs;
-  client mode: Home/Client/Logs). A role switch on Home can invalidate
-  the open page — it falls back to Home. The window title mirrors live
-  status.
-- **Pages** — Home (role switch + live status + connect addresses +
-  quick access + update line), Server (status, port, config path,
-  network interfaces), Client (server address, screen name), Layout
-  (canvas), Logs.
-- **`lib/hooks.ts`** — `useRunning` (polls role state every 2 s while
-  mounted) and `useLogTail` (polls the log every 1.5 s, sticks to the
-  bottom unless scrolled up).
+- **`app/AppProvider.tsx`** — one store for the whole app: the role and
+  live process state with a **single** 2 s poller. Pages read
+  `useApp()` instead of running their own intervals, so they can never
+  disagree about what is running. `app/App.tsx` is the shell: top bar
+  with a compact nav that only shows pages belonging to the current
+  role (server mode: Home/Server/Layout/Logs; client mode:
+  Home/Client/Logs). A role switch on Home can invalidate the open
+  page — it falls back to Home. The window title mirrors live status.
+- **features/home/** — a grid dashboard: RolePicker (the one place a
+  machine picks its role), ShareStatus (the *only* start/stop control;
+  all other pages are read-only and point here), ConnectInfo (addresses
+  to share / target to reach), QuickLinks, Updater.
+- **features/server & features/client** — pure configuration pages
+  (port + network / address + name). No duplicate start/stop.
+- **features/layout/** — see §8.3. Canvas gestures are handled through
+  refs with direct DOM writes during a drag (one state update on
+  release); ScreenNode is memoized so only a changed screen re-renders.
+- **features/logs/** — LogsPage (level select, enable switch, clear)
+  over LogViewer (`lib/useLogTail` polls the file every 1.5 s, sticks
+  to the bottom unless scrolled up).
 - The design is deliberately card-free: sections are plain type over
   hairline rules with generous whitespace, dark theme default.
 

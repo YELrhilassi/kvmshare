@@ -1,20 +1,22 @@
 import { useEffect, useState } from "react";
+import { useApp } from "@/app/AppProvider";
 import { api, type InterfaceInfo, type LayoutConfig, type Paths } from "@/lib/bridge";
 import { DEFAULT_PORT } from "@/lib/constants";
-import { useRunning } from "@/lib/hooks";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Section, Row } from "@/components/Section";
 import { cn } from "@/lib/utils";
 
+// Configuration for the shared machine. Start/stop lives on Home — this
+// page only shows a read-only status so nobody looks for the control
+// twice.
 export default function ServerPage() {
-  const running = useRunning();
+  const { running } = useApp();
   const [paths, setPaths] = useState<Paths | null>(null);
   const [config, setConfig] = useState<LayoutConfig | null>(null);
   const [ifaces, setIfaces] = useState<InterfaceInfo[]>([]);
   const [port, setPort] = useState(String(DEFAULT_PORT));
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -34,19 +36,6 @@ export default function ServerPage() {
       .then(setIfaces)
       .catch(() => {});
   }, []);
-
-  const toggleServer = async () => {
-    setBusy(true);
-    setError("");
-    try {
-      if (running.server) await api().ServerStop();
-      else await api().ServerStart();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const savePort = async () => {
     setError("");
@@ -69,23 +58,13 @@ export default function ServerPage() {
       <div className="mx-auto max-w-2xl px-10 py-16">
         <header className="mb-12 space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">Server</h1>
-          <p className="text-sm text-muted-foreground">Configuration and network.</p>
+          <p className="text-sm text-muted-foreground">
+            Settings for the machine that shares its keyboard and mouse.
+          </p>
         </header>
 
-        <div className="space-y-16">
-          <Section
-            title="Status"
-            action={
-              <Button
-                size="sm"
-                variant={running.server ? "outline" : "default"}
-                onClick={toggleServer}
-                disabled={busy}
-              >
-                {running.server ? "Stop" : "Start"}
-              </Button>
-            }
-          >
+        <div className="space-y-14">
+          <Section title="Status">
             <div className="flex items-center gap-3">
               <span
                 className={cn(
@@ -93,9 +72,11 @@ export default function ServerPage() {
                   running.server ? "bg-emerald-500" : "bg-muted-foreground/40",
                 )}
               />
-              <span className="text-lg font-medium">{running.server ? "Running" : "Stopped"}</span>
+              <span className="text-lg font-medium">{running.server ? "Sharing" : "Not sharing"}</span>
+              {!running.server && (
+                <span className="text-xs text-muted-foreground">start it from Home</span>
+              )}
             </div>
-            {error && <p className="text-xs text-destructive">{error}</p>}
           </Section>
 
           <Section title="Configuration">
@@ -116,6 +97,7 @@ export default function ServerPage() {
                 Save
               </Button>
             </div>
+            {error && <p className="text-xs text-destructive">{error}</p>}
             <div className="mt-6">
               <Row label="Screens" value={config ? String(config.screens.length) : "…"} />
               <Row label="Config file" value={paths?.configPath ?? "…"} mono />
@@ -142,7 +124,6 @@ export default function ServerPage() {
               ))}
             </div>
           </Section>
-
         </div>
       </div>
     </div>
