@@ -26,10 +26,19 @@ type Screen struct {
 	Y      int    `json:"y"`
 }
 
+// Network is the `[network]` section the frontend edits: who may
+// connect to this server.
+type Network struct {
+	Allowlist  bool     `json:"allowlist"`
+	LocalOnly  bool     `json:"localOnly"`
+	TrustedIDs []string `json:"trustedIds"`
+}
+
 // Config is the layout the frontend edits.
 type Config struct {
 	Port    int      `json:"port"`
 	Screens []Screen `json:"screens"`
+	Network Network  `json:"network"`
 }
 
 // configFile is the on-disk TOML shape. Kept separate from the JSON shape
@@ -37,6 +46,13 @@ type Config struct {
 type configFile struct {
 	Port    int          `toml:"port"`
 	Screens []screenFile `toml:"screens"`
+	Network networkFile  `toml:"network"`
+}
+
+type networkFile struct {
+	Allowlist  bool     `toml:"allowlist"`
+	LocalOnly  bool     `toml:"local_only"`
+	TrustedIDs []string `toml:"trusted_ids"`
 }
 
 type screenFile struct {
@@ -77,6 +93,16 @@ func (a *App) LoadConfig() (Config, error) {
 			Y:      s.Y,
 		})
 	}
+	cfg.Network = Network{
+		Allowlist:  cf.Network.Allowlist,
+		LocalOnly:  cf.Network.LocalOnly,
+		TrustedIDs: cf.Network.TrustedIDs,
+	}
+	// Old configs have no [network] section; default to secure.
+	if !cf.Network.Allowlist && !cf.Network.LocalOnly && len(cf.Network.TrustedIDs) == 0 {
+		cfg.Network.Allowlist = true
+		cfg.Network.LocalOnly = true
+	}
 	return cfg, nil
 }
 
@@ -107,7 +133,14 @@ func (a *App) SaveConfig(cfg Config) error {
 			return fmt.Errorf("screen %q has an invalid size", s.Name)
 		}
 	}
-	cf := configFile{Port: cfg.Port}
+	cf := configFile{
+		Port: cfg.Port,
+		Network: networkFile{
+			Allowlist:  cfg.Network.Allowlist,
+			LocalOnly:  cfg.Network.LocalOnly,
+			TrustedIDs: cfg.Network.TrustedIDs,
+		},
+	}
 	for _, s := range cfg.Screens {
 		cf.Screens = append(cf.Screens, screenFile{
 			Name:   strings.TrimSpace(s.Name),
@@ -147,5 +180,6 @@ func defaultConfig() Config {
 		Screens: []Screen{
 			{Name: name, Width: defaultScreenW, Height: defaultScreenH, X: 0, Y: 0},
 		},
+		Network: Network{Allowlist: true, LocalOnly: true},
 	}
 }

@@ -129,6 +129,7 @@ fn client_handshakes_and_applies_messages() {
     let port = 39001;
     let welcome = Message::Welcome {
         server_version: kvmshare_protocol::VERSION,
+        server_id: "server-1".into(),
         layout: Layout { screens: vec![] },
         own_screen_id: 7,
     };
@@ -138,7 +139,7 @@ fn client_handshakes_and_applies_messages() {
 
     let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 });
     let calls_handle = injector.calls.clone();
-    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     assert_eq!(client.own_id(), 7);
     let (_tx, rx) = mpsc::channel::<Message>();
     client.run(Box::new(injector), Box::new(NoClipboard), &rx).unwrap();
@@ -153,13 +154,14 @@ fn client_rejects_version_mismatch() {
     let port = 39002;
     let welcome = Message::Welcome {
         server_version: 999,
+        server_id: "server-1".into(),
         layout: Layout { screens: vec![] },
         own_screen_id: 7,
     };
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
     fake_server(listener, welcome, &[]);
     let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
-    let err = Client::connect(&format!("127.0.0.1:{port}"), "test", info).unwrap_err();
+    let err = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", info).unwrap_err();
     assert!(err.to_string().contains("v999"));
 }
 
@@ -168,6 +170,7 @@ fn resolution_change_is_reported() {
     let port = 39003;
     let welcome = Message::Welcome {
         server_version: kvmshare_protocol::VERSION,
+        server_id: "server-1".into(),
         layout: Layout { screens: vec![] },
         own_screen_id: 1,
     };
@@ -196,7 +199,7 @@ fn resolution_change_is_reported() {
     let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
     let injector = RecordingInjector::new(info);
     let info_handle = injector.info.clone();
-    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", info).unwrap();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", info).unwrap();
     let (_out_tx, out_rx) = mpsc::channel::<Message>();
 
     // Run the client on its own thread and simulate a display scale
@@ -225,6 +228,7 @@ fn udp_motion_stream_reaches_the_command_exactly_and_dedupes() {
     let port = 39004;
     let welcome = Message::Welcome {
         server_version: kvmshare_protocol::VERSION,
+        server_id: "server-1".into(),
         layout: Layout { screens: vec![] },
         own_screen_id: 7,
     };
@@ -266,7 +270,7 @@ fn udp_motion_stream_reaches_the_command_exactly_and_dedupes() {
     let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 });
     let calls_handle = injector.calls.clone();
     let pos_handle = injector.pos.clone();
-    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     let (_tx, rx) = mpsc::channel::<Message>();
     // The fake server closes the TCP side after ~310ms; run until EOF.
     let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
@@ -307,6 +311,7 @@ fn absolute_backends_land_exactly_on_the_command_via_tick_placement() {
     let port = 39005;
     let welcome = Message::Welcome {
         server_version: kvmshare_protocol::VERSION,
+        server_id: "server-1".into(),
         layout: Layout { screens: vec![] },
         own_screen_id: 7,
     };
@@ -340,7 +345,7 @@ fn absolute_backends_land_exactly_on_the_command_via_tick_placement() {
     let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 }).absolute();
     let calls_handle = injector.calls.clone();
     let pos_handle = injector.pos.clone();
-    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     let (_tx, rx) = mpsc::channel::<Message>();
     let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
 
@@ -369,6 +374,7 @@ fn secure_desktop_ends_the_session() {
     let port = 39008;
     let welcome = Message::Welcome {
         server_version: kvmshare_protocol::VERSION,
+        server_id: "server-1".into(),
         layout: Layout { screens: vec![] },
         own_screen_id: 7,
     };
@@ -386,7 +392,7 @@ fn secure_desktop_ends_the_session() {
 
     let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 });
     let secure_handle = injector.secure.clone();
-    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     let (_tx, rx) = mpsc::channel::<Message>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let client_thread = thread::spawn(move || {
@@ -411,6 +417,7 @@ fn button_wheel_and_key_are_injected_in_order_on_the_motion_thread() {
     let port = 39007;
     let welcome = Message::Welcome {
         server_version: kvmshare_protocol::VERSION,
+        server_id: "server-1".into(),
         layout: Layout { screens: vec![] },
         own_screen_id: 7,
     };
@@ -442,7 +449,7 @@ fn button_wheel_and_key_are_injected_in_order_on_the_motion_thread() {
 
     let mut injector = RecordingInjector::new(ScreenInfo { width: 1920, height: 1080, scale: 1.0 }).absolute();
     let calls_handle = injector.calls.clone();
-    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", injector.screen_info()).unwrap();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     let (_tx, rx) = mpsc::channel::<Message>();
     let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
 

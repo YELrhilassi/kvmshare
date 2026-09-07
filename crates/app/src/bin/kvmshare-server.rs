@@ -12,10 +12,12 @@ use std::time::{Duration, SystemTime};
 
 use kvmshare_app::guard::{self, RoleGuard};
 use kvmshare_app::{
-    default_config_path, parse_server_args, session_from_config, spawn_server_clipboard, Config,
+    default_config_path, machine_id, parse_server_args, session_from_config, spawn_server_clipboard,
+    state_dir, Config,
 };
-use kvmshare_core::server::{Control, Server};
+use kvmshare_core::server::{Control, Options, Policy, Server, ServerEvent};
 use kvmshare_log::{log_error, log_info, log_warn};
+use kvmshare_protocol::message::ScreenInfo;
 
 fn main() {
     if let Err(e) = run() {
@@ -70,9 +72,28 @@ fn run() -> Result<(), String> {
     let clipboard: Arc<Mutex<Box<dyn kvmshare_core::client::Clipboard>>> = Arc::new(Mutex::new(clipboard));
 
     let (ctl_tx, ctl_rx) = mpsc::channel();
+    // Lifecycle events (client connect/disconnect) flow out to the app
+    // layer, which persists the GUI's connected-client list and applies
+    // auto-config (screen sizes reported by clients).
+    let (evt_tx, evt_rx) = mpsc::channel();
+    let state = state_dir();
+    let policy = Policy {
+        allowlist: cfg.network.allowlist,
+        local_only: cfg.network.local_only,
+        trusted_ids: cfg.network.trusted_ids.clone(),
+    };
     let server = Arc::new(
-        Server::with_control(session_from_config(&cfg), port, Some(ctl_rx))
-            .map_err(|e| format!("bind: {e}"))?,
+        Server::with_options(
+            session_from_config(&cfg),
+            port,
+            Options {
+                control: Some(ctl_rx),
+                policy,
+                events: Some(evt_tx),
+                server_id: machine_id(&state),
+            },
+        )
+        .map_err(|e| format!("bind: {e}"))?,
     );
 
     // Clipboard: local changes are broadcast to every client.
@@ -80,7 +101,18 @@ fn run() -> Result<(), String> {
 
     // Config hot-reload: watch the file and adopt changes live, without
     // a restart (the GUI saves the config while the server keeps running).
-    spawn_config_watcher(config_path, ctl_tx);
+    spawn_config_watcher(config_path.clone(), ctl_tx.clone());
+
+    // The GUI's connected-client list: persist lifecycle events to
+    // `clients.json` in the state dir (the GUI polls it), and
+    // auto-configure screen sizes a client reports back into the config
+    // file (the user never has to type a resolution).
+    spawn_event_sink(evt_rx, state.clone(), config_path.clone());
+
+    // The GUI's per-client control file: `server.cmd` lines like
+    // `disconnect hp` / `reconnect hp` / `restart hp` become
+    // [`Control::ClientCommand`] messages on the main loop.
+    spawn_server_cmd_watcher(state.join("server.cmd"), ctl_tx);
 
     // Run forever, forwarding local input. The supervisor inside watches
     // the input path's health and, on a wedge while the cursor is on a
@@ -91,6 +123,147 @@ fn run() -> Result<(), String> {
 
 /// How often the config watcher polls the file for changes.
 const CONFIG_WATCH_POLL: Duration = Duration::from_millis(600);
+
+/// How often the `server.cmd` control file is polled.
+const CMD_WATCH_POLL: Duration = Duration::from_millis(250);
+
+/// Consume the server's lifecycle events: persist the connected-client
+/// list (`clients.json`) for the GUI and auto-configure screen sizes a
+/// client reports back into the config file.
+///
+/// The config write is deliberately narrow: it only updates `width` /
+/// `height` of the screen whose *name* matches the connected client,
+/// and only when the reported logical size differs from what the config
+/// says. Positions, names and the network section are never touched, so
+/// the user's layout decisions are preserved; the hot-reload watcher
+/// picks the corrected sizes up live.
+fn spawn_event_sink(
+    rx: mpsc::Receiver<ServerEvent>,
+    state_dir: PathBuf,
+    config_path: PathBuf,
+) {
+    thread::spawn(move || {
+        use std::collections::HashMap;
+        let mut clients: HashMap<String, (String, String, u64)> = HashMap::new(); // name → (id, addr, since_ms)
+        while let Ok(evt) = rx.recv() {
+            match evt {
+                ServerEvent::ClientConnected { name, id, addr, since_ms, info } => {
+                    clients.insert(name.clone(), (id, addr, since_ms));
+                    let _ = auto_config_screen_size(&config_path, &name, &info);
+                }
+                ServerEvent::ClientDisconnected { name } => {
+                    clients.remove(&name);
+                }
+            }
+            persist_clients(&state_dir, &clients);
+        }
+    });
+}
+
+/// Serialize the current client map as `clients.json` (atomic write).
+fn persist_clients(state_dir: &PathBuf, clients: &std::collections::HashMap<String, (String, String, u64)>) {
+    #[derive(serde::Serialize)]
+    struct Entry<'a> {
+        name: &'a str,
+        id: &'a str,
+        addr: &'a str,
+        since_ms: u64,
+    }
+    let list: Vec<Entry> = clients
+        .iter()
+        .map(|(name, (id, addr, since_ms))| Entry { name, id, addr, since_ms: *since_ms })
+        .collect();
+    let text = match serde_json::to_string(&list) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let path = state_dir.join("clients.json");
+    let _ = std::fs::create_dir_all(state_dir);
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Correct a screen's configured size to the size a client just reported
+/// (logical pixels = physical ÷ scale).
+///
+/// Only touches `width`/`height` of the matching screen — and only when
+/// the entry still carries the 1080p default (a size the user typed in
+/// is respected). Positions, names and the network section are never
+/// touched, so the user's layout decisions are preserved; the hot-reload
+/// watcher picks the corrected sizes up live.
+fn auto_config_screen_size(config_path: &PathBuf, name: &str, info: &ScreenInfo) -> Result<(), String> {
+    let mut cfg = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // config missing/broken — nothing to correct
+    };
+    let Some(screen) = cfg.screens.iter_mut().find(|s| s.name == name) else {
+        return Ok(()); // not a configured screen — nothing to correct
+    };
+    let is_default = screen.width == kvmshare_app::DEFAULT_SCREEN_W
+        && screen.height == kvmshare_app::DEFAULT_SCREEN_H;
+    if !is_default {
+        return Ok(()); // user set a size; keep it
+    }
+    let w = (info.width as f32 / info.scale.max(0.1)) as u32;
+    let h = (info.height as f32 / info.scale.max(0.1)) as u32;
+    if w < 1 || h < 1 || (w == screen.width && h == screen.height) {
+        return Ok(());
+    }
+    screen.width = w;
+    screen.height = h;
+    let text = match toml::to_string_pretty(&cfg) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let tmp = config_path.with_extension("toml.tmp");
+    if std::fs::write(&tmp, &text).is_ok() {
+        let _ = std::fs::rename(&tmp, config_path);
+        log_info!("auto-configured screen {name:?} to {w}x{h} from the client's reported geometry");
+    }
+    Ok(())
+}
+
+/// Poll the `server.cmd` control file and turn each line into a
+/// [`Control::ClientCommand`]. Lines are `<command> <name>` where
+/// `command` is disconnect | reconnect | restart. The file is truncated
+/// after a successful read (atomic tmp+rename), so the GUI can keep
+/// appending commands while the server is processing.
+fn spawn_server_cmd_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(CMD_WATCH_POLL);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) if !t.trim().is_empty() => t,
+                _ => continue,
+            };
+            // Clear the file first: even if parsing fails, the commands
+            // have been consumed (a partial write must not replay).
+            let tmp = path.with_extension("cmd.tmp");
+            if std::fs::write(&tmp, b"").is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+            for line in text.lines() {
+                let line = line.trim();
+                let mut parts = line.splitn(2, ' ');
+                let (Some(cmd), Some(name)) = (parts.next(), parts.next()) else { continue };
+                let command = match cmd {
+                    "disconnect" => kvmshare_protocol::id::control::DISCONNECT,
+                    "reconnect" => kvmshare_protocol::id::control::RECONNECT,
+                    "restart" => kvmshare_protocol::id::control::RESTART,
+                    _ => {
+                        log_warn!("server.cmd: unknown command {cmd:?}");
+                        continue;
+                    }
+                };
+                if tx.send(Control::ClientCommand { name: name.to_owned(), command }).is_err() {
+                    return; // server gone
+                }
+            }
+        }
+    });
+}
 
 /// Poll the config file and push a [`Control::Reload`] whenever its
 /// content changes, so layout edits apply live. A transient parse error

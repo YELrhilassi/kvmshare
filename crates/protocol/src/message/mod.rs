@@ -19,14 +19,21 @@ use crate::wire::{ReadBuf, WireError, WriteBuf};
 /// Every message peers can exchange.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    /// Client → server, first message.
-    Hello { version: u16, name: String, info: ScreenInfo },
+    /// Client → server, first message. `id` is the client machine's
+    /// stable machine id (used for trust and discovery); `name` is the
+    /// screen name (usually the hostname).
+    Hello { version: u16, id: String, name: String, info: ScreenInfo },
     /// Server → client, acknowledges the hello and sends the layout.
-    Welcome { server_version: u16, layout: Layout, own_screen_id: u8 },
+    /// `server_id` lets the client learn the server's machine id (trust).
+    Welcome { server_version: u16, server_id: String, layout: Layout, own_screen_id: u8 },
     /// Client → server: its screen shape changed (resolution/scale).
     ScreenInfo { info: ScreenInfo },
     /// Server → client: layout changed.
     Layout { layout: Layout },
+    /// Server → client: an operational command (disconnect / reconnect /
+    /// restart). The client ends its current session and acts per the
+    /// command — see [`crate::id::control`].
+    Control { command: u8 },
     /// Server → client: the cursor is entering this screen at (x, y).
     Enter { screen_id: u8, x: i32, y: i32 },
     /// Server → client: the cursor is leaving this screen.
@@ -66,6 +73,7 @@ impl Message {
             Message::Welcome { .. } => types::WELCOME,
             Message::ScreenInfo { .. } => types::SCREEN_INFO,
             Message::Layout { .. } => types::LAYOUT,
+            Message::Control { .. } => types::CONTROL,
             Message::Enter { .. } => types::ENTER,
             Message::Leave { .. } => types::LEAVE,
             Message::MouseMoveAbs { .. } => types::MOUSE_MOVE_ABS,
@@ -85,18 +93,21 @@ impl Message {
     pub fn to_frame(&self) -> Frame {
         let mut w = WriteBuf::with_capacity(32);
         match self {
-            Message::Hello { version, name, info } => {
+            Message::Hello { version, id, name, info } => {
                 w.put_u16(*version);
+                w.put_str(id);
                 w.put_str(name);
                 info.encode(&mut w);
             }
-            Message::Welcome { server_version, layout, own_screen_id } => {
+            Message::Welcome { server_version, server_id, layout, own_screen_id } => {
                 w.put_u16(*server_version);
+                w.put_str(server_id);
                 layout.encode(&mut w);
                 w.put_u8(*own_screen_id);
             }
             Message::ScreenInfo { info } => info.encode(&mut w),
             Message::Layout { layout } => layout.encode(&mut w),
+            Message::Control { command } => w.put_u8(*command),
             Message::Enter { screen_id, x, y } => {
                 w.put_u8(*screen_id);
                 w.put_i32(*x);
@@ -148,16 +159,19 @@ impl Message {
         let msg = match frame.msg_type {
             types::HELLO => Message::Hello {
                 version: r.get_u16()?,
+                id: r.get_str()?.to_owned(),
                 name: r.get_str()?.to_owned(),
                 info: ScreenInfo::decode(&mut r)?,
             },
             types::WELCOME => Message::Welcome {
                 server_version: r.get_u16()?,
+                server_id: r.get_str()?.to_owned(),
                 layout: Layout::decode(&mut r)?,
                 own_screen_id: r.get_u8()?,
             },
             types::SCREEN_INFO => Message::ScreenInfo { info: ScreenInfo::decode(&mut r)? },
             types::LAYOUT => Message::Layout { layout: Layout::decode(&mut r)? },
+            types::CONTROL => Message::Control { command: r.get_u8()? },
             types::ENTER => Message::Enter {
                 screen_id: r.get_u8()?,
                 x: r.get_i32()?,
@@ -232,6 +246,7 @@ mod tests {
     fn hello_roundtrip() {
         roundtrip(Message::Hello {
             version: 1,
+            id: "machine-1234".into(),
             name: "hp".into(),
             info: ScreenInfo { width: 1920, height: 1080, scale: 1.0 },
         });
@@ -241,6 +256,7 @@ mod tests {
     fn welcome_with_layout_roundtrip() {
         roundtrip(Message::Welcome {
             server_version: 1,
+            server_id: "machine-5678".into(),
             layout: Layout {
                 screens: vec![
                     Screen { id: 0, name: "pc".into(), rect: Rect { x: 0, y: 0, w: 1920, h: 1080 } },
@@ -249,6 +265,13 @@ mod tests {
             },
             own_screen_id: 1,
         });
+    }
+
+    #[test]
+    fn control_roundtrip() {
+        roundtrip(Message::Control { command: crate::id::control::DISCONNECT });
+        roundtrip(Message::Control { command: crate::id::control::RECONNECT });
+        roundtrip(Message::Control { command: crate::id::control::RESTART });
     }
 
     #[test]

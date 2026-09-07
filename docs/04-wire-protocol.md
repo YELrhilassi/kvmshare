@@ -53,12 +53,21 @@ Defined in `crates/protocol/src/message/mod.rs` (the `Message` enum) and
 
 | Type id | Message | Direction | Payload |
 |---------|---------|-----------|---------|
-| `0x01` | `Hello { version, name, info }` | client → server | protocol version, screen name, `ScreenInfo` |
-| `0x02` | `Welcome { server_version, layout, own_screen_id }` | server → client | version, the layout, this client's screen id |
+| `0x01` | `Hello { version, id, name, info }` | client → server | protocol version, **machine id**, screen name, `ScreenInfo` |
+| `0x02` | `Welcome { server_version, server_id, layout, own_screen_id }` | server → client | version, **server machine id**, the layout, this client's screen id |
 | `0x03` | `ScreenInfo { info }` | client → server | screen shape changed (resolution/scale) |
 | `0x04` | `Layout { layout }` | server → client | layout changed |
+| `0x05` | `Control { command }` | server → client | operational command (§4.3a) |
 | `0x7e` | `KeepAlive` | both | — |
 | `0x7f` | `Error { code, text }` | server → client | error code + text |
+
+### §4.3a Control commands
+
+| Code | Command | Meaning |
+|------|---------|---------|
+| `1` | `DISCONNECT` | end the session and **do not** reconnect — the client process exits its reconnect loop |
+| `2` | `RECONNECT` | end the session and reconnect immediately (fresh handshake) |
+| `3` | `RESTART` | end the session and reconnect immediately — a session-level restart of the controlled link |
 
 ### Cursor control
 
@@ -87,7 +96,9 @@ backend maps these to its native representation.
 
 ### Error codes
 
-`1` protocol, `2` version mismatch, `3` name conflict, `4` internal.
+`1` protocol, `2` version mismatch, `3` name conflict, `4` internal,
+`5` not allowed (name absent from layout and machine id not trusted),
+`6` not local (peer outside the server's local network).
 
 ## 4.4 The two transports
 
@@ -125,7 +136,7 @@ the address and sends motion there.
 
 ## 4.5 Versioning
 
-`kvmshare_protocol::VERSION` is currently `2`. The client sends its
+`kvmshare_protocol::VERSION` is currently `3`. The client sends its
 version in `Hello`; a mismatch is answered with `Error` (code 2) and the
 connection is refused. Bump the constant on any breaking wire change.
 

@@ -143,6 +143,10 @@ func main() {
 		setupTray(app, core, window)
 	})
 	core.StartNotifyWatcher()
+	// Advertise this machine on the LAN and watch for nearby kvmshare
+	// machines (discovery + pairing + auto-connect).
+	core.StartDiscovery()
+	core.AutoConnectLoop()
 
 	if err := app.Run(); err != nil {
 		log.Fatal(err)

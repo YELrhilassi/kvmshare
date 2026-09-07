@@ -15,6 +15,7 @@ use kvmshare_protocol::message::{Layout, Message, ScreenInfo};
 
 use crate::server::actions::apply_action;
 use crate::server::engine::{Engine, ServerClipboard};
+use crate::server::{Policy, ServerEvent};
 use crate::session::{Action, Session};
 use crate::transport::{RecvResult, Transport};
 use crate::udp;
@@ -35,6 +36,8 @@ const CLIENT_SILENT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Client {
     pub id: u8,
     pub name: String,
+    /// Monotonic ms when the client connected (for the client list).
+    pub since_ms: u64,
     /// Everything destined for this client: reliable control frames
     /// (TCP) and cursor-stream frames (UDP), in enqueue order. Drained
     /// by the writer thread.
@@ -86,6 +89,12 @@ pub struct ClientCtx {
     /// the signature of a wedged client — see the beacon watchdog in
     /// [`crate::server::udp::udp_receiver`].
     pub last_heard: Arc<Mutex<HashMap<u8, u64>>>,
+    /// Connection policy (allowlist / local-only / trusted ids).
+    pub policy: Policy,
+    /// Lifecycle events out to the app layer (client list, auto-config).
+    pub events: Option<Sender<ServerEvent>>,
+    /// This machine's stable id, sent to clients in `Welcome`.
+    pub server_id: String,
 }
 
 impl ClientCtx {
@@ -94,6 +103,12 @@ impl ClientCtx {
     pub fn layout_snapshot(&self) -> Layout {
         let s = self.session.lock().unwrap();
         Layout { screens: s.layout().screens.clone() }
+    }
+
+    /// This machine's stable id, sent to clients in `Welcome` so they
+    /// can trust the server (discovery, auto-connect).
+    pub fn server_id(&self) -> &str {
+        &self.server_id
     }
 
     /// Unregister the client everywhere and, if it had the cursor,
@@ -107,6 +122,9 @@ impl ClientCtx {
         self.addrs.lock().unwrap().remove(&id);
         self.seqs.lock().unwrap().remove(&id);
         self.last_heard.lock().unwrap().remove(&id);
+        if let Some(tx) = &self.events {
+            let _ = tx.send(ServerEvent::ClientDisconnected { name: name.to_owned() });
+        }
 
         {
             let mut act = self.active.lock().unwrap();
@@ -130,9 +148,10 @@ impl Client {
         // Timed reads: a client that stops sending (sleep, wedge, crash)
         // must be noticed and dropped so the session returns home — see
         // [`CLIENT_SILENT_TIMEOUT`].
+        let addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
         let mut transport = Transport::with_read_timeout(stream, Some(CLIENT_READ_TIMEOUT))?;
-        let (id, name, info, admitted) = exchange_hello(&mut transport, &ctx)?;
-        ctx.session.lock().unwrap().update_screen_info(id, info);
+        let (id, machine_id, name, info, admitted) = exchange_hello(&mut transport, &ctx, &addr)?;
+        ctx.session.lock().unwrap().update_screen_info(id, info.clone());
 
         // Send Welcome + current layout, then split the transport: the
         // writer keeps the sending half; the reader gets its own lock-
@@ -140,6 +159,7 @@ impl Client {
         // recv while the writer sends freely.
         transport.send(&Message::Welcome {
             server_version: kvmshare_protocol::VERSION,
+            server_id: ctx.server_id().to_owned(),
             layout: ctx.layout_snapshot(),
             own_screen_id: id,
         })?;
@@ -147,11 +167,25 @@ impl Client {
         let (out_tx, out_rx) = mpsc::channel::<Outbound>();
         spawn_writer(id, transport, udp, ctx.addrs.clone(), out_rx);
 
-        let client = Arc::new(Client { id, name, out: out_tx });
+        let client = Arc::new(Client {
+            id,
+            name: name.clone(),
+            since_ms: crate::time::now_ms(),
+            out: out_tx,
+        });
         ctx.clients.lock().unwrap().insert(id, client.clone());
         // Stable marker for the GUI's notification watcher (kept in sync
         // with the "disconnected" line in `teardown`): "client X connected".
         log_info!("client {} connected", client.name);
+        if let Some(tx) = &ctx.events {
+            let _ = tx.send(ServerEvent::ClientConnected {
+                name: name.clone(),
+                id: machine_id,
+                addr,
+                since_ms: client.since_ms,
+                info,
+            });
+        }
         if admitted {
             // The client was not in the layout and was admitted
             // dynamically. Every already-connected client must learn the
@@ -170,15 +204,21 @@ impl Client {
     }
 }
 
-/// Handshake: expect Hello with a matching protocol version, then find
-/// the client a screen. A client whose name is not in the layout is
-/// admitted dynamically (see [`Session::admit_client`]) instead of being
-/// rejected — a fresh pair of machines works before either has been
-/// configured. The only refusals left are a protocol version mismatch
-/// and a name that collides with the server's own screen.
-fn exchange_hello(transport: &mut Transport, ctx: &ClientCtx) -> io::Result<(u8, String, ScreenInfo, bool)> {
-    let (name, info) = match transport.recv()? {
-        RecvResult::Msg(Message::Hello { version, name, info }) => {
+/// Handshake: expect Hello with a matching protocol version, then apply
+/// the connection policy (local-only, allowlist / trusted ids) and find
+/// the client a screen.
+///
+/// Refusals: protocol version mismatch, a name colliding with the
+/// server's own screen, a peer outside the local network (when
+/// `local_only`), and a name absent from the layout whose machine id is
+/// not trusted (when `allowlist`).
+fn exchange_hello(
+    transport: &mut Transport,
+    ctx: &ClientCtx,
+    addr: &str,
+) -> io::Result<(u8, String, String, ScreenInfo, bool)> {
+    let (machine_id, name, info) = match transport.recv()? {
+        RecvResult::Msg(Message::Hello { version, id, name, info }) => {
             if version != kvmshare_protocol::VERSION {
                 let _ = transport.send(&Message::Error {
                     code: errors::VERSION_MISMATCH,
@@ -189,13 +229,44 @@ fn exchange_hello(transport: &mut Transport, ctx: &ClientCtx) -> io::Result<(u8,
                 });
                 return Err(io::Error::other("version mismatch"));
             }
-            (name, info)
+            (id, name, info)
         }
         RecvResult::Msg(_) => return Err(io::Error::other("expected hello")),
         RecvResult::Eof | RecvResult::NoData => {
             return Err(io::Error::other("client closed before hello"))
         }
     };
+
+    // Only accept connections from the local network (RFC1918 private
+    // ranges, loopback, link-local). A bridged/WAN peer is refused
+    // before any layout state is touched.
+    if ctx.policy.local_only && !is_local_addr(addr) {
+        let _ = transport.send(&Message::Error {
+            code: errors::NOT_LOCAL,
+            text: format!("connection from {addr} refused — only local-network peers are accepted"),
+        });
+        return Err(io::Error::other(format!("client {addr} is not on the local network")));
+    }
+
+    // Allowlist: the name must be in the layout, or the machine id must
+    // be trusted (then it is admitted dynamically). Anything else is
+    // refused — a client has to be named in the layout first.
+    if ctx.policy.allowlist {
+        let named = ctx.session.lock().unwrap().assign_screen_id(&name).is_some();
+        let trusted = ctx.policy.trusted_ids.iter().any(|t| t == &machine_id);
+        if !named && !trusted {
+            let _ = transport.send(&Message::Error {
+                code: errors::NOT_ALLOWED,
+                text: format!(
+                    "\"{name}\" is not in this server's layout and its machine id is not trusted — add it to the layout or trust its id to connect"
+                ),
+            });
+            return Err(io::Error::other(format!(
+                "client {name} ({machine_id}) refused: not in the layout and not trusted"
+            )));
+        }
+    }
+
     let (id, admitted) = match ctx.session.lock().unwrap().admit_client(&name, info.clone()) {
         Some(admitted) => admitted,
         None => {
@@ -206,7 +277,25 @@ fn exchange_hello(transport: &mut Transport, ctx: &ClientCtx) -> io::Result<(u8,
             return Err(io::Error::other(format!("client name {name} conflicts with the local screen")));
         }
     };
-    Ok((id, name, info, admitted))
+    Ok((id, machine_id, name, info, admitted))
+}
+
+/// Is `addr` (a `peer_addr()` string, possibly with port) on the local
+/// network? Accepts IPv4 RFC1918 private ranges (10/8, 172.16/12,
+/// 192.168/16), loopback and link-local, plus IPv6 loopback, ULA
+/// (fc00::/7) and link-local (fe80::/10). Anything else is "remote".
+fn is_local_addr(addr: &str) -> bool {
+    let ip = addr.split(':').next().unwrap_or(addr);
+    if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+        return v4.is_private() || v4.is_loopback() || v4.is_link_local();
+    }
+    if let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() {
+        let octets = v6.octets();
+        return v6.is_loopback()
+            || v6.is_unique_local()
+            || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80);
+    }
+    false
 }
 
 /// The reader thread: services one client's TCP control channel until it

@@ -21,9 +21,16 @@ export interface Screen {
   y: number;
 }
 
+export interface Network {
+  allowlist: boolean;
+  localOnly: boolean;
+  trustedIds: string[];
+}
+
 export interface LayoutConfig {
   port: number;
   screens: Screen[];
+  network: Network;
 }
 
 export interface Settings {
@@ -32,6 +39,25 @@ export interface Settings {
   clientName: string;
   logLevel: string;
   logEnabled: boolean;
+  trustedServers: string[];
+  acceptPairing: boolean;
+  autoConnect: boolean;
+}
+
+export interface ConnectedClient {
+  name: string;
+  id: string;
+  addr: string;
+  sinceMs: number;
+}
+
+export interface Peer {
+  id: string;
+  name: string;
+  role: "server" | "client";
+  addr: string;
+  port: number;
+  source: string;
 }
 
 export interface LogSettings {
@@ -87,6 +113,14 @@ interface GoApp {
   GetVersion(): Promise<string>;
   CheckForUpdate(): Promise<UpdateInfo>;
   ApplyUpdate(): Promise<UpdateResult>;
+  GetMachineId(): Promise<string>;
+  DiscoverPeers(): Promise<Peer[]>;
+  ListClients(): Promise<ConnectedClient[]>;
+  ClientCommand(name: string, action: string): Promise<void>;
+  TrustClient(id: string): Promise<void>;
+  TrustServer(id: string): Promise<void>;
+  ConnectToServer(addr: string): Promise<void>;
+  SendConnectRequest(peerId: string): Promise<void>;
 }
 
 interface WailsCall {
@@ -150,4 +184,12 @@ export const api = (): GoApp => ({
   GetVersion: () => call<string>("GetVersion"),
   CheckForUpdate: () => call<UpdateInfo>("CheckForUpdate"),
   ApplyUpdate: () => call<UpdateResult>("ApplyUpdate"),
+  GetMachineId: () => call<string>("GetMachineId"),
+  DiscoverPeers: () => call<Peer[]>("DiscoverPeers"),
+  ListClients: () => call<ConnectedClient[]>("ListClients"),
+  ClientCommand: (name, action) => call<void>("ClientCommand", name, action),
+  TrustClient: (id) => call<void>("TrustClient", id),
+  TrustServer: (id) => call<void>("TrustServer", id),
+  ConnectToServer: (addr) => call<void>("ConnectToServer", addr),
+  SendConnectRequest: (peerId) => call<void>("SendConnectRequest", peerId),
 });

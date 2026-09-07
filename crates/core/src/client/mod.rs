@@ -37,7 +37,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kvmshare_log::{log_error, log_warn};
+use kvmshare_log::{log_error, log_info, log_warn};
 use kvmshare_protocol::message::{Layout, Message, ScreenInfo};
 
 use crate::motion::{MotionProbe, PositionFollower};
@@ -56,6 +56,20 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 /// own thread and its own socket.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Why the client's session ended. The app layer's reconnect loop
+/// decides what to do next from this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// The link closed (EOF, reset, supervisor recovery) — reconnect.
+    LinkClosed,
+    /// The server told us to disconnect — do **not** reconnect; the
+    /// operator must start the client again.
+    Disconnected,
+    /// The server told us to reconnect (or restart) — reconnect now,
+    /// immediately, without the normal retry delay.
+    Reconnect,
+}
+
 /// A connected client. The transport is owned by the TCP thread (the
 /// thread that called [`Client::run`]); the cursor stream socket moves
 /// into [`Shared`] when `run` starts.
@@ -68,29 +82,38 @@ pub struct Client {
     /// own screen). Clients mostly ignore it today; it exists so future
     /// features have the data they need.
     layout: Layout,
+    /// The server's stable machine id (from `Welcome`), used to trust
+    /// the server for discovery / auto-connect.
+    server_id: String,
     /// The cursor stream socket; handed to [`Shared`] when `run` starts
     /// (motion and UDP threads share it).
     udp: UdpSocket,
 }
 
 impl Client {
-    /// Connect to `addr`, say hello with `name`, and wait for the server's
-    /// welcome. Opens the UDP cursor stream and registers it with the
-    /// server. Returns the client ready to run.
-    pub fn connect(addr: &str, name: &str, info: ScreenInfo) -> io::Result<Self> {
+    /// Connect to `addr`, say hello with `name` and this machine's stable
+    /// `id`, and wait for the server's welcome. Opens the UDP cursor
+    /// stream and registers it with the server. Returns the client ready
+    /// to run.
+    pub fn connect(addr: &str, name: &str, id: &str, info: ScreenInfo) -> io::Result<Self> {
         let stream = TcpStream::connect(addr)?;
         let mut transport = Transport::with_read_timeout(stream, Some(READ_TIMEOUT))?;
-        transport.send(&Message::Hello { version: kvmshare_protocol::VERSION, name: name.to_owned(), info })?;
+        transport.send(&Message::Hello {
+            version: kvmshare_protocol::VERSION,
+            id: id.to_owned(),
+            name: name.to_owned(),
+            info,
+        })?;
 
-        let (own_id, layout) = match transport.recv()? {
-            RecvResult::Msg(Message::Welcome { server_version, layout, own_screen_id }) => {
+        let (own_id, layout, server_id) = match transport.recv()? {
+            RecvResult::Msg(Message::Welcome { server_version, server_id, layout, own_screen_id }) => {
                 if server_version != kvmshare_protocol::VERSION {
                     return Err(io::Error::other(format!(
                         "server speaks v{server_version}, client speaks v{}",
                         kvmshare_protocol::VERSION
                     )));
                 }
-                (own_screen_id, layout)
+                (own_screen_id, layout, server_id)
             }
             RecvResult::Msg(Message::Error { code, text }) => Err(io::Error::other(format!(
                 "server rejected the connection ({code}): {text}"
@@ -110,7 +133,12 @@ impl Client {
         // server learns both who we are and where to send motion.
         udp.send(&udp::pack(own_id, 0, &Message::KeepAlive))?;
 
-        Ok(Self { transport, own_id, layout, udp })
+        Ok(Self { transport, own_id, layout, server_id, udp })
+    }
+
+    /// The server's machine id (from `Welcome`). Empty if unknown.
+    pub fn server_id(&self) -> &str {
+        &self.server_id
     }
 
     /// Run the client until the connection closes.
@@ -127,10 +155,10 @@ impl Client {
         mut injector: Box<dyn Injector>,
         clipboard: Box<dyn Clipboard>,
         outbox: &Receiver<Message>,
-    ) -> io::Result<()> {
+    ) -> io::Result<SessionEnd> {
         // Destructure so each field is owned independently — `udp` moves
         // into [`Shared`] while `transport` stays on this thread.
-        let Client { mut transport, own_id, layout, udp } = self;
+        let Client { mut transport, own_id, layout, server_id: _, udp } = self;
         let mut layout = layout;
         // The follower is born with the injector's current geometry so
         // its command can never run past a screen edge — even before
@@ -195,6 +223,7 @@ impl Client {
         // constant — motion no longer needs the control loop to wake at
         // motion cadence.
         let mut last_keepalive = Instant::now();
+        let mut end = SessionEnd::LinkClosed;
         loop {
             // A recovery path (the supervisor or the cursor-pin detector)
             // can ask the session to end from another thread; the read
@@ -224,6 +253,27 @@ impl Client {
                 break;
             }
             match transport.recv()? {
+                RecvResult::Msg(Message::Control { command }) => {
+                    // The server commands us to end this session in a
+                    // specific way. Handled here (not in `dispatch`) so
+                    // the reconnect loop can learn the reason.
+                    shared.tcp_tick_ms.store(now_ms(), Ordering::Relaxed);
+                    end = match command {
+                        kvmshare_protocol::id::control::DISCONNECT => SessionEnd::Disconnected,
+                        kvmshare_protocol::id::control::RECONNECT
+                        | kvmshare_protocol::id::control::RESTART => SessionEnd::Reconnect,
+                        _ => {
+                            log_warn!("unknown control command {command}");
+                            continue;
+                        }
+                    };
+                    match end {
+                        SessionEnd::Disconnected => log_info!("server asked us to disconnect"),
+                        SessionEnd::Reconnect => log_info!("server asked us to reconnect"),
+                        SessionEnd::LinkClosed => {}
+                    }
+                    break;
+                }
                 RecvResult::Msg(msg) => {
                     shared.tcp_tick_ms.store(now_ms(), Ordering::Relaxed);
                     dispatch::dispatch(&mut layout, &shared, own_id, msg);
@@ -262,7 +312,7 @@ impl Client {
         Self::join_bounded(sync, "sync");
         let _ = supervisor.join();
         threads::place_at_command(&shared);
-        Ok(())
+        Ok(end)
     }
 
     /// Join a worker thread with a grace period; a thread that has not

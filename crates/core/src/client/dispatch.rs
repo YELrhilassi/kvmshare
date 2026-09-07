@@ -98,11 +98,14 @@ pub(crate) fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, ms
         }
         Message::KeepAlive => {}
         Message::Error { code, text } => log_warn!("server error ({code}): {text}"),
-        // Not valid client-side traffic; ignore defensively.
+        // Not valid client-side traffic; ignore defensively. `Control`
+        // is intercepted by the TCP loop before dispatch (the reconnect
+        // loop needs the reason), so it can only reach here as a bug.
         Message::Hello { .. }
         | Message::Welcome { .. }
         | Message::ScreenInfo { .. }
         | Message::CursorPos { .. }
+        | Message::Control { .. }
         | Message::Escape => {}
     }
 }

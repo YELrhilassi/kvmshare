@@ -10,6 +10,9 @@ pub mod types {
     pub const WELCOME: u8 = 0x02;
     pub const SCREEN_INFO: u8 = 0x03;
     pub const LAYOUT: u8 = 0x04;
+    /// Server → client: an operational command (disconnect, reconnect,
+    /// restart). See [`super::message::Message::Control`].
+    pub const CONTROL: u8 = 0x05;
     pub const ENTER: u8 = 0x10;
     pub const LEAVE: u8 = 0x11;
     /// Client → server: the client's *real* cursor position while it is
@@ -60,4 +63,24 @@ pub mod errors {
     pub const VERSION_MISMATCH: u8 = 2;
     pub const NAME_CONFLICT: u8 = 3;
     pub const INTERNAL: u8 = 4;
+    /// The client's name is not in the server's layout and its machine id
+    /// is not trusted — the server's connection policy refused it.
+    pub const NOT_ALLOWED: u8 = 5;
+    /// The peer is outside the allowed network (the server only accepts
+    /// connections from its local network).
+    pub const NOT_LOCAL: u8 = 6;
+}
+
+/// Commands carried by the [`super::message::Message::Control`]
+/// message. Kept as plain `u8` constants so the wire format is trivial
+/// to document and debug.
+pub mod control {
+    /// End the session and **do not** reconnect — the client process
+    /// exits its reconnect loop (the operator must start it again).
+    pub const DISCONNECT: u8 = 1;
+    /// End the session and reconnect immediately (fresh handshake).
+    pub const RECONNECT: u8 = 2;
+    /// End the session and reconnect immediately — a session-level
+    /// restart of the controlled link.
+    pub const RESTART: u8 = 3;
 }

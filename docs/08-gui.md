@@ -10,7 +10,11 @@ never speaks the wire protocol itself.
 gui/
 ├── main.go                # entry: single instance, session bus, window, tray
 ├── app.go                 # the bound App service: settings, paths, processes, logs
-├── config.go              # layout config (TOML) load/save for the Layout page
+├── config.go              # layout + [network] config (TOML) load/save
+├── machine_id.go          # machine id (same file the Rust binaries read)
+├── discovery.go           # mDNS advertise + browse (zeroconf), auto-connect
+├── clients.go             # connected-client list (clients.json) + control file (server.cmd)
+├── trust.go               # trust a client by machine id, watcher loop
 ├── process.go             # process management (spawn/stop/adopt/auto-restart)
 ├── process_os_unix.go     #   Unix primitives (flock, process groups, signals)
 ├── process_os_windows.go  #   Windows primitives (LockFileEx, TerminateProcess)
@@ -56,7 +60,37 @@ Key methods the frontend calls: `GetSettings`/`SetSettings`,
 `ServerRunning`, `ClientStart`/`ClientStop`/`ClientRunning`,
 `StartActive`/`StopActive`, `ListInterfaces`, `TailLog`,
 `GetLogSettings`/`SetLogSettings`, `ClearLog`, `GetVersion`,
-`CheckForUpdate`, `ApplyUpdate`, `ConnectedClients`.
+`CheckForUpdate`, `ApplyUpdate`, `ConnectedClients`,
+`ListClients`, `ClientCommand`, `DiscoverServers`, `ConnectToServer`,
+`TrustClient`, `StartDiscovery`, `AutoConnectEnabled`.
+
+## 8.1a Discovery & pairing
+
+**Files: `gui/discovery.go`, `gui/trust.go`, `gui/machine_id.go`**
+
+- Every kvmshare advertises its role over **mDNS** (`_kvmshare._tcp`,
+  service name = the machine id + role). Servers also publish their
+  port and display geometry as TXT records. No IP/port typing.
+- The **Client page** lists nearby servers with one-click connect and
+  an **auto-connect** toggle for a chosen server; the watcher also
+  reconnects when a server returns. Discovery failing means even a
+  manual address would fail — it is the same local network.
+- **Trusted ids make pairing headless**: add a machine's id (shown on
+  its own Home page) to `trusted_ids`, or accept its connect when the
+  server asks — the client is admitted dynamically on first connect
+  with its real screen size, so no mouse-plug-in-first ritual.
+- Machine ids are shared with the Rust binaries via `machine.id` in the
+  state dir (see [App §7.4](07-app.md#74-machine-id--hostname)).
+
+## 8.1b The Server page (clients & network)
+
+- **Network policy** — allowlist on/off, local-only on/off, and the
+  `trusted_ids` list; all hot-applied to the running server via the
+  config watcher.
+- **Connected clients** — live list from `clients.json` (name, machine
+  id, address, connected-at) with per-client **Disconnect / Reconnect /
+  Restart** buttons, written to `server.cmd` and applied by the server
+  binary's control watcher.
 
 ## 8.2 Process management
 
@@ -178,8 +212,13 @@ ScreenInspector):
   machine picks its role), ShareStatus (the *only* start/stop control;
   all other pages are read-only and point here), ConnectInfo (addresses
   to share / target to reach), QuickLinks, Updater.
-- **features/server & features/client** — pure configuration pages
-  (port + network / address + name). No duplicate start/stop.
+- **features/server/** — network policy (allowlist, local-only,
+  trusted ids), live connected-client list with per-client
+  Disconnect/Reconnect/Restart, and the port. Read-only start/stop
+  (points to Home).
+- **features/client/** — nearby-server discovery with one-click
+  connect, auto-connect toggle, and the server address + name. Read-only
+  start/stop (points to Home).
 - **features/layout/** — see §8.3. Canvas gestures are handled through
   refs with direct DOM writes during a drag (one state update on
   release); ScreenNode is memoized so only a changed screen re-renders.

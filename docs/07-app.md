@@ -9,11 +9,16 @@ poller. Everything here is above the core/platform crates.
 **File: `crates/app/src/config.rs`**
 
 The server config (`kvmshare-server.toml`) describes **one machine's
-role as a server**: the port to listen on and the virtual desktop
-layout.
+role as a server**: the port to listen on, the connection policy, and
+the virtual desktop layout.
 
 ```toml
 port = 24800
+
+[network]          # who may connect (see §7.1a)
+allowlist = true
+local_only = true
+trusted_ids = []
 
 [[screens]]
 name = "pc"        # the FIRST screen is always this server's own
@@ -34,6 +39,25 @@ y = 0
   names) and `to_layout()` builds the wire layout with `id 0` = server,
   then `1..n` in order — **normalized** (near-adjacent screens snapped
   into exact contact).
+
+### §7.1a The `[network]` policy
+
+Who may connect, enforced by the server at handshake time:
+
+- `allowlist = true` (default) — only accept clients whose **exact
+  name** appears in the layout, plus any `trusted_ids`. A client that
+  is neither is refused with `Error` code 5 (`NOT_ALLOWED`).
+- `local_only = true` (default) — only accept connections whose peer
+  address is on the local network (private/loopback ranges); anything
+  else is refused with code 6 (`NOT_LOCAL`).
+- `trusted_ids` — machine ids allowed to connect even when their name
+  is not in the layout yet. A trusted client is **admitted
+  dynamically** on first connect: it gets the next screen id and the
+  new layout is broadcast to every client, so pairing a fresh machine
+  is headless — no need to plug a mouse in first.
+
+The GUI edits the same `[network]` section live; the server hot-reloads
+it with the rest of the config.
 - `Config::for_this_machine()` — a default describing *this machine
   only*: the real hostname and real display geometry (via
   `platform::primary_display`, physical pixels ÷ DPI scale → logical
@@ -80,7 +104,13 @@ lock is held:
 - `--logctl` points at the GUI-written control file for live log level /
   enable changes.
 
-## 7.4 Hostname
+## 7.4 Machine id & hostname
+
+**File: `crates/app/src/machine_id.rs`** — every machine has a stable
+random id, stored in `machine.id` in the state dir. It is sent in
+`Hello`/`Welcome`, shown in the GUI's client list, and used by the
+`trusted_ids` policy — so a machine can be granted access by id without
+any name bookkeeping.
 
 **File: `crates/app/src/hostname.rs`** — the machine's host name (env,
 `/proc/sys/kernel/hostname`, then `platform::hostname()`), used as the
@@ -99,6 +129,18 @@ Two extra pieces live here:
 - `spawn_config_watcher` — polls the config file every 600 ms; on a
   content change it sends `Control::Reload` to the server (hot reload,
   applied on the main loop).
+- `spawn_client_events` — receives the server's `ServerEvent`s
+  (connect/disconnect/screen change) and writes `clients.json` in the
+  state dir (name, machine id, address, connected-at, screen info). The
+  GUI watches this file for its client list.
+- `spawn_control_watcher` — watches `server.cmd` in the state dir;
+  each line is a `Control` command (`disconnect NAME`,
+  `reconnect NAME`, `restart NAME`) sent to the named client's session.
+  The GUI writes this file for its per-client buttons.
+- Auto-config: when a client connects it reports its real `ScreenInfo`;
+  the server updates the layout's entry for that name to the reported
+  size (falling back to 1080p for an unknown-but-trusted client) and
+  re-broadcasts the layout — the user never types screen sizes.
 
 ## 7.6 The client binary
 
@@ -115,6 +157,9 @@ The notable bits:
   answered).
 - The role lock keeps this the single client instance; SIGTERM ends the
   loop.
+- On `Control::DISCONNECT` from the server it exits its reconnect loop
+  entirely (the GUI's "Disconnect" button); `RECONNECT`/`RESTART` end
+  the current session and start a fresh handshake immediately.
 
 ---
 

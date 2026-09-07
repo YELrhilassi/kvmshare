@@ -38,13 +38,24 @@ const (
 )
 
 // Settings is the GUI's own persisted state (role + client connection +
-// the operator's logging preferences).
+// the operator's logging preferences + discovery/trust settings).
 type Settings struct {
 	Mode       Mode   `json:"mode"`
 	ClientAddr string `json:"clientAddr"` // host:port of the server to connect to
 	ClientName string `json:"clientName"` // screen name used on the server
 	LogLevel   string `json:"logLevel"`   // error|warn|info|debug|trace
 	LogEnabled bool   `json:"logEnabled"` // false silences the role's log entirely
+
+	// TrustedServers is the list of server machine ids this machine
+	// accepts connection requests from (discovery pairing). Empty means
+	// "no server may command this machine to connect".
+	TrustedServers []string `json:"trustedServers"`
+	// AcceptPairing lets any local kvmshare server request a connection
+	// (a convenience with a trust trade-off; off by default).
+	AcceptPairing bool `json:"acceptPairing"`
+	// AutoConnect makes the client automatically connect to the last
+	// used server when it appears on the network (discovery).
+	AutoConnect bool `json:"autoConnect"`
 }
 
 // LogSettings is what the Logs page shows and edits: the logging
@@ -89,6 +100,8 @@ type App struct {
 	// Lifecycle notifications (client connect/disconnect from the server
 	// log). nil until StartNotifyWatcher is called.
 	notify *notify
+	// Network discovery (mDNS advertise + browse + pairing listener).
+	disc *discovery
 }
 
 // NewApp locates every file the GUI needs.
@@ -158,6 +171,7 @@ func NewApp() *App {
 	}
 	a.loadSettings()
 	a.notify = newNotify(a.serverLogPath)
+	a.disc = newDiscovery(a)
 	return a
 }
 
@@ -322,6 +336,20 @@ func (a *App) GetSettings() Settings {
 	return a.settings
 }
 
+// ConnectToServer points the client at `addr` (host:port) and starts it.
+// Used by discovery pairing: a trusted server asked this machine to
+// connect. Idempotent when a client is already running.
+func (a *App) ConnectToServer(addr string) error {
+	a.mu.Lock()
+	next := a.settings
+	next.ClientAddr = addr
+	a.settings = next
+	a.saveSettingsLocked()
+	a.mu.Unlock()
+	_, err := a.ClientStart()
+	return err
+}
+
 // SetSettings stores the GUI state. Changing the role also stops the
 // process of the other role, because a machine runs as a server or as a
 // client — never both. The client address may stay empty until the
@@ -344,6 +372,9 @@ func (a *App) SetSettings(s Settings) error {
 	// instance (hot reload) and to whichever role starts next.
 	a.writeLogCtlLocked(roleServer)
 	a.writeLogCtlLocked(roleClient)
+	// A role switch changes what this machine advertises on the network
+	// (server vs client) — re-publish so nearby machines see the truth.
+	a.ReAdvertise()
 	// Changing mode is a *selection*, not a command to stop anything:
 	// the role currently running on this machine keeps running until the
 	// user starts the other one. Starting a role stops the opposite role
@@ -444,6 +475,19 @@ func (a *App) ClearLog(role string) error {
 // the background for the whole GUI lifetime; idempotent.
 func (a *App) StartNotifyWatcher() {
 	a.notify.run()
+}
+
+// StartDiscovery advertises this machine and browses for peers. Runs for
+// the whole GUI lifetime; a role switch re-advertises under the new role.
+func (a *App) StartDiscovery() {
+	a.disc.start()
+}
+
+// ReAdvertise re-publishes the mDNS record under the current role.
+func (a *App) ReAdvertise() {
+	if a.disc != nil {
+		a.disc.republish()
+	}
 }
 
 // ConnectedClients reports how many clients the server currently has

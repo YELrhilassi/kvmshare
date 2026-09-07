@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use kvmshare_core::client::{Clipboard, Client, Injector};
 use kvmshare_core::layout::Layout;
-use kvmshare_core::server::{Control, Engine, Server};
+use kvmshare_core::server::{Control, Engine, Options, Policy, Server};
 use kvmshare_core::session::Session;
 use kvmshare_core::transport::{RecvResult, Transport};
 use kvmshare_core::udp;
@@ -125,7 +125,17 @@ impl Harness {
 fn start_server() -> Harness {
     let session = Session::new(two_screen_layout(), 0);
     let (control_tx, control_rx) = mpsc::channel::<Control>();
-    let server = Arc::new(Server::with_control(session, 0, Some(control_rx)).unwrap());
+    // The e2e harness keeps the legacy open behavior (allowlist off) so
+    // every pre-existing scenario works unchanged; the allowlist itself
+    // is exercised by its own dedicated test.
+    let server = Arc::new(
+        Server::with_options(
+            session,
+            0,
+            Options { control: Some(control_rx), policy: Policy { allowlist: false, ..Policy::default() }, events: None, server_id: "server-pc".into() },
+        )
+        .unwrap(),
+    );
     let port = server.local_addr().unwrap().port();
 
     let (input_tx, input_rx) = mpsc::channel::<Message>();
@@ -154,7 +164,7 @@ fn connect_client(port: u16) -> (Client, RecordingInjector, Arc<Mutex<Vec<String
     let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
     let injector = RecordingInjector::new(info);
     let calls = injector.calls.clone();
-    let client = Client::connect(&format!("127.0.0.1:{port}"), "hp", info).unwrap();
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info).unwrap();
     assert_eq!(client.own_id(), 1);
     let (_out_tx, out_rx) = mpsc::channel::<Message>();
     (client, injector, calls, out_rx)
@@ -278,7 +288,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
 fn raw_beacon_client(port: u16, n: u32) {
     let mut tcp = Transport::new(TcpStream::connect(("127.0.0.1", port)).unwrap()).unwrap();
     let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
-    tcp.send(&Message::Hello { version: VERSION, name: "hp".into(), info }).unwrap();
+    tcp.send(&Message::Hello { version: VERSION, id: "machine-hp".into(), name: "hp".into(), info }).unwrap();
     let id = match tcp.recv().unwrap() {
         RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => own_screen_id,
         other => panic!("expected welcome, got {other:?}"),
@@ -357,7 +367,7 @@ fn crossing_after_idle_is_not_dropped_by_the_beacon_watchdog() {
     // hiding the race this guards against.)
     let mut tcp = Transport::new(TcpStream::connect(("127.0.0.1", h.port)).unwrap()).unwrap();
     let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
-    tcp.send(&Message::Hello { version: VERSION, name: "hp".into(), info }).unwrap();
+    tcp.send(&Message::Hello { version: VERSION, id: "machine-hp".into(), name: "hp".into(), info }).unwrap();
     let id = match tcp.recv().unwrap() {
         RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => own_screen_id,
         other => panic!("expected welcome, got {other:?}"),
@@ -432,12 +442,74 @@ fn unknown_client_is_admitted_dynamically() {
     // pair of machines works before either has been configured.
     let h = start_server(); // pc at origin, hp configured to the left
     let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
-    let client = Client::connect(&format!("127.0.0.1:{}", h.port), "not-in-layout", info).unwrap();
+    let client = Client::connect(&format!("127.0.0.1:{}", h.port), "not-in-layout", "machine-new", info).unwrap();
     // pc=0 and hp=1 are taken; the newcomer gets the next free id and
     // the server registered it.
     assert_eq!(client.own_id(), 2);
     h.wait_for_clients(1);
     assert_eq!(h.server.client_count(), 1);
+}
+
+/// The allowlist policy: a name absent from the layout is refused unless
+/// its machine id is trusted. Trusted ids are admitted dynamically.
+#[test]
+fn allowlist_refuses_unknown_and_admits_trusted() {
+    let session = Session::new(two_screen_layout(), 0);
+    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let policy = Policy {
+        allowlist: true,
+        local_only: false, // localhost must pass the network check
+        trusted_ids: vec!["machine-trusted".into()],
+    };
+    let server = Arc::new(
+        Server::with_options(
+            session,
+            0,
+            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+        )
+        .unwrap(),
+    );
+    let port = server.local_addr().unwrap().port();
+    let (input_tx, input_rx) = mpsc::channel::<Message>();
+    let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
+    let clipboard: kvmshare_core::server::ServerClipboard =
+        Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
+    thread::spawn({
+        let server = server.clone();
+        let engine = engine.clone();
+        let clipboard = clipboard.clone();
+        move || {
+            server
+                .run(input_rx, engine, clipboard, Arc::new(kvmshare_core::server::Liveness::default()))
+                .unwrap()
+        }
+    });
+
+    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+
+    // Untrusted and unnamed: refused with a NOT_ALLOWED error.
+    let err = Client::connect(&format!("127.0.0.1:{port}"), "stranger", "machine-stranger", info.clone())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("rejected"),
+        "unknown untrusted client should be refused, got: {err}"
+    );
+    // Wait a beat so the refused connection is fully torn down; the
+    // server never registered it.
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(server.client_count(), 0, "refused client must not be registered");
+
+    // Trusted id (even without a layout name): admitted dynamically.
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "trusted-peer", "machine-trusted", info)
+        .unwrap();
+    assert_eq!(client.own_id(), 2);
+    for _ in 0..100 {
+        if server.client_count() >= 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(server.client_count(), 1, "trusted client should be admitted");
 }
 
 #[test]

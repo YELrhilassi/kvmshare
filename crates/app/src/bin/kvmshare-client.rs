@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use kvmshare_app::guard::{self, RoleGuard};
-use kvmshare_app::{hostname, parse_client_args, with_default_port, DEFAULT_PORT};
-use kvmshare_core::client::Client;
+use kvmshare_app::{hostname, machine_id, parse_client_args, state_dir, with_default_port, DEFAULT_PORT};
+use kvmshare_core::client::{Client, SessionEnd};
 use kvmshare_log::{log_error, log_info, log_warn};
 use kvmshare_protocol::message::Message;
 
@@ -45,11 +45,17 @@ fn run() -> Result<(), String> {
 
     let addr = with_default_port(&args.server_addr, DEFAULT_PORT);
     let name = args.name.unwrap_or_else(hostname);
+    // This machine's stable id: sent in Hello so the server can trust
+    // this machine by id (the allowlist's trusted-ids bypass) and list
+    // it in the GUI. The GUI reads the same file.
+    let id = machine_id(&state_dir());
 
     // Connect forever (reconnecting while the process lives). The role
     // lock keeps this the single client instance; stopping the process
     // (SIGTERM) is what ends the loop. Errors are printed once per state
-    // change so a down server doesn't spam the log.
+    // change so a down server doesn't spam the log. The session can also
+    // end on the server's command: disconnect (stop), reconnect/restart
+    // (reconnect immediately).
     let mut warned = false;
     let mut prompt_warned = false;
     loop {
@@ -83,8 +89,8 @@ fn run() -> Result<(), String> {
             }
         };
 
-        log_info!("connecting to {addr} as {name}");
-        match Client::connect(&addr, &name, injector.screen_info()) {
+        log_info!("connecting to {addr} as {name} (machine {id})");
+        match Client::connect(&addr, &name, &id, injector.screen_info()) {
             Ok(client) => {
                 warned = false;
                 log_info!("connected, screen id {}", client.own_id());
@@ -92,8 +98,26 @@ fn run() -> Result<(), String> {
                 // the core run loop handles clipboard upload and
                 // keepalives itself.
                 let (_out_tx, out_rx) = mpsc::channel::<Message>();
-                if let Err(e) = client.run(injector, clipboard, &out_rx) {
-                    log_warn!("session ended: {e} — reconnecting");
+                match client.run(injector, clipboard, &out_rx) {
+                    // The server told us to disconnect: do not reconnect.
+                    // The operator starts the client again when wanted.
+                    Ok(SessionEnd::Disconnected) => {
+                        log_info!("disconnected by the server — staying stopped");
+                        return Ok(());
+                    }
+                    // Reconnect/restart: immediately, fresh handshake.
+                    Ok(SessionEnd::Reconnect) => {
+                        log_info!("reconnect requested by the server");
+                        continue;
+                    }
+                    Ok(SessionEnd::LinkClosed) => {
+                        thread::sleep(RETRY_DELAY);
+                        continue;
+                    }
+                    Err(e) => {
+                        log_warn!("session ended: {e} — reconnecting");
+                        thread::sleep(RETRY_DELAY);
+                    }
                 }
             }
             Err(e) => {
@@ -101,8 +125,8 @@ fn run() -> Result<(), String> {
                     log_warn!("connect failed: {e} — retrying every 3 s");
                     warned = true;
                 }
+                thread::sleep(RETRY_DELAY);
             }
         }
-        thread::sleep(RETRY_DELAY);
     }
 }

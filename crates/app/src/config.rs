@@ -12,7 +12,8 @@ pub const DEFAULT_PORT: u16 = 24800;
 pub const DEFAULT_SCREEN_W: u32 = 1920;
 pub const DEFAULT_SCREEN_H: u32 = 1080;
 
-/// The server config file: the virtual desktop layout.
+/// The server config file: the virtual desktop layout and the network
+/// policy.
 ///
 /// The **first** screen is always the server's own screen (id 0). The
 /// remaining screens are clients, matched by the name a client sends in
@@ -30,6 +31,39 @@ pub struct Config {
     pub port: u16,
     #[serde(default)]
     pub screens: Vec<ScreenConfig>,
+    /// Connection policy (`[network]` section). Defaults are applied
+    /// when the section is missing, so old configs stay valid.
+    #[serde(default)]
+    pub network: NetworkConfig,
+}
+
+/// The `[network]` section: who may connect to this server.
+///
+/// * `allowlist` — only accept clients whose exact name appears in the
+///   layout, plus trusted machine ids (default `true`).
+/// * `local_only` — only accept connections from the local network
+///   (default `true`).
+/// * `trusted_ids` — machine ids allowed to connect even when their
+///   name is not in the layout yet (they are admitted dynamically on
+///   their first connect).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default = "default_true")]
+    pub allowlist: bool,
+    #[serde(default = "default_true")]
+    pub local_only: bool,
+    #[serde(default)]
+    pub trusted_ids: Vec<String>,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self { allowlist: true, local_only: true, trusted_ids: Vec::new() }
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -136,6 +170,7 @@ impl Config {
                 y: 0,
                 scale: 1.0,
             }],
+            network: NetworkConfig::default(),
         }
     }
 
@@ -230,6 +265,45 @@ mod tests {
         assert_eq!(layout.screens[1].id, 1);
         assert_eq!(layout.screens[1].name, "hp");
         assert_eq!(layout.screens[1].rect.x, -1920);
+        // Network policy defaults to secure.
+        assert!(cfg.network.allowlist);
+        assert!(cfg.network.local_only);
+        assert!(cfg.network.trusted_ids.is_empty());
+    }
+
+    #[test]
+    fn config_parses_network_section() {
+        let text = r#"
+            port = 24800
+            [[screens]]
+            name = "pc"
+            [network]
+            allowlist = false
+            local_only = false
+            trusted_ids = ["machine-1", "machine-2"]
+        "#;
+        let path = std::env::temp_dir().join("kvmshare-test-network.toml");
+        std::fs::write(&path, text).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(!cfg.network.allowlist);
+        assert!(!cfg.network.local_only);
+        assert_eq!(cfg.network.trusted_ids, vec!["machine-1".to_string(), "machine-2".to_string()]);
+    }
+
+    #[test]
+    fn old_config_without_network_section_stays_valid() {
+        let text = r#"
+            port = 24800
+            [[screens]]
+            name = "pc"
+        "#;
+        let path = std::env::temp_dir().join("kvmshare-test-old.toml");
+        std::fs::write(&path, text).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(cfg.network.allowlist);
+        assert!(cfg.network.local_only);
     }
 
     #[test]

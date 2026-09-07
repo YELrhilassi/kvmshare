@@ -1,0 +1,118 @@
+package main
+
+// Trust and auto-connect: the two sides of "set it up once, connect
+// automatically after".
+//
+//   - Server side — a server operator sees a nearby machine in the
+//     discovery list and clicks "trust": its machine id is added to the
+//     config's `[network] trusted_ids`, so the allowlist accepts it even
+//     before a layout screen is pinned for it.
+//   - Client side — the GUI's settings carry a trusted-servers list and
+//     an auto-connect flag. When auto-connect is on and a server whose
+//     id is trusted (or whose address matches the last-used server)
+//     appears on the network, the client connects by itself.
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// TrustClient adds a machine id to the server config's trusted_ids list
+// (persisted; the running server hot-reloads it). Idempotent.
+func (a *App) TrustClient(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("machine id is required")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cfg, err := a.LoadConfig()
+	if err != nil {
+		return err
+	}
+	for _, t := range cfg.Network.TrustedIDs {
+		if t == id {
+			return nil // already trusted
+		}
+	}
+	cfg.Network.TrustedIDs = append(cfg.Network.TrustedIDs, id)
+	return a.SaveConfig(cfg)
+}
+
+// TrustServer adds a server machine id to this machine's trusted-servers
+// list (the client accepts connection requests from it). Idempotent.
+func (a *App) TrustServer(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("machine id is required")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, t := range a.settings.TrustedServers {
+		if t == id {
+			return nil
+		}
+	}
+	a.settings.TrustedServers = append(a.settings.TrustedServers, id)
+	a.saveSettingsLocked()
+	return nil
+}
+
+// AutoConnectLoop watches discovery: when auto-connect is on, a client
+// that is not running connects to a trusted server (or the last used
+// server) as soon as it appears. Cheap: it only acts on a *transition*
+// (server newly seen), so it never fights the user's manual start/stop.
+func (a *App) AutoConnectLoop() {
+	go func() {
+		var lastSeen map[string]bool // peer id -> present
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			s := a.GetSettings()
+			if s.Mode != ModeClient || !s.AutoConnect {
+				lastSeen = nil
+				continue
+			}
+			if a.ClientRunning() {
+				lastSeen = nil // already connected — re-arm on next gap
+				continue
+			}
+			peers := a.DiscoverPeers()
+			now := map[string]bool{}
+			for _, p := range peers {
+				if p.Role != "server" {
+					continue
+				}
+				now[p.ID] = true
+				if lastSeen[p.ID] {
+					continue // seen before; don't re-trigger
+				}
+				if a.settingsTrustsServer(p.ID) || a.peerMatchesClientAddr(p) {
+					addr := fmt.Sprintf("%s:%d", p.Addr, portOrDefault(p.Port))
+					_ = a.ConnectToServer(addr)
+					break
+				}
+			}
+			lastSeen = now
+		}
+	}()
+}
+
+// peerMatchesClientAddr reports whether a discovered server matches the
+// address the user last connected to (same host, any port).
+func (a *App) peerMatchesClientAddr(p Peer) bool {
+	addr := strings.TrimSpace(a.GetSettings().ClientAddr)
+	host := addr
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		host = host[:i]
+	}
+	return host != "" && host == p.Addr
+}
+
+func portOrDefault(p int) int {
+	if p <= 0 || p > 65535 {
+		return defaultPort
+	}
+	return p
+}

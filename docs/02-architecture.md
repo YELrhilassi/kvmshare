@@ -231,6 +231,9 @@ See [App — role locking](07-app.md#72-role-locking) and
 | Canonical HID key ids | One wire format works for any OS pair |
 | Clipboard on its own lock/thread | A stalled clipboard can never freeze the cursor |
 | One role per machine via OS locks | Enforced even if binaries are started by hand |
+| Allowlist + local-only connection policy | Only layout-named clients from the local network; trusted machine ids for headless first-connect |
+| mDNS discovery + trusted ids | No IP/port typing; auto-connect and click-to-connect, pairing without plugging a mouse in |
+| Auto-config on handshake | Client reports real screen geometry; the server reconfigures the layout automatically |
 | Role processes outlive the GUI | The shared input keeps working when the window is closed |
 | Tray on any desktop (SNI or XEmbed) | Wails SNI for modern bars, raw-Xlib XEmbed fallback for legacy bars |
 
