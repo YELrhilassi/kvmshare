@@ -147,7 +147,10 @@ fn sink() -> Option<mpsc::SyncSender<String>> {
     if let Some(tx) = SINK.get() {
         return Some(tx.clone());
     }
-    let (tx, rx) = mpsc::sync_channel(16_384);
+    // Bounded but generous: at ~100 bytes a line this is a few hundred
+    // KiB worst case, and a full queue drops the newest line rather
+    // than growing memory (see [`SINK`]).
+    let (tx, rx) = mpsc::sync_channel(4_096);
     match SINK.set(tx.clone()) {
         Ok(()) => {
             std::thread::Builder::new()

@@ -68,10 +68,24 @@ Three pieces, each with its own X connection so nothing contends:
   client that grabs the pointer must be the one that warps it. A
   **beacon thread** on its own connection polls the real pointer
   position (a busy X server can delay its round-trips without stalling
-  the cursor stream) and emits position beacons at ~6 ms cadence.
+  the cursor stream) and emits position beacons at ~6 ms cadence. Once
+  the position has not changed for a few consecutive queries it backs
+  off to 25 ms — nothing to report — and drops back to 6 ms the moment
+  the pointer moves again. Crossing latency is untouched: crossings are
+  driven by raw motion deltas and the *client's* beacons, never by this
+  thread.
 - **`engine.rs`** — `X11Engine` implements `core::server::Engine`;
   cursor control is delegated to the capture thread via
-  `CaptureCommand`s (warp / grab / isolate / hide-show).
+  `CaptureCommand`s (warp / grab / isolate / hide-show); every command
+  also writes a byte to the capture loop's **wake pipe**, so an idle
+  capture thread is woken out of `poll(2)` immediately — commands are
+  never delayed by an event-driven wait.
+- The capture loop itself is **event-driven**: it blocks in `poll(2)` on
+  the X connection fd plus the wake pipe, and only wakes for a reason —
+  an X event, an engine command, or a pending cadence duty (a beacon to
+  send, a held key to repeat). Fully idle it sleeps in the kernel; while
+  the cursor is on a client it wakes on a slow tick (100 ms) so the
+  supervisor's heartbeat keeps advancing.
 - **`injector.rs`** — `X11Injector` implements `core::client::Injector`:
   XTest fake input for relative motion/buttons/keys/wheel, XFixes for
   cursor hide/show, `X11Clipboard` (arboard) on its own lock.
@@ -91,10 +105,17 @@ cadence, wheel, buttons, keys, Scroll Lock escape). On return home the
 grab is released and X capture resumes.
 
 - `device.rs` — open/classify devices, translate kernel events.
-- `reader.rs` — the reader thread: grab/release lifecycle, hot-plug
-  re-enumeration on its own thread (device opens can block; they never
-  delay the cursor stream), drain-and-discard while local so a boundary
+- `reader.rs` — the reader thread: **event-driven** — it blocks in
+  `poll(2)` on the device fds plus a wake pipe (transitions and fresh
+  device lists write the pipe), so idle it sleeps in the kernel instead
+  of busy-draining. It grabs/releases at the kernel on control
+  transitions, and drains-and-discards while local so a boundary
   crossing never carries stale events across it.
+- `hotplug.rs` — the enumerator thread: watches `/dev/input` with
+  **inotify** and only re-opens the devices when something actually
+  changed (hot-plug is signalled immediately); a 30 s fallback scan
+  catches what inotify cannot see (permission changes). Device opens can
+  block — they run on this thread, never on the reader's.
 - The reader is **X-free by design** — a future Wayland backend reuses
   it unchanged.
 - Reading `/dev/input` needs a one-time grant; the installer's udev rule

@@ -10,6 +10,9 @@
 //! block on the selection owner and must never serialize with cursor
 //! control.
 
+use std::io::Write;
+use std::os::unix::net::UnixStream;
+
 use kvmshare_core::server::Engine;
 
 use super::capture::CaptureCommand;
@@ -19,37 +22,54 @@ pub struct X11Engine {
     /// Where cursor-control commands go (the capture thread executes them
     /// on its own connection — see the module docs).
     cmd_tx: std::sync::mpsc::Sender<CaptureCommand>,
+    /// Write end of the capture loop's wake pipe: every command writes a
+    /// byte here so the loop's poll(2) returns immediately instead of
+    /// sleeping through the command.
+    wake: UnixStream,
 }
 
 impl X11Engine {
-    pub fn new(display: Option<&str>, cmd_tx: std::sync::mpsc::Sender<CaptureCommand>) -> Result<Self, String> {
+    pub fn new(
+        display: Option<&str>,
+        cmd_tx: std::sync::mpsc::Sender<CaptureCommand>,
+        wake: UnixStream,
+    ) -> Result<Self, String> {
         let _ = display; // the display is validated by capture::start
-        Ok(Self { cmd_tx })
+        Ok(Self { cmd_tx, wake })
+    }
+
+    /// Send one command and wake the capture loop out of its idle poll.
+    /// Nonblocking throughout: a full wake pipe drops the nudge, never
+    /// the command (which already travelled over the channel).
+    fn send(&self, cmd: CaptureCommand) {
+        let _ = self.cmd_tx.send(cmd);
+        let mut w = &self.wake;
+        let _ = w.write(&[1]);
     }
 }
 
 impl Engine for X11Engine {
     fn warp_local(&mut self, x: i32, y: i32) {
         // Executed on the capture connection (the grab owner).
-        let _ = self.cmd_tx.send(CaptureCommand::Warp(x, y));
+        self.send(CaptureCommand::Warp(x, y));
     }
 
     fn grab_input(&mut self, grabbed: bool) {
         // Pointer/keyboard grab lives on the capture connection so that
         // connection can keep warping the cursor while it holds the grab.
-        let _ = self.cmd_tx.send(CaptureCommand::Grab(grabbed));
+        self.send(CaptureCommand::Grab(grabbed));
     }
 
     fn isolate_input(&mut self, isolated: bool) {
         // Kernel-level device isolation (evdev reader) — see
         // `CaptureCommand::IsolateRemote`. Best-effort on the capture
         // connection like every other cursor control.
-        let _ = self.cmd_tx.send(CaptureCommand::IsolateRemote(isolated));
+        self.send(CaptureCommand::IsolateRemote(isolated));
     }
 
     fn show_local_cursor(&mut self, visible: bool) {
         // Also executed on the capture connection (same reason as warp).
-        let _ = self.cmd_tx.send(CaptureCommand::CursorVisible(visible));
+        self.send(CaptureCommand::CursorVisible(visible));
     }
 
 }

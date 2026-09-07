@@ -24,6 +24,12 @@ use crate::udp;
 /// move it.
 const ACTIVE_BEACON_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// The UDP socket's read timeout: the receiver blocks in `recv_from` and
+/// the OS wakes it at this cadence when the stream is idle, purely so
+/// the beacon staleness watchdog runs. Datagrams wake it immediately —
+/// this is a bound on idle wakes, not a poll.
+pub const IDLE_TIMEOUT: Duration = Duration::from_millis(8);
+
 /// Drop the active client when its cursor stream has been silent for
 /// [`ACTIVE_BEACON_TIMEOUT`]. Called from the UDP receiver whenever the
 /// stream is quiet. Mirrors the TCP silence drop in the reader thread —
@@ -137,14 +143,13 @@ pub fn udp_receiver(udp: Arc<std::net::UdpSocket>, ctx: Arc<ClientCtx>) {
                     _ => {}
                 }
             }
-            // Non-blocking socket: WouldBlock is the normal idle state,
-            // not an error — yield briefly and check again. The sleep is
-            // kept short so a beacon parked at a wall is answered within
-            // ~1 ms (crossing latency is invisible at that scale) while
-            // the thread still yields the CPU when nothing is flowing.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            // Blocking socket with an [`IDLE_TIMEOUT`] read timeout: the
+            // OS sleeps for us — no busy polling. A timeout is the idle
+            // state; run the staleness watchdog and wait again. A parked
+            // beacon is answered within one timeout (~8 ms), which is
+            // invisible as crossing latency.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
                 check_active_beacon_staleness(&ctx);
-                thread::sleep(Duration::from_millis(1));
             }
             Err(e) => {
                 log_warn!("udp receiver: {e}");

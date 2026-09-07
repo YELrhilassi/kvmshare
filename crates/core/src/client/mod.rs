@@ -33,7 +33,7 @@ use std::io;
 use std::net::{TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -145,6 +145,8 @@ impl Client {
                 pin_windows: 0,
             }),
             active: AtomicBool::new(false),
+            wake_lock: Mutex::new(()),
+            wake_cv: Condvar::new(),
             udp,
             udp_seq: AtomicU32::new(1),
             stop: AtomicBool::new(false),
@@ -244,6 +246,9 @@ impl Client {
         // reconnect loop (the supervisor already released local input for
         // that case).
         shared.stop.store(true, Ordering::Relaxed);
+        // The motion thread may be blocked in its idle wait — wake it so
+        // the join below can complete.
+        shared.wake_cv.notify_all();
         Self::join_bounded(motion, "motion");
         Self::join_bounded(udp_thread, "udp");
         Self::join_bounded(sync, "sync");

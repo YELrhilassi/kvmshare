@@ -124,11 +124,15 @@ impl Server {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let udp_port = listener.local_addr()?.port();
         let udp = Arc::new(UdpSocket::bind(("0.0.0.0", udp_port))?);
-        // Non-blocking sends: the writer thread must never stall the
-        // cursor stream on a full socket buffer (congestion, a slow
-        // peer). Motion is loss-tolerant — dropping a frame is always
-        // better than delaying the next hundred.
-        udp.set_nonblocking(true)?;
+        // Blocking receive with a short read timeout: the receiver
+        // sleeps in the kernel and datagrams wake it immediately (no
+        // busy polling); the timeout only bounds idle wakes so the
+        // beacon staleness watchdog runs. The same socket carries the
+        // writers' sends — matching the client's proven pattern. Motion
+        // frames are tiny, the send buffer is huge, and a full buffer
+        // (local NIC backpressure) would stall any protocol; the client
+        // has shipped with exactly this setup.
+        udp.set_read_timeout(Some(udp::IDLE_TIMEOUT))?;
         Ok(Self {
             listener,
             udp,

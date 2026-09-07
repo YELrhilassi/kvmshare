@@ -1,7 +1,16 @@
 //! The capture thread: owns the X connection, drains raw events,
 //! executes engine commands, and runs the beacon thread.
+//!
+//! The loop is **event-driven**: it blocks in `poll(2)` on the X
+//! connection fd plus a command wake pipe, and only wakes for a reason —
+//! an X event (raw motion, keys, position), an engine command, or a
+//! pending cadence duty (a beacon to send, a held key to repeat). Fully
+//! idle it sleeps in the kernel instead of ticking.
 
 use std::collections::HashMap;
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -24,12 +33,6 @@ use super::events::{is_escape, raw_xy, select_input_events, CaptureCommand, Held
 use crate::evdev::EvdevReader;
 use crate::x11::buttons::{self, XButton};
 
-/// Idle poll pause. The capture loop polls for X events instead of
-/// blocking, so it can also apply engine commands, forward motion at the
-/// capped cadence, and synthesize key repeats while no input is flowing.
-/// 2 ms is far below human perception and keeps idle CPU negligible.
-const POLL_PAUSE: Duration = Duration::from_millis(2);
-
 /// Minimum gap between forwarded position beacons. The real pointer
 /// position is sampled at device rate (up to 1000 Hz on a modern mouse);
 /// forwarding every sample floods the wire and the session channel with
@@ -41,6 +44,26 @@ const POLL_PAUSE: Duration = Duration::from_millis(2);
 /// period plus the poll pause, and the stream costs a few frames per
 /// second instead of a thousand.
 const BEACON_PERIOD: Duration = Duration::from_millis(6);
+/// The beacon thread's idle interval: once the pointer has sat still for
+/// a few consecutive queries, the round-trips back off to this rate —
+/// nothing changed, nothing to report. The first query after motion
+/// resumes sees a new position and drops back to [`BEACON_PERIOD`]
+/// immediately. Crossing latency is untouched: crossings are driven by
+/// raw motion deltas and the *client's* beacons, never by this thread's
+/// position stream.
+const BEACON_IDLE_PERIOD: Duration = Duration::from_millis(25);
+/// Consecutive identical positions before the beacon thread backs off.
+const BEACON_IDLE_AFTER: u32 = 3;
+/// How often the capture loop wakes while the cursor is on a client and
+/// nothing else is pending. The supervisor watches the capture thread's
+/// heartbeat to detect a wedge, and the heartbeat must keep advancing
+/// even when the user is idle away from home — this tick keeps it fresh
+/// at ~10 Hz, far above the supervisor's 3 s stall bound, for a rounding
+/// error of CPU.
+const REMOTE_IDLE_TICK: Duration = Duration::from_millis(100);
+/// Pause after a `poll(2)` error other than EINTR (rare and usually
+/// permanent — a wedged X transport); prevents a spin.
+const POLL_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
 /// Captures local input and controls the local cursor on a background
 /// thread. Owns its X connection exclusively — the engine talks to it
@@ -51,6 +74,10 @@ struct InputCapture {
     root: xproto::Window,
     tx: Sender<Message>,
     cmd_rx: Receiver<CaptureCommand>,
+    /// Read end of the command wake pipe: the engine writes a byte on
+    /// every command, which releases this loop from poll immediately —
+    /// commands are never delayed by an idle wait.
+    wake_rx: UnixStream,
     motion: PendingMotion,
     /// The newest real pointer position seen but not yet forwarded as a
     /// beacon (coalesced to [`BEACON_PERIOD`]; see the const docs).
@@ -88,12 +115,14 @@ struct InputCapture {
 /// root window, and start the capture thread.
 ///
 /// Returns the channel the server's main loop reads local input from,
-/// plus the capture thread's heartbeat for the server supervisor.
-/// `cmd_rx` delivers the engine's cursor-control commands.
+/// the capture thread's heartbeat for the server supervisor, and the
+/// **write end of the command wake pipe** — the engine keeps it and
+/// writes a byte on every command so the capture loop's poll returns
+/// immediately instead of sleeping through a command.
 pub fn start(
     display: Option<&str>,
     cmd_rx: Receiver<CaptureCommand>,
-) -> Result<(Receiver<Message>, Arc<AtomicU64>), String> {
+) -> Result<(Receiver<Message>, Arc<AtomicU64>, UnixStream), String> {
     let (conn, screen_num) = RustConnection::connect(display).map_err(|e| format!("X11 connect: {e}"))?;
     let root = conn.setup().roots[screen_num].root;
 
@@ -110,6 +139,13 @@ pub fn start(
     }
     conn.xfixes_query_version(5, 0).map_err(|e| format!("XFixes version: {e}"))?;
     log_info!("input capture started (XI2 raw events)");
+
+    // The command wake pipe: nonblocking both ways, so an engine write
+    // never stalls on a full pipe (the byte is a nudge — the command
+    // itself travels over the channel).
+    let (wake_rx, wake_tx) = UnixStream::pair().map_err(|e| format!("wake pipe: {e}"))?;
+    wake_rx.set_nonblocking(true).map_err(|e| format!("wake pipe nonblocking: {e}"))?;
+    wake_tx.set_nonblocking(true).map_err(|e| format!("wake pipe nonblocking: {e}"))?;
 
     let (tx, rx) = mpsc::channel();
     // The evdev reader is always started; it isolates the devices at the
@@ -128,6 +164,7 @@ pub fn start(
         root,
         tx: tx.clone(),
         cmd_rx,
+        wake_rx,
         motion: PendingMotion::default(),
         beacon: None,
         last_beacon: None,
@@ -152,7 +189,7 @@ pub fn start(
     // is grabbed (beacons are suppressed then anyway), so the beacon
     // thread skips the round-trip entirely in that state.
     spawn_beacon_thread(display.map(str::to_owned), grabbed, real_pos, tx);
-    Ok((rx, capture_tick))
+    Ok((rx, capture_tick, wake_tx))
 }
 
 /// Poll the real pointer position on a dedicated thread with its own X
@@ -164,6 +201,12 @@ pub fn start(
 /// event thread forwards raw motion and processes X events without ever
 /// waiting on a reply, so a busy X server can delay the beacon thread's
 /// round-trips without stalling the cursor stream.
+///
+/// While the pointer is grabbed, or once the position has not changed
+/// for a few consecutive queries, the round-trip backs off to
+/// [`BEACON_IDLE_PERIOD`]: there is nothing to report, so the cost drops
+/// to a rounding error. The first query after the position changes (or
+/// the grab releases) drops straight back to the fast cadence.
 pub fn spawn_beacon_thread(
     display: Option<String>,
     grabbed: Arc<AtomicBool>,
@@ -174,9 +217,13 @@ pub fn spawn_beacon_thread(
         let Ok((conn, screen_num)) = RustConnection::connect(display.as_deref()) else { return };
         let root = conn.setup().roots[screen_num].root;
         let mut last: Option<(i32, i32)> = None;
+        let mut same_count: u32 = 0;
+        let mut interval = BEACON_PERIOD;
         loop {
             // While the local pointer is grabbed (cursor on a client),
-            // beacons are meaningless — skip the round-trip entirely.
+            // beacons are meaningless — skip the round-trip entirely and
+            // take the idle cadence. The moment the grab releases, the
+            // next iteration resumes at the fast cadence.
             if !grabbed.load(Ordering::Relaxed) {
                 if let Ok(cookie) = conn.query_pointer(root) {
                     if let Ok(reply) = cookie.reply() {
@@ -184,6 +231,8 @@ pub fn spawn_beacon_thread(
                         *real_pos.lock().unwrap() = Some((x, y));
                         if last != Some((x, y)) {
                             last = Some((x, y));
+                            same_count = 0;
+                            interval = BEACON_PERIOD;
                             // The session re-anchors on every beacon; the
                             // ordering guarantee (motion first, then the
                             // position) is the event thread's job — the
@@ -191,11 +240,19 @@ pub fn spawn_beacon_thread(
                             if tx.send(Message::MouseMoveAbs { x, y }).is_err() {
                                 return; // server gone
                             }
+                        } else {
+                            // Position unchanged: back off once a few
+                            // consecutive queries agree, and stay backed
+                            // off until it moves again.
+                            same_count += 1;
+                            if same_count >= BEACON_IDLE_AFTER {
+                                interval = BEACON_IDLE_PERIOD;
+                            }
                         }
                     }
                 }
             }
-            thread::sleep(BEACON_PERIOD);
+            thread::sleep(interval);
         }
     });
 }
@@ -203,10 +260,14 @@ pub fn spawn_beacon_thread(
 impl InputCapture {
     /// The capture loop: drain X events, apply engine commands, forward
     /// coalesced motion and synthesized key repeats at their cadences,
-    /// and pause briefly so the thread stays responsive to all of it even
-    /// when nothing else is happening. Runs forever; returns only on a
-    /// fatal X error.
+    /// then block in `poll(2)` until there is a reason to wake. Runs
+    /// forever; returns only on a fatal X error.
     fn run_forever(mut self) -> Result<(), String> {
+        // The X connection's fd: polled together with the command wake
+        // pipe, so a fully idle loop sleeps in the kernel instead of
+        // ticking.
+        let x_fd = self.conn.stream().as_raw_fd();
+        let wake_fd = self.wake_rx.as_raw_fd();
         loop {
             self.capture_tick.store(
                 SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
@@ -226,7 +287,83 @@ impl InputCapture {
             self.flush_beacon();
             self.tick_repeats();
             self.sample_probe();
-            thread::sleep(POLL_PAUSE);
+
+            // Block until there is something to do. The wait is computed,
+            // not fixed: a pending cadence duty (beacon, held key)
+            // bounds it, a remote cursor keeps the heartbeat alive, and
+            // a fully idle local loop sleeps indefinitely (an X event or
+            // an engine command wakes it).
+            let timeout = self.wait_timeout();
+            let ms = timeout.map(|t| t.as_millis().min(i32::MAX as u128) as i32).unwrap_or(-1);
+            let mut pfd = [
+                libc::pollfd { fd: x_fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
+            ];
+            // SAFETY: pfd is two valid pollfds backed by the X connection
+            // fd and the wake pipe fd, both alive for the call.
+            let ready = unsafe { libc::poll(pfd.as_mut_ptr(), 2, ms) };
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                log_warn!("input capture: poll: {err}");
+                thread::sleep(POLL_ERROR_PAUSE);
+                continue;
+            }
+            // A command arrived: drain the nudge bytes; the commands
+            // themselves are picked up at the top of the next iteration.
+            if pfd[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                let mut buf = [0u8; 64];
+                let mut r = &self.wake_rx;
+                loop {
+                    match r.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// How long the next poll may sleep. `None` = block until an X event
+    /// or command (the fully idle local state).
+    fn wait_timeout(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let mut due: Option<Duration> = None;
+        // A beacon is set but rate-limited: it must go out within
+        // [`BEACON_PERIOD`] of the last send.
+        if self.beacon.is_some() {
+            if let Some(last) = self.last_beacon {
+                due = Some(BEACON_PERIOD.saturating_sub(now.duration_since(last)));
+            }
+        }
+        // Held keys need the repeat cadence: the earliest of the first
+        // repeat delay and each key's next repeat interval.
+        if !self.held.is_empty() {
+            let mut earliest: Option<Duration> = None;
+            for h in self.held.values() {
+                let wait = if now.duration_since(h.down_at) < REPEAT_DELAY {
+                    REPEAT_DELAY.saturating_sub(now.duration_since(h.down_at))
+                } else {
+                    REPEAT_INTERVAL.saturating_sub(now.duration_since(h.last_repeat))
+                };
+                earliest = Some(earliest.map_or(wait, |e: Duration| e.min(wait)));
+            }
+            due = match (due, earliest) {
+                (Some(d), Some(e)) => Some(d.min(e)),
+                (d, e) => d.or(e),
+            };
+        }
+        match due {
+            // Cadence duty pending: wake at the duty's cadence.
+            Some(d) => Some(d),
+            // Nothing pending. While the cursor is on a client the
+            // heartbeat must keep advancing (the supervisor watches it),
+            // so wake on a slow tick; fully idle and local, sleep until
+            // an X event or command.
+            None if self.grabbed.load(Ordering::Relaxed) => Some(REMOTE_IDLE_TICK),
+            None => None,
         }
     }
 
@@ -447,8 +584,9 @@ impl InputCapture {
     /// Forward the coalesced position beacon at [`BEACON_PERIOD`]
     /// cadence, if one is pending. Called from the poll loop, so a beacon
     /// is never delayed longer than one period after the pointer stops
-    /// (the loop wakes every [`POLL_PAUSE`]) — edge parks are confirmed
-    /// to the session within ~8 ms even under load.
+    /// (the loop wakes at the beacon's cadence while one is pending) —
+    /// edge parks are confirmed to the session within ~8 ms even under
+    /// load.
     fn flush_beacon(&mut self) {
         let Some((x, y)) = self.beacon else { return };
         let now = Instant::now();

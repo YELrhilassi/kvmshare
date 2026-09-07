@@ -54,7 +54,10 @@ pub(crate) fn supervisor_loop(shared: Arc<Shared>) {
             }
             // End the session: the TCP loop wakes within its read
             // timeout, run() unwinds, and the binary reconnects fresh.
+            // Wake the motion thread too — it may be blocked in its idle
+            // wait and must see the stop.
             shared.stop.store(true, Ordering::Relaxed);
+            shared.wake_cv.notify_all();
             break;
         }
     }

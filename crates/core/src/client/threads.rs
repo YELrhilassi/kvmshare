@@ -48,54 +48,71 @@ pub(crate) fn motion_loop(shared: Arc<Shared>, own_id: u8) {
     let mut beacon_failed = false;
     let mut recover = false;
     while !shared.stop.load(Ordering::Relaxed) && !recover {
+        // Event-driven idle: while this machine is not being controlled
+        // the motion thread has no duties at all (the supervisor only
+        // guards active sessions and the heartbeat is only read while
+        // active), so it blocks on the wake condvar instead of ticking
+        // at MOTION_PERIOD forever. Enter/Leave/stop notify it; a
+        // spurious wake simply re-checks the flags.
+        if !shared.active.load(Ordering::Acquire) {
+            let mut guard = shared.wake_lock.lock().unwrap();
+            while !shared.active.load(Ordering::Acquire) && !shared.stop.load(Ordering::Relaxed) {
+                guard = shared.wake_cv.wait(guard).unwrap();
+            }
+            drop(guard);
+            continue; // re-check stop at the loop head
+        }
+        // The idle guard above guarantees control is on this machine
+        // from here on. Fixed-cadence steering: place the cursor on the
+        // command (absolute) or correct toward it (relative), execute
+        // queued injection events, beacon the real position back, and
+        // sample telemetry.
         let tick = Instant::now();
         shared.motion_tick_ms.store(now_ms(), Ordering::Relaxed);
-        if shared.active.load(Ordering::Acquire) {
-            let mut m = shared.motion.lock().unwrap();
-            m.ticks_win += 1;
-            let mut inj = shared.injector.lock().unwrap();
-            inj.steer_heartbeat();
-            let (rx, ry) = inj.cursor_position();
-            if inj.absolute_motion() {
-                // Place exactly at the command. Skipped when the cursor
-                // is already there: an idle cursor costs nothing, and a
-                // stray native move is re-placed — self-healing.
-                let (cx, cy) = m.follower.command();
-                if (cx, cy) != (rx, ry) {
-                    inj.move_cursor(cx, cy);
-                }
-            } else if let Some((dx, dy)) = m.follower.correct((rx, ry)) {
-                inj.move_rel(dx, dy);
+        let mut m = shared.motion.lock().unwrap();
+        m.ticks_win += 1;
+        let mut inj = shared.injector.lock().unwrap();
+        inj.steer_heartbeat();
+        let (rx, ry) = inj.cursor_position();
+        if inj.absolute_motion() {
+            // Place exactly at the command. Skipped when the cursor
+            // is already there: an idle cursor costs nothing, and a
+            // stray native move is re-placed — self-healing.
+            let (cx, cy) = m.follower.command();
+            if (cx, cy) != (rx, ry) {
+                inj.move_cursor(cx, cy);
             }
-            // Execute queued injection events (buttons, keys, wheel) at
-            // the placed position, on this thread's cadence — see
-            // [`Shared::events`] for why injection never happens on the
-            // control thread. A block here stalls only the motion loop,
-            // which the supervisor and watchdogs recover.
-            shared.drain_events(&mut inj);
-            // Telemetry is collected under the locks but logged only
-            // after they are released — a slow log sink must never hold
-            // up the next placement. The screen query stays lazy: it is
-            // only needed to disambiguate a pin, and it is a user32 call
-            // that can stall on a busy desktop — never on the hot path.
-            let report = m.probe_window(rx, ry, || inj.screen_info());
-            if report.pinned {
-                inj.emergency_release();
-                shared.stop.store(true, Ordering::Relaxed);
-                recover = true;
-            }
-            drop(m);
-            drop(inj);
-            if let Some(line) = report.trace {
-                log_trace!("{line}");
-            }
-            if last_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
-                last_beacon = Instant::now();
-                if let Err(e) = send_beacon(&shared, own_id, rx, ry) {
-                    if !beacon_failed {
-                        log_warn!("cursor beacon send failed (first): {e}");
-                        beacon_failed = true;
-                    }
+        } else if let Some((dx, dy)) = m.follower.correct((rx, ry)) {
+            inj.move_rel(dx, dy);
+        }
+        // Execute queued injection events (buttons, keys, wheel) at
+        // the placed position, on this thread's cadence — see
+        // [`Shared::events`] for why injection never happens on the
+        // control thread. A block here stalls only the motion loop,
+        // which the supervisor and watchdogs recover.
+        shared.drain_events(&mut inj);
+        // Telemetry is collected under the locks but logged only
+        // after they are released — a slow log sink must never hold
+        // up the next placement. The screen query stays lazy: it is
+        // only needed to disambiguate a pin, and it is a user32 call
+        // that can stall on a busy desktop — never on the hot path.
+        let report = m.probe_window(rx, ry, || inj.screen_info());
+        if report.pinned {
+            inj.emergency_release();
+            shared.stop.store(true, Ordering::Relaxed);
+            recover = true;
+        }
+        drop(m);
+        drop(inj);
+        if let Some(line) = report.trace {
+            log_trace!("{line}");
+        }
+        if last_beacon.elapsed() >= CURSOR_BEACON_INTERVAL {
+            last_beacon = Instant::now();
+            if let Err(e) = send_beacon(&shared, own_id, rx, ry) {
+                if !beacon_failed {
+                    log_warn!("cursor beacon send failed (first): {e}");
+                    beacon_failed = true;
                 }
             }
         }

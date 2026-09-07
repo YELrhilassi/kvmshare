@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use kvmshare_log::log_error;
 use kvmshare_protocol::message::{KeyKind, ScreenInfo};
@@ -46,6 +46,14 @@ pub(crate) struct Shared {
     /// thread on Enter/Leave; read every tick by the motion and UDP
     /// threads.
     pub(crate) active: AtomicBool,
+    /// Wake channel for the motion thread: while this machine is not
+    /// being controlled the motion thread has no duties at all, so it
+    /// blocks on [`Self::wake_cv`] instead of ticking forever. Enter,
+    /// Leave and stop all notify; a spurious wake just re-checks the
+    /// flags. This is what makes the client idle CPU cost zero instead
+    /// of a 250 Hz empty loop.
+    pub(crate) wake_lock: Mutex<()>,
+    pub(crate) wake_cv: Condvar,
     /// The UDP cursor stream: motion in, beacons out.
     pub(crate) udp: UdpSocket,
     /// Sequence for outgoing beacon datagrams (registration used 0).

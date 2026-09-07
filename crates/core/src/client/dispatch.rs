@@ -48,6 +48,9 @@ pub(crate) fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, ms
             }
             drop(m);
             shared.active.store(true, Ordering::Release);
+            // Wake the motion thread from its idle wait: control is on
+            // this machine now, so steering starts immediately.
+            shared.wake_cv.notify_all();
             // Report where we are right away so the server's edge
             // state is fresh from the first moment.
             let (x, y) = shared.injector.lock().unwrap().cursor_position();
@@ -56,6 +59,9 @@ pub(crate) fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, ms
         Message::Leave { screen_id: _ } => {
             log_trace!("control left");
             shared.active.store(false, Ordering::Release);
+            // Wake the motion thread: it re-checks the flag and returns
+            // to its idle wait (no more steering, no more ticks).
+            shared.wake_cv.notify_all();
             let mut m = shared.motion.lock().unwrap();
             m.follower.leave();
             m.probe.leave();

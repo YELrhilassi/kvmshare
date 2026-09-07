@@ -52,10 +52,11 @@
 //!
 //! * [`device`] — opening, classifying and absorbing devices; kernel
 //!   event → protocol message translation.
-//! * [`reader`] — the reader thread, its enumerator, and the grab/release
-//!   lifecycle.
+//! * [`reader`] — the reader thread and the grab/release lifecycle.
+//! * [`hotplug`] — the enumerator thread: inotify-driven device scans.
 
 mod device;
+mod hotplug;
 mod reader;
 
 pub use reader::EvdevReader;

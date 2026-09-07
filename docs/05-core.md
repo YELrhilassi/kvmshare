@@ -136,9 +136,12 @@ the main loop never blocks on the network.
 **UDP receiver** (`server/udp.rs`): one thread owns the socket, learns
 each client's address from its first datagram, drops stale/duplicate
 beacons by sequence number, and executes beacon-fired crossings right
-on the park. Also runs the **beacon watchdog**: an active client whose
-cursor stream is silent for 1.5 s is dropped (`ACTIVE_BEACON_TIMEOUT`) —
-a wedged motion loop is invisible to TCP keepalives.
+on the park. It **blocks** on `recv_from` with an 8 ms read timeout —
+datagrams wake it immediately, the timeout only bounds idle wakes — so
+it sleeps in the kernel instead of busy-polling. Also runs the
+**beacon watchdog**: an active client whose cursor stream is silent for
+1.5 s is dropped (`ACTIVE_BEACON_TIMEOUT`) — a wedged motion loop is
+invisible to TCP keepalives.
 
 **Supervisor** (`server/liveness.rs`): while the cursor is on a client,
 a main-loop or capture-thread heartbeat older than 3 s means the input
@@ -178,8 +181,8 @@ instead of `push()`).
 | Thread | Duty |
 |--------|------|
 | TCP control (main) | Service server messages; drain outbox + sync channel; keepalive every 2 s; 100 ms read timeout |
-| UDP | Drain motion datagrams → advance command; ignore motion outside Enter/Leave (it can beat the TCP Enter on the wire) |
-| Motion | Every `MOTION_PERIOD` (4 ms): place/correct the cursor, execute queued injection events, beacon the real position every 8 ms |
+| UDP | Drain motion datagrams → advance command; ignore motion outside Enter/Leave (it can beat the TCP Enter on the wire). Blocks on the socket with an 8 ms read timeout — frames wake it immediately, the timeout only bounds idle wakes |
+| Motion | **Event-driven idle**: while this machine is not being controlled it blocks on a condvar (woken on Enter/Leave/stop) and costs zero CPU. While controlled: every `MOTION_PERIOD` (4 ms) place/correct the cursor, execute queued injection events, beacon the real position every 8 ms |
 | Sync | Poll screen geometry (2 s) and clipboard (500 ms); report changes over the channel |
 | Supervisor | If the motion thread stops ticking while controlled (3 s), force-restore local input and end the session |
 

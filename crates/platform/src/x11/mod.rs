@@ -54,8 +54,11 @@ impl Server {
     /// build the engine and the clipboard service.
     pub fn start(display: Option<&str>) -> Result<Self, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (input, capture_tick) = capture::start(display, cmd_rx)?;
-        let engine = Box::new(engine::X11Engine::new(display, cmd_tx)?);
+        // The third return value is the command wake pipe's write end:
+        // the capture loop blocks in poll(2) when idle, and the engine
+        // must nudge it out of that wait on every command.
+        let (input, capture_tick, wake) = capture::start(display, cmd_rx)?;
+        let engine = Box::new(engine::X11Engine::new(display, cmd_tx, wake)?);
         let clipboard: Box<dyn Clipboard> = Box::new(injector::X11Clipboard::new(display));
         let liveness = Arc::new(Liveness { capture_tick_ms: capture_tick, ..Default::default() });
         Ok(Self { input, engine, clipboard, liveness })
