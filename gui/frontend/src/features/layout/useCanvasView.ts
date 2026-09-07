@@ -6,6 +6,7 @@ import {
   fitScale,
   MAX_ZOOM,
   MIN_ZOOM,
+  toModel,
   viewAtPercent,
   zoomAt,
   type View,
@@ -20,7 +21,6 @@ export function useCanvasView(screens: Screen[]) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [view, setView] = useState<View>(DEFAULT_VIEW);
   const viewRef = useRef(view);
-  const fitScaleRef = useRef(1); // the scale shown as 100%
   const fittedRef = useRef(false); // initial auto-fit done with a real size?
   const userAdjustedRef = useRef(false); // user took over the view?
 
@@ -39,13 +39,15 @@ export function useCanvasView(screens: Screen[]) {
     return el ? { w: el.clientWidth, h: el.clientHeight } : { w: 800, h: 600 };
   }, []);
 
-  // Fit: the whole desktop becomes 100%.
+  // Fit: frame the whole desktop. Screens are real pixels in the
+  // document but model units on the canvas, so fit works on the
+  // model-space bounds — a 1080p desktop fits comfortably at 1:1 model
+  // scale instead of shrinking to a sliver. The resulting zoom shows as
+  // its true percentage (e.g. 45%), not as "100%".
   const fit = useCallback(() => {
     const v = viewportSize();
-    const b = boundsOf(screens);
-    const z = fitScale(v, b);
-    fitScaleRef.current = z;
-    update(centeredView(z, v, b));
+    const b = boundsOf(screens.map(toModel));
+    update(centeredView(fitScale(v, b), v, b));
   }, [screens, viewportSize, update]);
 
   // Zoom by a factor, keeping the viewport center fixed (toolbar +/-).
@@ -76,11 +78,11 @@ export function useCanvasView(screens: Screen[]) {
     [markAdjusted, viewportSize, update],
   );
 
-  // Set the zoom percentage relative to the fit view (100 = fitted).
+  // Set the zoom percentage (100 = model 1:1).
   const setPercent = useCallback(
     (pct: number) => {
       markAdjusted();
-      update(viewAtPercent(viewRef.current, viewportSize(), pct, fitScaleRef.current));
+      update(viewAtPercent(viewRef.current, viewportSize(), pct));
     },
     [markAdjusted, viewportSize, update],
   );
@@ -142,9 +144,11 @@ export function useCanvasView(screens: Screen[]) {
     };
   }, [fitWhenReady, fit]);
 
-  const percent = fitScaleRef.current > 0 ? (view.scale / fitScaleRef.current) * 100 : 0;
-  const minPercent = Math.min((MIN_ZOOM / fitScaleRef.current) * 100, 5);
-  const maxPercent = (MAX_ZOOM / fitScaleRef.current) * 100;
+  // Zoom is a fixed, balanced range around model 1:1 — never dependent
+  // on how big or spread out the layout happens to be.
+  const percent = view.scale * 100;
+  const minPercent = MIN_ZOOM * 100;
+  const maxPercent = MAX_ZOOM * 100;
 
   return {
     view,

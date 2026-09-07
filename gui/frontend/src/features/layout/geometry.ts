@@ -4,11 +4,29 @@ import { DEFAULT_SCREEN_HEIGHT, DEFAULT_SCREEN_WIDTH } from "@/lib/constants";
 // Pure canvas math for the layout editor. Nothing here touches the DOM
 // or React — every function maps world/viewport coordinates so the
 // components above stay thin.
+//
+// Screens are stored and edited in REAL pixels (the server needs exact
+// positions), but the canvas presents them at a fixed model scale so a
+// 1920×1080 screen reads as a comfortable 192×108 unit block instead of
+// dwarfing the viewport. Everything on the canvas — positions, sizes,
+// grid, snap, zoom — is in model units; real↔model conversion happens
+// only at the data boundary (toModel, and the drag commit in Canvas).
 
-export const MIN_ZOOM = 0.05; // real (CSS) scale floor
-export const MAX_ZOOM = 4; // real (CSS) scale ceiling
-export const SNAP_DIST = 12; // world px within which edges snap together
-export const WORLD_SPAN = 12000; // grid extends ±this around the origin
+export const MODEL_SCALE = 0.1; // 1 model unit = 10 real pixels
+
+// Zoom is expressed as a percentage of model 1:1 — 100% is the natural
+// size (a 1080p screen is a 192×108 block), and the range is fixed and
+// balanced (10%–400%) no matter how big or spread out the layout is.
+// "Fit" is a separate action that picks whatever scale shows everything.
+export const MIN_ZOOM = 0.1; // 10%
+export const MAX_ZOOM = 4; // 400%
+export const SNAP_DIST = 12; // model px within which edges snap together
+export const WORLD_SPAN = 2000; // grid extends ±this around the origin (model units)
+
+// Real-pixel screen → model-space screen (positions and size only).
+export function toModel(s: Screen): Screen {
+  return { ...s, x: s.x * MODEL_SCALE, y: s.y * MODEL_SCALE, width: s.width * MODEL_SCALE, height: s.height * MODEL_SCALE };
+}
 
 export interface View {
   scale: number;
@@ -75,15 +93,10 @@ export function zoomAt(view: View, factor: number, anchor: { x: number; y: numbe
   };
 }
 
-// Set the zoom to a percentage of the reference (fit) scale, keeping the
-// viewport center fixed.
-export function viewAtPercent(
-  view: View,
-  viewport: { w: number; h: number },
-  pct: number,
-  reference: number,
-): View {
-  const scale = clampScale((pct / 100) * reference);
+// Set the zoom to a percentage of model 1:1 (100 = natural size),
+// keeping the viewport center fixed.
+export function viewAtPercent(view: View, viewport: { w: number; h: number }, pct: number): View {
+  const scale = clampScale(pct / 100);
   return zoomAt(view, scale / view.scale, { x: viewport.w / 2, y: viewport.h / 2 });
 }
 
@@ -138,8 +151,10 @@ export function placementFor(screens: Screen[]): Screen {
 // screens and fight with them; dots read as texture and keep the screens
 // as the loudest thing. The cell is the smallest "nice" step whose
 // on-screen pitch stays comfortable (20–40 px), so the grid adapts at
-// every zoom instead of turning into a wall of lines or a mush.
-const GRID_STEPS = [40, 80, 160, 320, 640, 1280, 2560];
+// every zoom instead of turning into a wall of lines or a mush. Steps
+// are in MODEL units (a 1080p screen is 192 units wide, so 32 gives a
+// clear 32 px pitch at 100%).
+const GRID_STEPS = [8, 16, 32, 64, 128, 256, 512];
 
 export interface GridStyle {
   backgroundImage: string;

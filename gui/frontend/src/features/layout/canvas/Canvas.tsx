@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Move } from "lucide-react";
 import type { Screen } from "@/lib/bridge";
-import { snapTo, type View } from "@/features/layout/geometry";
+import { MODEL_SCALE, snapTo, type View } from "@/features/layout/geometry";
 import { cn } from "@/lib/utils";
 import GridLayer from "@/features/layout/canvas/GridLayer";
 import ScreenNode from "@/features/layout/canvas/ScreenNode";
@@ -78,6 +78,9 @@ export default function Canvas({
 
   // ---------------------------------------------------------------------
   // Wheel zoom (anchored at the cursor) — needs a non-passive listener.
+  // The factor is exponential in delta, so a mouse notch (~±100) gives a
+  // deliberate ~1.13× step while trackpad flicks zoom smoothly without
+  // overshooting.
   // ---------------------------------------------------------------------
 
   useEffect(() => {
@@ -85,7 +88,7 @@ export default function Canvas({
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      zoomAtPoint(e.deltaY < 0 ? 1.1 : 1 / 1.1, e.clientX, e.clientY);
+      zoomAtPoint(Math.exp(-e.deltaY * 0.0012), e.clientX, e.clientY);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -133,10 +136,12 @@ export default function Canvas({
       const d = dir[e.key];
       if (!d) return;
       e.preventDefault();
-      const step = e.shiftKey ? 10 : 1;
+      // Steps are in model units (visible on screen); the document
+      // stores real pixels, so convert back.
+      const step = e.shiftKey ? 5 : 1;
       const s = screensRef.current[selected];
       if (!s) return;
-      onMove(selected, s.x + d[0] * step, s.y + d[1] * step);
+      onMove(selected, s.x + (d[0] * step) / MODEL_SCALE, s.y + (d[1] * step) / MODEL_SCALE);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -194,9 +199,13 @@ export default function Canvas({
         index: i,
         startX: e.clientX,
         startY: e.clientY,
-        base: { x: s.x, y: s.y, w: s.width, h: s.height },
+        // Drag math runs in model units (what the DOM shows); the
+        // document stays in real pixels, so convert on commit.
+        base: { x: s.x * MODEL_SCALE, y: s.y * MODEL_SCALE, w: s.width * MODEL_SCALE, h: s.height * MODEL_SCALE },
         el,
-        others: screensRef.current.filter((_, j) => j !== i),
+        others: screensRef.current
+          .filter((_, j) => j !== i)
+          .map((o) => ({ ...o, x: o.x * MODEL_SCALE, y: o.y * MODEL_SCALE, width: o.width * MODEL_SCALE, height: o.height * MODEL_SCALE })),
       };
     },
     [onSelect],
@@ -227,7 +236,8 @@ export default function Canvas({
     const nx = parseFloat(d.el.style.left);
     const ny = parseFloat(d.el.style.top);
     if (Number.isNaN(nx) || Number.isNaN(ny)) return;
-    onMove(d.index, nx, ny);
+    // Commit back to real pixels for the document.
+    onMove(d.index, nx / MODEL_SCALE, ny / MODEL_SCALE);
   }, [onMove]);
 
   return (

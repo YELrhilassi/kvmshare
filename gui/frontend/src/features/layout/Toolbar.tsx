@@ -56,7 +56,7 @@ export default function Toolbar({
   return (
     <div className="flex items-center gap-0.5 border-b px-2 py-1.5">
       <Tip label="Zoom out">
-        <Button variant="ghost" size="icon" onClick={() => onZoomBy(1 / 1.25)}>
+        <Button variant="ghost" size="icon" onClick={() => onZoomBy(1 / 1.5)}>
           <ZoomOut className="h-4 w-4" />
         </Button>
       </Tip>
@@ -69,7 +69,7 @@ export default function Toolbar({
         onValueChange={([v]) => onPercentChange(v)}
       />
       <Tip label="Zoom in">
-        <Button variant="ghost" size="icon" onClick={() => onZoomBy(1.25)}>
+        <Button variant="ghost" size="icon" onClick={() => onZoomBy(1.5)}>
           <ZoomIn className="h-4 w-4" />
         </Button>
       </Tip>

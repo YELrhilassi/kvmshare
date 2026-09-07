@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { Lock } from "lucide-react";
 import type { Screen } from "@/lib/bridge";
+import { MODEL_SCALE } from "@/features/layout/geometry";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -31,8 +32,27 @@ function ScreenNode({
   onPointerMove,
   onPointerUp,
 }: Props) {
-  const inv = 1 / Math.max(scale, 0.0001);
+  // Counter-scale keeps borders/labels at a constant on-screen size,
+  // but the values must be CLAMPED: at low zoom the raw 1/scale would
+  // turn the backdrop blur and selection shadow into multi-hundred-px
+  // rasters that freeze the compositor.
+  const inv = Math.min(1 / Math.max(scale, 0.0001), 2);
   const own = index === 0;
+  const blur = Math.min(8 * inv, 10);
+  const radius = Math.min(10 * inv, 14);
+  const border = Math.min(1.5 * inv, 2.5);
+  const ring = Math.min(2 * inv, 3);
+  const glowBlur = Math.min(24 * inv, 28);
+  const glowSpread = Math.min(6 * inv, 8);
+  const shadowBlur = Math.min(16 * inv, 20);
+  const shadowY = Math.min(4 * inv, 6);
+
+  // Drawn at model scale so screens are compact blocks on the canvas;
+  // the label below still shows the real resolution.
+  const left = screen.x * MODEL_SCALE;
+  const top = screen.y * MODEL_SCALE;
+  const width = screen.width * MODEL_SCALE;
+  const height = screen.height * MODEL_SCALE;
 
   return (
     <div
@@ -48,22 +68,22 @@ function ScreenNode({
         dragging && "screen-dragging",
       )}
       style={{
-        left: screen.x,
-        top: screen.y,
-        width: screen.width,
-        height: screen.height,
-        borderWidth: `${1.5 * inv}px`,
-        borderRadius: `${10 * inv}px`,
+        left,
+        top,
+        width,
+        height,
+        borderWidth: `${border}px`,
+        borderRadius: `${radius}px`,
         background: `linear-gradient(180deg, ${
           own ? "rgba(255,255,255,0.17)" : "rgba(255,255,255,0.1)"
         }, ${own ? "rgba(255,255,255,0.07)" : "rgba(255,255,255,0.04)"})`,
-        backdropFilter: `blur(${8 * inv}px)`,
-        WebkitBackdropFilter: `blur(${8 * inv}px)`,
+        backdropFilter: `blur(${blur}px)`,
+        WebkitBackdropFilter: `blur(${blur}px)`,
         // The selection ring is drawn here — Tailwind's ring utilities
         // use box-shadow, which this inline shadow would override.
         boxShadow: selected
-          ? `0 0 0 ${2 * inv}px var(--ring), 0 ${6 * inv}px ${24 * inv}px rgba(0, 0, 0, 0.4)`
-          : `0 ${4 * inv}px ${16 * inv}px rgba(0, 0, 0, 0.28)`,
+          ? `0 0 0 ${ring}px var(--ring), 0 ${glowSpread}px ${glowBlur}px rgba(0, 0, 0, 0.4)`
+          : `0 ${shadowY}px ${shadowBlur}px rgba(0, 0, 0, 0.28)`,
       }}
       title={`${screen.name} — ${screen.width}×${screen.height} at ${screen.x},${screen.y}`}
     >
