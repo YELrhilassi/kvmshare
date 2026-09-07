@@ -169,7 +169,12 @@ The shared cursor on a client is steered by a **closed loop**:
   32 px) — so the client OS's pointer acceleration can never make the
   cursor run past the hand, and a lost frame is pushed forward;
 - ordering-critical events (a click, a key) flush the residual first
-  (`flush`, capped at 64 px) so they land where the motion pointed.
+  (`flush`, capped at 64 px) so they land where the motion pointed;
+- the commanded position is **clamped to the client's screen bounds**
+  (seeded from the injector at startup, re-bounded on resolution
+  changes), so pushing against an edge can never run the command
+  off-screen — reversing at an edge moves immediately because the
+  command is already at the edge.
 
 There is **no replay queue** — a backlog can never form. Absolute
 backends (Windows) place the cursor at the whole command each tick; the

@@ -15,7 +15,7 @@ gui/
 ├── process_os_unix.go     #   Unix primitives (flock, process groups, signals)
 ├── process_os_windows.go  #   Windows primitives (LockFileEx, TerminateProcess)
 ├── notify.go              # client connect/disconnect notifications (tails server log)
-├── tray.go                # system tray: status + Start/Stop/Open/Quit
+├── tray.go                # system tray: SNI + XEmbed backends, role menu
 ├── netlog.go              # network interfaces + log tailing
 ├── update.go              # in-app self-update (GitHub releases)
 ├── sessionbus_linux.go    # D-Bus session-bus ownership (Linux)
@@ -115,10 +115,17 @@ ScreenInspector):
 ## 8.4 Tray, notifications, session bus
 
 - **`tray.go`** — a system tray item with live role status
-  ("Server · running · 2 clients"), Start/Stop/Open/Quit. On Linux the
-  tray is only used when a real tray host exists (a
-  `org.kde.StatusNotifierWatcher` probe); with no tray host, closing the
-  window quits cleanly instead of hiding into a ghost.
+  ("Server · running · 2 clients"). Two backends, picked once at
+  startup: **SNI** (`org.kde.StatusNotifierItem`, Wails' built-in tray)
+  when a `StatusNotifierWatcher` is on the session bus, else **XEmbed**
+  — a native X11 icon implemented directly on Xlib with its own popup
+  menu (Open / Start-Stop / Restart / Quit) for legacy bars (i3bar,
+  xfce4-panel, trayer, stalonetray). No GTK: Wails links GTK4, and a
+  GTK3 `GtkStatusIcon` would collide two GType systems in one process.
+  With no tray host at all, closing the window quits cleanly instead of
+  hiding into a ghost. Menu labels track live role state; Quit stops
+  every role first so a background role is never stranded without a
+  tray to control it.
 - **`notify.go`** — tails the server log for the stable
   `client X connected` / `disconnected` markers and raises desktop
   notifications over D-Bus; also feeds the tray's connected-client count.

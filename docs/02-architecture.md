@@ -232,6 +232,7 @@ See [App — role locking](07-app.md#72-role-locking) and
 | Clipboard on its own lock/thread | A stalled clipboard can never freeze the cursor |
 | One role per machine via OS locks | Enforced even if binaries are started by hand |
 | Role processes outlive the GUI | The shared input keeps working when the window is closed |
+| Tray on any desktop (SNI or XEmbed) | Wails SNI for modern bars, raw-Xlib XEmbed fallback for legacy bars |
 
 ---
 
