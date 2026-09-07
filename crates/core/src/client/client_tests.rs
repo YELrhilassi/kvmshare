@@ -424,7 +424,7 @@ fn button_wheel_and_key_are_injected_in_order_on_the_motion_thread() {
         stream.write_all(&welcome.encode()).unwrap();
         stream.flush().unwrap();
         let mut reg = [0u8; 512];
-        let (_, from) = udp.recv_from(&mut reg).unwrap();
+        let _ = udp.recv_from(&mut reg).unwrap();
         stream
             .write_all(&Message::Enter { screen_id: 7, x: 50, y: 50 }.encode())
             .unwrap();

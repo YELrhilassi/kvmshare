@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use super::*;
+use super::boundary::{wall_bits, BIT_LEFT, BIT_RIGHT, BIT_TOP};
 use kvmshare_protocol::message::{KeyKind, Rect, Screen};
 
 fn two_screens() -> Session {

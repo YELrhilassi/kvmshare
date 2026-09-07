@@ -1,4 +1,5 @@
 use super::*;
+use x11rb::protocol::Event as XEvent;
 use x11rb::protocol::xtest::ConnectionExt as _;
 
 /// The decisive fact behind kernel input isolation: apps that read
