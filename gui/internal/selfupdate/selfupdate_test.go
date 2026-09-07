@@ -21,6 +21,11 @@ func TestNewer(t *testing.T) {
 		{"v0.1.0", "v0.1.0-dev", true}, // dev builds always see updates
 		{"v0.1.0-dev", "v0.1.0", false},
 		{"v0.1.0", "v0.0.9", true},
+		{"v0.1.0", "v0.1.0-rc1", true}, // a plain release beats its prerelease
+		{"v0.1.0-rc1", "v0.1.0", false},
+		{"v0.2.0-rc1", "v0.1.0", true}, // a newer prerelease is still newer
+		{"v0.1.0-rc2", "v0.1.0-rc1", false}, // same-version prereleases do not auto-upgrade
+		{"v0.4.0", "v0.0.0-dev", true}, // the Makefile's dev label sees releases
 	}
 	for _, c := range cases {
 		if got := Newer(c.a, c.b); got != c.want {
@@ -173,4 +178,74 @@ func TestReplaceAtSurvivesTargetPresence(t *testing.T) {
 	if _, err := os.Stat(dst + ".old"); !os.IsNotExist(err) {
 		t.Error("the .old backup should be cleaned up")
 	}
+}
+
+func TestReplaceSetAllOrNothing(t *testing.T) {
+	newFile := func(dir, name, content string) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	t.Run("success replaces all and cleans asides", func(t *testing.T) {
+		dir := t.TempDir()
+		aDst, bDst := filepath.Join(dir, "a"), filepath.Join(dir, "b")
+		if err := os.WriteFile(aDst, []byte("old-a"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(bDst, []byte("old-b"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		repl := map[string]string{
+			aDst: newFile(t.TempDir(), "src-a", "new-a"),
+			bDst: newFile(t.TempDir(), "src-b", "new-b"),
+		}
+		if err := ReplaceSet(repl); err != nil {
+			t.Fatal(err)
+		}
+		for dst, want := range map[string]string{aDst: "new-a", bDst: "new-b"} {
+			got, err := os.ReadFile(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != want {
+				t.Errorf("%s = %q, want %q", dst, got, want)
+			}
+		}
+		if _, err := os.Stat(aDst + ".old"); !os.IsNotExist(err) {
+			t.Error("a.old should be removed after success")
+		}
+	})
+
+	t.Run("mid-failure restores every already-replaced target", func(t *testing.T) {
+		dir := t.TempDir()
+		aDst, bDst, cDst := filepath.Join(dir, "a"), filepath.Join(dir, "b"), filepath.Join(dir, "c")
+		for _, d := range []string{aDst, bDst, cDst} {
+			if err := os.WriteFile(d, []byte("old-"+filepath.Base(d)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The third source does not exist: moveInto fails on it, so the
+		// failure lands after a and b were already replaced.
+		repl := map[string]string{
+			aDst: newFile(t.TempDir(), "src-a", "new-a"),
+			bDst: newFile(t.TempDir(), "src-b", "new-b"),
+			cDst: filepath.Join(t.TempDir(), "missing-src"),
+		}
+		if err := ReplaceSet(repl); err == nil {
+			t.Fatal("ReplaceSet should fail on the un-moveable source")
+		}
+		for dst, want := range map[string]string{aDst: "old-a", bDst: "old-b", cDst: "old-c"} {
+			got, err := os.ReadFile(dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != want {
+				t.Errorf("%s = %q, want original %q", dst, got, want)
+			}
+		}
+	})
 }

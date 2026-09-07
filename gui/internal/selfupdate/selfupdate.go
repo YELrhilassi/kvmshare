@@ -34,8 +34,9 @@ import (
 //
 //	go build -ldflags "-X kvmshare/gui/internal/selfupdate.Version=v0.1.0"
 //
-// The default keeps un-tagged dev builds identifiable.
-var Version = "v0.1.0-dev"
+// The default matches the Makefile's dev label, so a build that skips
+// the ldflags still compares sensibly against published releases.
+var Version = "v0.0.0-dev"
 
 // DefaultUpstream is the GitHub repository releases are pulled from.
 // Overridable with KVMSHARE_UPSTREAM (useful for forks).
@@ -99,26 +100,52 @@ func fetchRelease(upstream, ref string) (*Release, error) {
 		upstream = DefaultUpstream
 	}
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/%s", upstream, ref)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "kvmshare-installer")
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("reach GitHub: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	// One retry with a short backoff covers the two failure modes that
+	// actually bite: GitHub's unauthenticated rate limit (403/429) and a
+	// transient 5xx. A request cannot be re-issued after `Do`, so it is
+	// rebuilt per attempt.
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "kvmshare-updater/"+Version)
+		// Authenticate when a token is available (GITHUB_TOKEN): the
+		// unauthenticated API is rate-limited to 60 requests/hour per IP,
+		// which an active updater can exhaust. Never fail on a missing
+		// token — it only raises the budget.
+		if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("reach GitHub: %w", err)
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+			var rel Release
+			if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+				return nil, fmt.Errorf("decode release: %w", err)
+			}
+			return &rel, nil
+		}
+		resp.Body.Close()
+		// Retry only the statuses that can succeed on the next attempt;
+		// a 404 means "no such release" and will never change.
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("GitHub API %s (attempt %d)", resp.Status, attempt+1)
+			continue
+		}
 		return nil, fmt.Errorf("GitHub API %s", resp.Status)
 	}
-	var rel Release
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return nil, fmt.Errorf("decode release: %w", err)
-	}
-	return &rel, nil
+	return nil, lastErr
 }
 
 // AssetFor finds the archive for this platform in a release.
@@ -210,14 +237,35 @@ func parseChecksums(raw string) map[string]string {
 }
 
 // Newer reports whether version `a` is newer than `b`. Tags are vX.Y.Z
-// with optional suffixes; missing components count as 0, and a dev build
-// ("vX.Y.Z-dev") is always older than the plain release so development
-// machines still see published updates.
+// with optional suffixes; missing components count as 0.
+//
+// A dev build ("vX.Y.Z-dev") defers to the plain release of the same
+// version — a machine running unverified code should always be offered
+// the verified build — and any release is newer than a dev build of an
+// older version. Prerelease suffixes (-rcN) sort before the plain
+// release, so a release candidate never shadows it.
 func Newer(a, b string) bool {
-	if strings.HasSuffix(b, "-dev") {
-		return true
+	cmp := compareVersion(a, b)
+	if cmp != 0 {
+		return cmp > 0
 	}
-	return compareVersion(a, b) > 0
+	// Same numeric version: a plain release beats a dev build or a
+	// prerelease of that version.
+	return !isDev(a) && (isDev(b) || isPrerelease(b) && !isPrerelease(a))
+}
+
+func isDev(v string) bool {
+	return strings.HasSuffix(v, "-dev")
+}
+
+// isPrerelease reports a -rcN / -beta style suffix (anything after the
+// numeric version that is not the -dev marker).
+func isPrerelease(v string) bool {
+	rest := strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if i := strings.IndexByte(rest, '-'); i >= 0 {
+		return rest[i+1:] != "dev"
+	}
+	return false
 }
 
 func compareVersion(a, b string) int {

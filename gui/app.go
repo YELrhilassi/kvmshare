@@ -72,6 +72,7 @@ type App struct {
 	configPath    string
 	serverPath    string
 	clientPath    string
+	installPath   string
 	settingsPath  string
 	serverLogPath string
 	clientLogPath string
@@ -125,6 +126,12 @@ func NewApp() *App {
 	if clientPath == "" {
 		clientPath = lookPathElse("kvmshare-client", filepath.Join(dir, binName("kvmshare-client", runtime.GOOS)))
 	}
+	// The standalone installer/bootstrap: kept current by the updater so
+	// the portable update path never lags behind the GUI's.
+	installPath := firstNonEmpty(os.Getenv("KVMSHARE_INSTALL"))
+	if installPath == "" {
+		installPath = lookPathElse("kvmshare-install", filepath.Join(dir, binName("kvmshare-install", runtime.GOOS)))
+	}
 
 	stateDir := filepath.Join(home, ".local", "state", "kvmshare")
 	if home == "" {
@@ -137,6 +144,7 @@ func NewApp() *App {
 		configPath:       configPath,
 		serverPath:       serverPath,
 		clientPath:       clientPath,
+		installPath:      installPath,
 		settingsPath:     filepath.Join(stateDir, "gui.json"),
 		serverLogPath:    filepath.Join(stateDir, "server.log"),
 		clientLogPath:    filepath.Join(stateDir, "client.log"),
@@ -160,7 +168,37 @@ func NewApp() *App {
 // error, so "already running" must *show the window*, not die silently.
 // The flock releases automatically when this process dies — no stale
 // state after a crash.
+// restartHandoff is the second half of an in-place update (see
+// update.go): the freshly-updated process was spawned by the old one,
+// which is still alive and still holds the instance lock. Wait for that
+// lock to be released instead of raising the old instance — it is on its
+// way out and will never come forward. Bounded: if the lock is still
+// held after the grace period, something else is genuinely running, and
+// the caller falls through to the normal "already running" handling.
+func (a *App) restartHandoff() {
+	if os.Getenv("KVMSHARE_RESTART") == "" {
+		return
+	}
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		f, err := os.OpenFile(a.instanceLockPath, os.O_CREATE|os.O_RDWR, 0o644)
+		if err == nil {
+			if tryLockFile(f) == nil {
+				unlockFile(f) // probe only — the caller takes the lock
+				f.Close()
+				break
+			}
+			f.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// The handoff env must not leak into processes this instance spawns
+	// later (a role, or a future restart of its own).
+	_ = os.Unsetenv("KVMSHARE_RESTART")
+}
+
 func (a *App) SingleInstance() (raised bool, err error) {
+	a.restartHandoff()
 	f, err := os.OpenFile(a.instanceLockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return false, fmt.Errorf("open instance lock: %w", err)

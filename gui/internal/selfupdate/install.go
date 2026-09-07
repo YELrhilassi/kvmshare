@@ -94,6 +94,52 @@ func replaceFile(src, dst string) error {
 	return nil
 }
 
+// ReplaceSet moves each `src` over its `dst` (map dst → src) as one
+// transaction: every target is renamed aside first, then all new files
+// are moved in. If any step fails, the already-replaced targets are
+// restored from their asides — the machine is never left with a mix of
+// versions. On full success the aside files are removed. The asides are
+// also what make a running process survivable (renaming a live binary is
+// allowed on both platforms; deleting it is not).
+func ReplaceSet(replacements map[string]string) error {
+	// Aside records one successfully-replaced target, available for
+	// rollback.
+	type aside struct{ dst, old string }
+	var done []aside
+	rollback := func() {
+		for _, a := range done {
+			_ = os.Remove(a.dst)
+			_ = os.Rename(a.old, a.dst)
+		}
+	}
+	for dst, src := range replacements {
+		old := dst + ".old"
+		_ = os.Remove(old) // stale aside from an interrupted run
+		if _, err := os.Stat(dst); err == nil {
+			if err := os.Rename(dst, old); err != nil {
+				rollback()
+				return err
+			}
+		}
+		if err := moveInto(src, dst); err != nil {
+			// Restore this target, then the earlier ones.
+			if _, statErr := os.Stat(old); statErr == nil {
+				_ = os.Rename(old, dst)
+			}
+			rollback()
+			return err
+		}
+		done = append(done, aside{dst, old})
+	}
+	for _, a := range done {
+		// Removing the aside of a *running* binary can fail on Windows
+		// (the renamed file stays locked); the next update retries the
+		// removal, so a lingering aside is harmless.
+		_ = os.Remove(a.old)
+	}
+	return nil
+}
+
 // moveInto puts `src` at `dst`, renaming when possible and copying
 // across devices (os.Rename returns EXDEV for that).
 func moveInto(src, dst string) error {

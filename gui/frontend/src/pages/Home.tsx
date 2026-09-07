@@ -241,9 +241,14 @@ function UpdateLine() {
       )}
       {state === "applying" && <span>Installing — restarting…</span>}
       {state === "error" && (
-        <button onClick={() => void check()} className="text-destructive transition-colors hover:opacity-70" title={error}>
-          Update check failed — retry
-        </button>
+        <span className="flex items-center gap-3">
+          <span className="text-destructive" title={error}>
+            {error || "Update check failed"}
+          </span>
+          <button onClick={() => void check()} className="text-muted-foreground transition-colors hover:text-foreground">
+            Retry
+          </button>
+        </span>
       )}
     </div>
   );
