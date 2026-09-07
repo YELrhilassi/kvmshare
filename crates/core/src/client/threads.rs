@@ -173,6 +173,13 @@ pub(crate) fn sync_loop(shared: Arc<Shared>, tx: Sender<Message>) {
             let info = shared.injector.lock().unwrap().screen_info();
             if info != last_info {
                 let _ = tx.send(Message::ScreenInfo { info });
+                // A resolution change re-bounds the command: it may now
+                // sit outside the new screen (a shrink), and the command
+                // must never be where the visible cursor cannot go. Lock
+                // order is safe — the injector lock was released above,
+                // so only `motion` is taken here (the motion thread
+                // takes motion then injector; these are never nested).
+                shared.motion.lock().unwrap().follower.set_bounds(info.width, info.height);
                 last_info = info;
             }
         }

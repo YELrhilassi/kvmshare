@@ -53,15 +53,51 @@ pub struct PositionFollower {
     /// Sub-pixel remainder of injected corrections (truncation carry).
     fx: f64,
     fy: f64,
+    /// This machine's screen bounds (width, height), when known. The
+    /// commanded position is clamped into them: while the OS pins the
+    /// visible cursor at an edge, an unclamped command would keep
+    /// running off-screen and the whole overshoot would have to be
+    /// walked back before a reversal moved the cursor again. Clamping
+    /// keeps the command where the cursor can actually be, so reversing
+    /// at an edge moves immediately. `None` until the first screen
+    /// geometry is known — the command is then unclamped rather than
+    /// mis-clamped to the origin.
+    bounds: Option<(u32, u32)>,
 }
 
 impl Default for PositionFollower {
     fn default() -> Self {
-        Self { tx: 0.0, ty: 0.0, active: false, fx: 0.0, fy: 0.0 }
+        Self { tx: 0.0, ty: 0.0, active: false, fx: 0.0, fy: 0.0, bounds: None }
     }
 }
 
 impl PositionFollower {
+    /// Set (or update) this machine's screen bounds and clamp the
+    /// current command into them — a resolution shrink can leave the
+    /// command outside the new screen, and the command must never sit
+    /// where the visible cursor cannot.
+    pub fn set_bounds(&mut self, w: u32, h: u32) {
+        self.bounds = Some((w, h));
+        self.clamp_command();
+    }
+
+    /// Clamp the commanded position into the screen bounds, if known.
+    /// A command beyond an edge is exactly the "virtual cursor stuck
+    /// past the boundary" failure: the OS pins the visible cursor at
+    /// the edge while the command runs off-screen, so a reversal has to
+    /// eat the whole overshoot before the cursor moves. Clamped, the
+    /// command is already at the edge, and reversing moves immediately.
+    /// Degenerate (zero-size) bounds clamp to (0, 0) instead of
+    /// panicking (`f64::clamp` requires min <= max).
+    fn clamp_command(&mut self) {
+        if let Some((w, h)) = self.bounds {
+            let max_x = (w as i64 - 1).max(0) as f64;
+            let max_y = (h as i64 - 1).max(0) as f64;
+            self.tx = self.tx.clamp(0.0, max_x);
+            self.ty = self.ty.clamp(0.0, max_y);
+        }
+    }
+
     /// Control entered at `(x, y)`: the command starts there.
     pub fn enter(&mut self, x: i32, y: i32) {
         self.tx = x as f64;
@@ -69,6 +105,7 @@ impl PositionFollower {
         self.active = true;
         self.fx = 0.0;
         self.fy = 0.0;
+        self.clamp_command();
     }
 
     /// Control left: stop following.
@@ -91,6 +128,7 @@ impl PositionFollower {
     pub fn push(&mut self, dx: i32, dy: i32) -> (i32, i32) {
         self.tx += dx as f64;
         self.ty += dy as f64;
+        self.clamp_command();
         self.fx += dx as f64 * FEED_FORWARD;
         self.fy += dy as f64 * FEED_FORWARD;
         let ix = self.fx.trunc() as i32;
@@ -112,6 +150,7 @@ impl PositionFollower {
     pub fn advance(&mut self, dx: i32, dy: i32) {
         self.tx += dx as f64;
         self.ty += dy as f64;
+        self.clamp_command();
     }
 
     /// Absolute re-anchor (defensive placement): the command and the
@@ -121,6 +160,7 @@ impl PositionFollower {
         self.ty = y as f64;
         self.fx = 0.0;
         self.fy = 0.0;
+        self.clamp_command();
     }
 
     /// The current commanded position, rounded to whole pixels. Used by

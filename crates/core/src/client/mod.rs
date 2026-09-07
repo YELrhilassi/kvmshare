@@ -124,7 +124,7 @@ impl Client {
     /// control messages). Drained on the TCP thread.
     pub fn run(
         self,
-        injector: Box<dyn Injector>,
+        mut injector: Box<dyn Injector>,
         clipboard: Box<dyn Clipboard>,
         outbox: &Receiver<Message>,
     ) -> io::Result<()> {
@@ -132,11 +132,19 @@ impl Client {
         // into [`Shared`] while `transport` stays on this thread.
         let Client { mut transport, own_id, layout, udp } = self;
         let mut layout = layout;
+        // The follower is born with the injector's current geometry so
+        // its command can never run past a screen edge — even before
+        // the sync thread's first resolution poll. (A wire command is
+        // not allowed to leave this machine's screen; the server drives
+        // crossings with its own virtual cursor.)
+        let screen = injector.screen_info();
+        let mut follower = PositionFollower::default();
+        follower.set_bounds(screen.width, screen.height);
         let shared = Arc::new(Shared {
             injector: Mutex::new(injector),
             clipboard: Mutex::new(clipboard),
             motion: Mutex::new(MotionState {
-                follower: PositionFollower::default(),
+                follower,
                 probe: MotionProbe::default(),
                 frames_win: 0,
                 ticks_win: 0,

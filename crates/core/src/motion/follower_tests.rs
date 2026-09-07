@@ -148,6 +148,57 @@ fn follower_survives_a_stalled_loop_without_teleporting() {
 }
 
 #[test]
+fn follower_command_never_leaves_the_screen() {
+    // The virtual cursor must respect the screen boundary: pushing
+    // against an edge runs the command up to the edge and no further,
+    // so a reversal moves immediately instead of walking the whole
+    // off-screen overshoot back (the OS pins the visible cursor at the
+    // edge meanwhile — the "stuck at the boundary" failure).
+    let mut f = PositionFollower::default();
+    f.set_bounds(1920, 1080);
+    f.enter(100, 100);
+    // Sweep far beyond the right and bottom edges: the command clamps.
+    f.advance(5000, 4000);
+    assert_eq!(f.command(), (1919, 1079));
+    // Reversing moves immediately from the edge — no stuck cursor.
+    f.advance(-10, 0);
+    assert_eq!(f.command(), (1909, 1079));
+    // Sweep beyond the top and left edges the same way.
+    f.advance(-5000, -5000);
+    assert_eq!(f.command(), (0, 0));
+
+    // Relative backends push through the same clamp: the command stops
+    // at the edge even while the feedforward injection is absorbed by
+    // the OS pin.
+    let mut g = PositionFollower::default();
+    g.set_bounds(800, 600);
+    g.enter(700, 550);
+    let _ = g.push(500, 500);
+    assert_eq!(g.command(), (799, 599));
+
+    // A resolution shrink re-bounds an out-of-range command.
+    let mut h = PositionFollower::default();
+    h.set_bounds(1920, 1080);
+    h.enter(10, 10);
+    h.advance(3000, 3000);
+    h.set_bounds(1280, 720);
+    assert_eq!(h.command(), (1279, 719));
+
+    // Unknown bounds leave the command free (no mis-clamp to (0,0)).
+    let mut k = PositionFollower::default();
+    k.enter(10, 10);
+    k.advance(-50, 0);
+    assert_eq!(k.command(), (-40, 10));
+
+    // Degenerate zero-size bounds clamp to (0, 0) without panicking.
+    let mut z = PositionFollower::default();
+    z.set_bounds(0, 0);
+    z.enter(5, 5);
+    z.advance(10, 10);
+    assert_eq!(z.command(), (0, 0));
+}
+
+#[test]
 fn follower_leave_stops_correcting_and_flush_lands_clicks() {
     let mut f = PositionFollower::default();
     f.enter(0, 0);
