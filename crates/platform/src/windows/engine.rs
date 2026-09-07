@@ -33,10 +33,12 @@ impl Engine for Win32Engine {
     fn grab_input(&mut self, _grabbed: bool) {
         // Suppressing local input while the cursor is on a client needs a
         // low-level hook (WH_MOUSE_LL / WH_KEYBOARD_LL) that swallows
-        // events. Not implemented yet — Windows-as-server parity is
-        // tracked in docs/roadmap.md. Until then a Windows server that
-        // sends its cursor to a client still lets the same input act
-        // locally (see the X11 backend for the reference behavior).
+        // events. Not implemented for the Windows *server* yet (Windows-
+        // as-server parity is an open item — see docs/06-platform.md).
+        // Until then a Windows server that sends its cursor to a client
+        // still lets the same input act locally (see the X11 backend for
+        // the reference behavior). The Windows *client* already has the
+        // hook-based isolation: `windows::isolation`.
     }
 
     fn warp_local(&mut self, x: i32, y: i32) {
