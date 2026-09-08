@@ -222,10 +222,11 @@ func (d *discovery) list() []Peer {
 	return out
 }
 
-// DiscoverPeers exposes the live peer list to the frontend.
+// DiscoverPeers exposes the live peer list to the frontend. Always
+// returns a non-nil slice so the frontend can safely iterate it.
 func (a *App) DiscoverPeers() []Peer {
 	if a.disc == nil {
-		return nil
+		return []Peer{}
 	}
 	return a.disc.list()
 }

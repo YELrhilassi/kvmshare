@@ -28,15 +28,16 @@ type ConnectedClient struct {
 
 // ListClients returns the server's currently connected clients (read
 // from `clients.json`; empty when the server is not running or has none).
+// Always returns a non-nil slice so the frontend can safely iterate it.
 func (a *App) ListClients() []ConnectedClient {
 	path := filepath.Join(a.stateDir, "clients.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil // no server yet, or none connected
+		return []ConnectedClient{} // no server yet, or none connected
 	}
 	var out []ConnectedClient
 	if json.Unmarshal(raw, &out) != nil {
-		return nil
+		return []ConnectedClient{}
 	}
 	return out
 }

@@ -41,13 +41,15 @@ export default function LayoutPage() {
     );
   }
 
-  return <Editor initial={config.screens} port={config.port} />;
+  return <Editor config={config} />;
 }
 
 // The editor: one reducer for the document, one hook for the view, and
-// three presentational pieces (toolbar / canvas / inspector).
-function Editor({ initial, port }: { initial: Screen[]; port: number }) {
-  const { state, dispatch } = useLayoutDocument(initial);
+// three presentational pieces (toolbar / canvas / inspector). The full
+// config is passed in so a save round-trips every field (port, network
+// policy, …) — the layout page only ever edits screens.
+function Editor({ config }: { config: LayoutConfig }) {
+  const { state, dispatch } = useLayoutDocument(config.screens);
   const view = useCanvasView(state.screens);
   const { screens, selected, lock, snap, dirty, savedMsg, error } = state;
 
@@ -77,7 +79,7 @@ function Editor({ initial, port }: { initial: Screen[]; port: number }) {
 
   const save = async () => {
     try {
-      await api().SaveConfig({ port, screens });
+      await api().SaveConfig({ ...config, screens });
       dispatch({ type: "markSaved", message: "Saved — applied live" });
     } catch (e) {
       dispatch({ type: "fail", message: String(e) });
