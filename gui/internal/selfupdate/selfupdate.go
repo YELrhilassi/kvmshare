@@ -258,6 +258,13 @@ func isDev(v string) bool {
 	return strings.HasSuffix(v, "-dev")
 }
 
+// IsRelease reports whether `v` is a real released build. Dev builds
+// (the unset default "v0.0.0-dev", or anything ending in -dev) have no
+// upstream release to compare against and must never offer self-update.
+func IsRelease(v string) bool {
+	return v != "" && !isDev(v)
+}
+
 // isPrerelease reports a -rcN / -beta style suffix (anything after the
 // numeric version that is not the -dev marker).
 func isPrerelease(v string) bool {

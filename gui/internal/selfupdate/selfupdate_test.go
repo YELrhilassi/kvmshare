@@ -249,3 +249,18 @@ func TestReplaceSetAllOrNothing(t *testing.T) {
 		}
 	})
 }
+
+// Dev builds must never be treated as released: they have no upstream
+// archive, so self-update has to stay silent for them.
+func TestIsRelease(t *testing.T) {
+	for _, v := range []string{"", "v0.0.0-dev", "v1.0.0-dev", "v1.2.3-dev"} {
+		if IsRelease(v) {
+			t.Errorf("%q must not count as a release", v)
+		}
+	}
+	for _, v := range []string{"v0.0.1", "v1.2.3", "v1.2.3-rc1"} {
+		if !IsRelease(v) {
+			t.Errorf("%q must count as a release", v)
+		}
+	}
+}

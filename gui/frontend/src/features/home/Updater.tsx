@@ -19,6 +19,11 @@ export default function Updater() {
       .catch(() => {});
   }, []);
 
+  // Dev builds are not released: there is nothing to update from and no
+  // honest "check" to run — show that plainly instead of a check button
+  // that fails.
+  const isDev = version === "" || version === "v0.0.0-dev" || version.endsWith("-dev");
+
   const check = async () => {
     setState("checking");
     setError("");
@@ -53,7 +58,8 @@ export default function Updater() {
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-border/70 pt-5 text-xs text-muted-foreground/70">
       <span className="font-mono">{version || "kvmshare"}</span>
       <span className="h-3 w-px bg-border" />
-      {state === "idle" && (
+      {isDev && <span>development build — updates disabled</span>}
+      {!isDev && state === "idle" && (
         <button onClick={() => void check()} className="transition-colors hover:text-foreground">
           Check for updates
         </button>
