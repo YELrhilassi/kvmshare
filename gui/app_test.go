@@ -810,3 +810,47 @@ func TestPairingRequestConnects(t *testing.T) {
 		t.Fatal("client did not start after a pairing request")
 	}
 }
+
+// A subnet probe ("cmd":"probe") must NOT be recorded as a peer — it
+// exists to trigger a beacon reply, and recording it would fabricate a
+// machine at the prober's address.
+func TestProbeNotRecorded(t *testing.T) {
+	a, _ := newTestApp(t)
+	d := newDiscovery(a)
+	from := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 72), Port: discoveryPort}
+
+	probe, err := json.Marshal(struct {
+		Cmd string `json:"cmd"`
+		ID  string `json:"id"`
+	}{Cmd: "probe", ID: "aaaaaaaa11111111"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.handleDatagram(probe, from)
+	if got := d.list(); len(got) != 0 {
+		t.Fatalf("probe must not be recorded as a peer: %+v", got)
+	}
+}
+
+// The live-state stream must be quiet: an unchanged snapshot emits
+// nothing (no event, no re-render), and any change emits exactly once.
+func TestShouldEmitDedupes(t *testing.T) {
+	a, _ := newTestApp(t)
+	base := LiveSnapshot{Mode: ModeServer, Running: runningSnapshot{Server: false, Client: false}}
+
+	if !a.shouldEmit(base) {
+		t.Fatal("first snapshot should emit (nothing sent yet)")
+	}
+	if a.shouldEmit(base) {
+		t.Fatal("unchanged snapshot must not emit")
+	}
+
+	changed := base
+	changed.Running.Server = true
+	if !a.shouldEmit(changed) {
+		t.Fatal("changed snapshot should emit")
+	}
+	if a.shouldEmit(changed) {
+		t.Fatal("repeated changed snapshot must not emit again")
+	}
+}

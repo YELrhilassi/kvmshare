@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, type ClientState, type Mode } from "@/lib/bridge";
+import { api, onState, type ClientState, type ConnectedClient, type Mode, type Peer } from "@/lib/bridge";
 
 export interface RunningStatus {
   server: boolean;
@@ -8,29 +8,41 @@ export interface RunningStatus {
 
 interface AppContextValue {
   mode: Mode;
-  /** Persist a role switch (stops the running process) and update the store. */
+  /** Persist a role switch and update the store. */
   setMode: (m: Mode) => Promise<void>;
   running: RunningStatus;
   /** The client's real connection state ("connected" / "connecting" / "disconnected"). */
   clientState: ClientState;
-  /** Re-check process state immediately (after a start/stop from Home). */
+  /** Server-side: connected machines. Client-side: empty. */
+  clients: ConnectedClient[];
+  /** Every kvmshare machine seen on the network. */
+  peers: Peer[];
+  /** One-shot re-read after a user action (a response to a click, not polling). */
   refresh: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextValue | null>(null);
 
-// One store for the whole app: the role and the live process state. A
-// single 2s poller lives here, so pages never run their own intervals
-// and can't disagree about what is running.
+// One store for the whole app. The backend owns the live picture and
+// pushes a `kvmshare:state` snapshot whenever anything changes — the
+// page subscribes once and never polls. `refresh()` exists for instant
+// feedback after a click; steady state is pure events.
 export function AppProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<Mode>("server");
   const [running, setRunning] = useState<RunningStatus>({ server: false, client: false });
   const [clientState, setClientState] = useState<ClientState>({ status: "disconnected", server: "" });
+  const [clients, setClients] = useState<ConnectedClient[]>([]);
+  const [peers, setPeers] = useState<Peer[]>([]);
 
   const refresh = useCallback(async () => {
     try {
-      const [server, client] = await Promise.all([api().ServerRunning(), api().ClientRunning()]);
+      const [server, client, cs] = await Promise.all([
+        api().ServerRunning(),
+        api().ClientRunning(),
+        api().ClientStatus(),
+      ]);
       setRunning({ server, client });
+      setClientState(cs);
     } catch {
       /* bridge not ready yet — keep the last known state */
     }
@@ -44,28 +56,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
         if (alive) setModeState(s.mode);
       })
       .catch(() => {});
-    const tick = async () => {
-      try {
-        const [server, client, cs] = await Promise.all([
-          api().ServerRunning(),
-          api().ClientRunning(),
-          api().ClientStatus(),
-        ]);
-        if (alive) {
-          setRunning({ server, client });
-          setClientState(cs);
-        }
-      } catch {
-        /* bridge not ready yet */
-      }
-    };
-    void tick();
-    const id = setInterval(tick, 2000);
+    // The one subscription: every snapshot replaces the store atomically.
+    const off = onState((s) => {
+      if (!alive) return;
+      setModeState(s.mode);
+      setRunning(s.running);
+      setClientState(s.clientState);
+      setClients(s.clients);
+      setPeers(s.peers);
+    });
+    void refresh(); // seed before the first event arrives
     return () => {
       alive = false;
-      clearInterval(id);
+      off();
     };
-  }, []);
+  }, [refresh]);
 
   const setMode = useCallback(async (m: Mode) => {
     try {
@@ -81,8 +86,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ mode, setMode, running, clientState, refresh }),
-    [mode, setMode, running, clientState, refresh],
+    () => ({ mode, setMode, running, clientState, clients, peers, refresh }),
+    [mode, setMode, running, clientState, clients, peers, refresh],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

@@ -103,6 +103,12 @@ func main() {
 		LogLevel: level,
 	})
 
+	// The frontend gets live state as events, not by polling the bridge:
+	// hand the service the event manager and start the single re-check
+	// loop that emits a snapshot only when something changed.
+	core.attachEvents(app.Event)
+	core.stateLoop()
+
 	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             "main",
 		Title:            "kvmshare",
