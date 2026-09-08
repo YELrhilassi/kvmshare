@@ -44,12 +44,12 @@ export default function LiveOverview() {
     window.setTimeout(() => setCopiedId(""), 1500);
   };
 
-  const roleTag = isServer ? "client machine" : "server machine";
+  const roleTag = isServer ? "client" : "server";
   const empty =
-    "No other machine is visible on the network yet. They appear automatically once they are running — or connect by address from the Client page.";
+    "No other machines found yet. They show up here automatically once they're running — or connect by address from the Client page.";
 
   return (
-    <Section title="Machines on this network">
+    <Section title="On this network">
       {rows.length === 0 ? (
         <p className="text-sm text-muted-foreground">{empty}</p>
       ) : (
@@ -71,7 +71,7 @@ export default function LiveOverview() {
                         state === "connected" ? "bg-emerald-500/10 text-emerald-500" : "bg-muted/40 text-muted-foreground",
                       )}
                     >
-                      {state === "connected" ? (isServer ? "connected to this machine" : "this machine is connected") : "nearby"}
+                      {state === "connected" ? (isServer ? "connected to you" : "in control") : "nearby"}
                     </span>
                   </div>
                   <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-muted-foreground/60">
@@ -104,15 +104,11 @@ export default function LiveOverview() {
                         Connect here
                       </Button>
                     )
-                  ) : state === "connected" ? (
-                    // The connection control lives in the status section —
-                    // a second Disconnect here would be redundant.
-                    <span className="text-xs text-emerald-500">Connected</span>
-                  ) : (
+                  ) : state !== "connected" ? (
                     <Button variant="outline" size="sm" onClick={() => void act(() => api().ConnectToServer(addr))}>
                       Connect
                     </Button>
-                  )}
+                  ) : null}
                 </div>
               </div>
             );

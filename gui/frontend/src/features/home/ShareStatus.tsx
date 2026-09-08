@@ -54,13 +54,13 @@ export default function ShareStatus() {
 
   const blurb = isServer
     ? active
-      ? "Machines that connect to you can use your keyboard and mouse."
-      : "Nothing is shared right now — start to let other machines use your keyboard and mouse."
+      ? "Your keyboard and mouse are shared — other machines can use them."
+      : "Nothing is shared right now. Start to let other machines use your keyboard and mouse."
     : connected
-      ? `${serverLabel} (${clientState.server}) controls this machine's keyboard and mouse${clientName ? `, as ${clientName}` : ""}.`
+      ? `${serverLabel} is using this machine's keyboard and mouse${clientName ? ` (as ${clientName})` : ""}.`
       : connecting
         ? "Connecting to the server — nothing is shared yet."
-        : "No server controls this machine. Pick one below and connect.";
+        : "No one is controlling this machine right now. Pick a machine below to connect.";
 
   const verb = isServer
     ? active
