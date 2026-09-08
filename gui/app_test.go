@@ -143,6 +143,59 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 }
 
+// The frontend iterates network.trustedIds — it must never receive
+// `null`. A config without a [network] section (older files) loads with
+// an empty, non-nil slice.
+func TestConfigNetworkNeverNil(t *testing.T) {
+	a, configPath := newTestApp(t)
+
+	// A legacy config: screens only, no [network] section at all.
+	legacy := "port = 24800\n\n[[screens]]\nname = 'pc'\nwidth = 1920\nheight = 1080\nx = 0\ny = 0\n"
+	if err := os.WriteFile(configPath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := a.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Network.TrustedIDs == nil {
+		t.Fatal("trustedIds must never be nil (the frontend iterates it)")
+	}
+	if len(cfg.Network.TrustedIDs) != 0 {
+		t.Fatalf("trustedIds should be empty, got %v", cfg.Network.TrustedIDs)
+	}
+	// The legacy default is secure: allowlist + local-only on.
+	if !cfg.Network.Allowlist || !cfg.Network.LocalOnly {
+		t.Fatalf("legacy config should default to allowlist+local-only, got %+v", cfg.Network)
+	}
+}
+
+// The client's real connection state comes from client.state (written by
+// the Rust client). Missing file means "disconnected".
+func TestClientStatusReadsStateFile(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	if st := a.ClientStatus(); st.Status != "disconnected" {
+		t.Fatalf("missing state file should read as disconnected, got %+v", st)
+	}
+
+	statePath := filepath.Join(a.stateDir, "client.state")
+	if err := os.WriteFile(statePath, []byte("status=connected\nserver=192.168.1.86:24800\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := a.ClientStatus()
+	if st.Status != "connected" || st.Server != "192.168.1.86:24800" {
+		t.Fatalf("state file parse = %+v", st)
+	}
+
+	if err := os.WriteFile(statePath, []byte("status=bogus\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if st := a.ClientStatus(); st.Status != "disconnected" {
+		t.Fatalf("unknown status should fall back to disconnected, got %+v", st)
+	}
+}
+
 func TestSaveConfigValidation(t *testing.T) {
 	a, _ := newTestApp(t)
 	if err := a.SaveConfig(Config{Port: 24800, Screens: []Screen{}}); err == nil {

@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use kvmshare_app::guard::{self, RoleGuard};
-use kvmshare_app::{hostname, machine_id, parse_client_args, state_dir, with_default_port, DEFAULT_PORT};
+use kvmshare_app::{hostname, machine_id, parse_client_args, state_dir, with_default_port, write_client_state, DEFAULT_PORT};
 use kvmshare_core::client::{Client, SessionEnd};
 use kvmshare_log::{log_error, log_info, log_warn};
 use kvmshare_protocol::message::Message;
@@ -58,6 +58,11 @@ fn run() -> Result<(), String> {
     // (reconnect immediately).
     let mut warned = false;
     let mut prompt_warned = false;
+    // The live state file the GUI reads (Home's connection panel): it
+    // always says what this process is doing *right now* — connecting,
+    // connected, or not connected. Written on every transition.
+    let state_dir = state_dir();
+    write_client_state(&state_dir, "disconnected", &addr);
     loop {
         // The UAC secure desktop (Windows): while a consent prompt is
         // up, no injected input can land anywhere, so connecting (or
@@ -90,10 +95,12 @@ fn run() -> Result<(), String> {
         };
 
         log_info!("connecting to {addr} as {name} (machine {id})");
+        write_client_state(&state_dir, "connecting", &addr);
         match Client::connect(&addr, &name, &id, injector.screen_info()) {
             Ok(client) => {
                 warned = false;
                 log_info!("connected, screen id {}", client.own_id());
+                write_client_state(&state_dir, "connected", &addr);
                 // The outbox is reserved for app-level control messages;
                 // the core run loop handles clipboard upload and
                 // keepalives itself.
@@ -103,6 +110,7 @@ fn run() -> Result<(), String> {
                     // The operator starts the client again when wanted.
                     Ok(SessionEnd::Disconnected) => {
                         log_info!("disconnected by the server — staying stopped");
+                        write_client_state(&state_dir, "disconnected", &addr);
                         return Ok(());
                     }
                     // Reconnect/restart: immediately, fresh handshake.
@@ -116,6 +124,7 @@ fn run() -> Result<(), String> {
                     }
                     Err(e) => {
                         log_warn!("session ended: {e} — reconnecting");
+                        write_client_state(&state_dir, "disconnected", &addr);
                         thread::sleep(RETRY_DELAY);
                     }
                 }
@@ -125,6 +134,7 @@ fn run() -> Result<(), String> {
                     log_warn!("connect failed: {e} — retrying every 3 s");
                     warned = true;
                 }
+                write_client_state(&state_dir, "disconnected", &addr);
                 thread::sleep(RETRY_DELAY);
             }
         }

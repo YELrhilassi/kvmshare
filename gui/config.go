@@ -96,7 +96,7 @@ func (a *App) LoadConfig() (Config, error) {
 	cfg.Network = Network{
 		Allowlist:  cf.Network.Allowlist,
 		LocalOnly:  cf.Network.LocalOnly,
-		TrustedIDs: cf.Network.TrustedIDs,
+		TrustedIDs: nonNilStrings(cf.Network.TrustedIDs),
 	}
 	// Old configs have no [network] section; default to secure.
 	if !cf.Network.Allowlist && !cf.Network.LocalOnly && len(cf.Network.TrustedIDs) == 0 {
@@ -104,6 +104,16 @@ func (a *App) LoadConfig() (Config, error) {
 		cfg.Network.LocalOnly = true
 	}
 	return cfg, nil
+}
+
+// nonNilStrings returns `s`, or an empty (non-nil) slice when s is nil
+// — JSON would otherwise encode nil as `null`, which frontends must
+// never see for a list field.
+func nonNilStrings(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // SaveConfig writes the layout and validates it. The first screen is

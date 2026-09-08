@@ -152,7 +152,6 @@ export function useCanvasView(screens: Screen[]) {
 
   return {
     view,
-    viewRef,
     viewportRef,
     fit,
     zoomBy,

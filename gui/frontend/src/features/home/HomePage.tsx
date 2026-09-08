@@ -3,17 +3,12 @@ import RolePicker from "@/features/home/RolePicker";
 import ShareStatus from "@/features/home/ShareStatus";
 import ConnectInfo from "@/features/home/ConnectInfo";
 import LiveOverview from "@/features/home/LiveOverview";
-import QuickLinks from "@/features/home/QuickLinks";
 import Updater from "@/features/home/Updater";
-
-interface Props {
-  onNavigate: (p: Page) => void;
-}
 
 // The dashboard: what this machine is doing right now (role, live state,
 // who is connected, what is on the network) and the single start/stop
 // control. Everything here is state; settings live on their own pages.
-export default function HomePage({ onNavigate }: Props) {
+export default function HomePage(_props: { onNavigate: (p: Page) => void }) {
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-5xl px-10 py-14">
@@ -33,8 +28,6 @@ export default function HomePage({ onNavigate }: Props) {
           </div>
 
           <LiveOverview />
-
-          <QuickLinks onNavigate={onNavigate} />
 
           <Updater />
         </div>

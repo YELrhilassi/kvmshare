@@ -10,14 +10,18 @@ import LayoutPage from "@/features/layout/LayoutPage";
 import LogsPage from "@/features/logs/LogsPage";
 
 // Plain-language label for the top-right status: what is happening right
-// now, not what the process is called.
-function statusLabel(mode: "server" | "client", running: boolean): string {
-  if (!running) return "Stopped";
-  return mode === "server" ? "Sharing" : "Connected";
+// now, not what the process is called. For the client this is the real
+// connection state (a running process that is not connected says
+// "Connecting…", never "Connected").
+function statusLabel(mode: "server" | "client", running: boolean, connected: boolean): string {
+  if (mode === "server") return running ? "Sharing" : "Stopped";
+  if (connected) return "Connected";
+  if (running) return "Connecting…";
+  return "Stopped";
 }
 
 function Shell() {
-  const { mode, running } = useApp();
+  const { mode, running, clientState } = useApp();
   const [page, setPage] = useState<Page>("home");
 
   // The layout only shows pages that belong to the current role. A role
@@ -27,8 +31,8 @@ function Shell() {
 
   // Window title mirrors live status (also handy for taskbars/wm hints).
   useEffect(() => {
-    document.title = `kvmshare — ${statusLabel(mode, running[mode])}`;
-  }, [running, mode]);
+    document.title = `kvmshare — ${statusLabel(mode, running[mode], clientState.status === "connected")}`;
+  }, [running, mode, clientState.status]);
 
   return (
     <TooltipProvider delayDuration={200}>
@@ -65,10 +69,12 @@ function Shell() {
             <span
               className={cn(
                 "h-2 w-2 rounded-full",
-                running[mode] ? "bg-emerald-500" : "bg-muted-foreground/40",
+                mode === "server" ? (running.server ? "bg-emerald-500" : "bg-muted-foreground/40") : clientState.status === "connected" ? "bg-emerald-500" : clientState.status === "connecting" ? "bg-amber-500" : "bg-muted-foreground/40",
               )}
             />
-            <span className="font-medium text-foreground/80">{statusLabel(mode, running[mode])}</span>
+            <span className="font-medium text-foreground/80">
+              {statusLabel(mode, running[mode], clientState.status === "connected")}
+            </span>
           </div>
         </header>
 

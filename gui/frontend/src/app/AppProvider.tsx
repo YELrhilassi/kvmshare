@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, type Mode } from "@/lib/bridge";
+import { api, type ClientState, type Mode } from "@/lib/bridge";
 
 export interface RunningStatus {
   server: boolean;
@@ -11,6 +11,8 @@ interface AppContextValue {
   /** Persist a role switch (stops the running process) and update the store. */
   setMode: (m: Mode) => Promise<void>;
   running: RunningStatus;
+  /** The client's real connection state ("connected" / "connecting" / "disconnected"). */
+  clientState: ClientState;
   /** Re-check process state immediately (after a start/stop from Home). */
   refresh: () => Promise<void>;
 }
@@ -23,6 +25,7 @@ const AppContext = createContext<AppContextValue | null>(null);
 export function AppProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<Mode>("server");
   const [running, setRunning] = useState<RunningStatus>({ server: false, client: false });
+  const [clientState, setClientState] = useState<ClientState>({ status: "disconnected", server: "" });
 
   const refresh = useCallback(async () => {
     try {
@@ -43,8 +46,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
       .catch(() => {});
     const tick = async () => {
       try {
-        const [server, client] = await Promise.all([api().ServerRunning(), api().ClientRunning()]);
-        if (alive) setRunning({ server, client });
+        const [server, client, cs] = await Promise.all([
+          api().ServerRunning(),
+          api().ClientRunning(),
+          api().ClientStatus(),
+        ]);
+        if (alive) {
+          setRunning({ server, client });
+          setClientState(cs);
+        }
       } catch {
         /* bridge not ready yet */
       }
@@ -70,7 +80,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const value = useMemo(() => ({ mode, setMode, running, refresh }), [mode, setMode, running, refresh]);
+  const value = useMemo(
+    () => ({ mode, setMode, running, clientState, refresh }),
+    [mode, setMode, running, clientState, refresh],
+  );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

@@ -6,6 +6,7 @@
 pub mod guard;
 
 mod args;
+mod client_state;
 mod clipboard;
 mod config;
 mod hostname;
@@ -13,6 +14,7 @@ mod machine_id;
 mod session;
 
 pub use args::{parse_client_args, parse_server_args, with_default_port, ClientArgs, ServerArgs};
+pub use client_state::write_client_state;
 pub use clipboard::spawn_server_clipboard;
 pub use config::{
     default_config_path, Config, NetworkConfig, ScreenConfig, DEFAULT_PORT, DEFAULT_SCREEN_H,

@@ -91,6 +91,11 @@ export interface UpdateResult {
   error?: string;
 }
 
+export interface ClientState {
+  status: "connected" | "connecting" | "disconnected";
+  server: string;
+}
+
 interface GoApp {
   GetSettings(): Promise<Settings>;
   SetSettings(s: Settings): Promise<void>;
@@ -121,6 +126,7 @@ interface GoApp {
   TrustServer(id: string): Promise<void>;
   ConnectToServer(addr: string): Promise<void>;
   SendConnectRequest(peerId: string): Promise<void>;
+  ClientStatus(): Promise<ClientState>;
 }
 
 interface WailsCall {
@@ -192,4 +198,5 @@ export const api = (): GoApp => ({
   TrustServer: (id) => call<void>("TrustServer", id),
   ConnectToServer: (addr) => call<void>("ConnectToServer", addr),
   SendConnectRequest: (peerId) => call<void>("SendConnectRequest", peerId),
+  ClientStatus: () => call<ClientState>("ClientStatus"),
 });

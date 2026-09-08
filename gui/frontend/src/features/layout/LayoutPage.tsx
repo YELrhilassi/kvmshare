@@ -109,7 +109,6 @@ function Editor({ config }: { config: LayoutConfig }) {
       <div className="flex min-h-0 flex-1">
         <Canvas
           view={view.view}
-          viewRef={view.viewRef}
           viewportRef={view.viewportRef}
           screens={screens}
           selected={selected}
