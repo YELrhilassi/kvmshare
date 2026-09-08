@@ -593,7 +593,9 @@ func setupXEmbedTray(app *application.App, core *App, win *application.WebviewWi
 			// on Windows, keep the elevated client's input gate on) with
 			// no tray left to control it.
 			app.Logger.Info("tray: menu — quit")
-			_ = core.StopAll()
+			if err := core.StopAll(); err != nil {
+				app.Logger.Warn("tray: quit — could not stop every role process, quitting anyway", "err", err)
+			}
 			app.Quit()
 		},
 	}

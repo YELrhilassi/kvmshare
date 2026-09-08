@@ -69,14 +69,17 @@ const raiseSignal = syscall.SIGUSR2
 // raiseInstance asks a running GUI to show and focus its window. A second
 // launch uses this so "already running" never looks like "nothing
 // happened" (the classic invisible-ghost trap: the window was hidden to
-// the tray, so a dmenu relaunch died silently).
-func raiseInstance(pid int) error {
+// the tray, so a dmenu relaunch died silently). `scope` is unused here
+// (the signal addresses the instance directly) but kept for signature
+// parity with Windows.
+func raiseInstance(pid int, scope string) error {
 	return syscall.Kill(pid, raiseSignal)
 }
 
 // watchRaiseSignal calls `onRaise` when another instance asks us to come
-// forward. Signals are only meaningful on Unix; Windows gets a no-op.
-func watchRaiseSignal(onRaise func()) {
+// forward. Signals are only meaningful on Unix; Windows uses a named
+// event instead.
+func watchRaiseSignal(scope string, onRaise func()) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, raiseSignal)
 	go func() {

@@ -121,8 +121,9 @@ func main() {
 		BackgroundColour: application.NewRGBA(10, 10, 12, 255),
 	})
 
-	// A second launch asks us to come forward (see SingleInstance).
-	watchRaiseSignal(func() {
+	// A second launch asks us to come forward (see SingleInstance). On
+	// Windows the ask arrives on a named event scoped to this install.
+	watchRaiseSignal(core.raiseScope(), func() {
 		window.Show()
 		window.Focus()
 	})
@@ -144,7 +145,9 @@ func main() {
 		// No tray: cancel the default close (which would destroy the
 		// window and leave a windowless zombie process) and quit cleanly.
 		e.Cancel()
-		_ = core.StopAll()
+		if err := core.StopAll(); err != nil {
+			app.Logger.Warn("close: could not stop every role process, quitting anyway", "err", err)
+		}
 		app.Quit()
 	})
 

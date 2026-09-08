@@ -54,15 +54,58 @@ func signalPid(pid int) error {
 	return terminateProcess(pid)
 }
 
-// raiseInstance is not yet implemented on Windows (no POSIX signals; a
-// registered window message would do it). A second launch on Windows
-// falls back to the plain "already running" message.
-func raiseInstance(pid int) error {
-	return fmt.Errorf("raise not supported on windows")
+// raiseInstance asks a running GUI to show and focus its window. Windows
+// has no POSIX signals, so this sets a named event that the running
+// instance watches (see watchRaiseSignal); the event name is scoped to
+// the install, so two installs never cross-talk. The pid is unused (the
+// event addresses the instance directly) but kept for signature parity
+// with the Unix implementation.
+func raiseInstance(pid int, scope string) error {
+	ev, err := openRaiseEvent(scope)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(ev)
+	return windows.SetEvent(ev)
 }
 
-// watchRaiseSignal is a no-op on Windows (see raiseInstance).
-func watchRaiseSignal(func()) {}
+// watchRaiseSignal calls `onRaise` when another instance asks us to come
+// forward by setting the named raise event. Runs for the process
+// lifetime; the event handle is process-owned and dies with it. A
+// missing event (older instance) simply never fires.
+func watchRaiseSignal(scope string, onRaise func()) {
+	ev, err := openRaiseEvent(scope)
+	if err != nil {
+		return
+	}
+	go func() {
+		for {
+			wait, err := windows.WaitForSingleObject(ev, windows.INFINITE)
+			if err != nil || wait == windows.WAIT_FAILED {
+				return
+			}
+			onRaise()
+		}
+	}()
+}
+
+// raiseEventName names the raise event in the Local\ namespace (per
+// logon session — right for a per-user GUI), scoped to the install so
+// different installs or users never signal each other.
+func raiseEventName(scope string) string {
+	return `Local\kvmshare-raise-` + scope
+}
+
+// openRaiseEvent opens (creating if needed) the auto-reset raise event:
+// each SetEvent wakes exactly one waiter and the event resets, so a
+// burst of second launches maps to a burst of raises.
+func openRaiseEvent(scope string) (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(raiseEventName(scope))
+	if err != nil {
+		return 0, err
+	}
+	return windows.CreateEvent(nil, 0, 0, name)
+}
 
 func terminateProcess(pid int) error {
 	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
