@@ -21,14 +21,14 @@ import (
 
 // TrustClient adds a machine id to the server config's trusted_ids list
 // (persisted; the running server hot-reloads it). Idempotent. Accepts a
-// short (8-char) or full id.
+// short (8-char) or full id. Deliberately does NOT hold a.mu while
+// saving: SaveConfig takes the lock itself, and holding it here would
+// deadlock.
 func (a *App) TrustClient(id string) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
 		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	cfg, err := a.LoadConfig()
 	if err != nil {
 		return err
@@ -40,6 +40,46 @@ func (a *App) TrustClient(id string) error {
 	}
 	cfg.Network.TrustedIDs = append(cfg.Network.TrustedIDs, id)
 	return a.SaveConfig(cfg)
+}
+
+// RevokeClient removes a machine id from the server config's trusted_ids
+// (the machine must be trusted by name/layout from now on, like any
+// other). Idempotent; accepts the short or full id. Like TrustClient it
+// avoids holding a.mu across SaveConfig (which locks it itself).
+func (a *App) RevokeClient(id string) error {
+	id = strings.TrimSpace(id)
+	cfg, err := a.LoadConfig()
+	if err != nil {
+		return err
+	}
+	kept := cfg.Network.TrustedIDs[:0]
+	for _, t := range cfg.Network.TrustedIDs {
+		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
+			continue // this entry IS the id (full or prefix) — drop it
+		}
+		kept = append(kept, t)
+	}
+	cfg.Network.TrustedIDs = kept
+	return a.SaveConfig(cfg)
+}
+
+// RevokeServer removes a server machine id from this machine's
+// trusted-servers list — its connection requests are refused again
+// (unless pairing is enabled). Idempotent; accepts short or full ids.
+func (a *App) RevokeServer(id string) error {
+	id = strings.TrimSpace(id)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	kept := a.settings.TrustedServers[:0]
+	for _, t := range a.settings.TrustedServers {
+		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	a.settings.TrustedServers = kept
+	a.saveSettingsLocked()
+	return nil
 }
 
 // TrustServer adds a server machine id to this machine's trusted-servers

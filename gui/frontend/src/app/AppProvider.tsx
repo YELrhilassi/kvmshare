@@ -19,6 +19,8 @@ interface AppContextValue {
   clients: ConnectedClient[];
   /** Every kvmshare machine seen on the network. */
   peers: Peer[];
+  /** Machine ids this machine trusts (prefix-matched against peers). */
+  trusted: string[];
   /** One-shot re-read after a user action (a response to a click, not polling). */
   refresh: () => Promise<void>;
 }
@@ -36,6 +38,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [clientState, setClientState] = useState<ClientState>({ status: "disconnected", server: "" });
   const [clients, setClients] = useState<ConnectedClient[]>([]);
   const [peers, setPeers] = useState<Peer[]>([]);
+  const [trusted, setTrusted] = useState<string[]>([]);
 
   const refresh = useCallback(async () => {
     try {
@@ -68,6 +71,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setClientState(s.clientState);
       setClients(s.clients);
       setPeers(s.peers);
+      setTrusted(s.trusted ?? []);
     });
     void refresh(); // seed before the first event arrives
     return () => {
@@ -90,8 +94,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ mode, clientName, setMode, running, clientState, clients, peers, refresh }),
-    [mode, clientName, setMode, running, clientState, clients, peers, refresh],
+    () => ({ mode, clientName, setMode, running, clientState, clients, peers, trusted, refresh }),
+    [mode, clientName, setMode, running, clientState, clients, peers, trusted, refresh],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

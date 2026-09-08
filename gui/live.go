@@ -38,6 +38,9 @@ type runningSnapshot struct {
 // A single JSON blob means the page can never show torn state (e.g.
 // "connected" from one source while "not running" from another).
 // ClientName lets the client status say "connected to pc, as hp".
+// Trusted are the machine ids this machine trusts (server config ids
+// for a server, trusted-server ids for a client) — the page uses them
+// to tell "nearby" machines from "trusted but not running" ones.
 type LiveSnapshot struct {
 	Mode        Mode              `json:"mode"`
 	ClientName  string            `json:"clientName"`
@@ -45,6 +48,7 @@ type LiveSnapshot struct {
 	ClientState ClientState       `json:"clientState"`
 	Peers       []Peer            `json:"peers"`
 	Clients     []ConnectedClient `json:"clients"`
+	Trusted     []string          `json:"trusted"`
 }
 
 // snapshot assembles the current picture. Locking is deliberately
@@ -59,7 +63,7 @@ func (a *App) snapshot() LiveSnapshot {
 	client := a.clientProc.running() || a.roleActive(roleClient)
 	a.mu.Unlock()
 
-	return LiveSnapshot{
+	snap := LiveSnapshot{
 		Mode:        mode,
 		ClientName:  clientName,
 		Running:     runningSnapshot{Server: server, Client: client},
@@ -67,6 +71,19 @@ func (a *App) snapshot() LiveSnapshot {
 		Peers:       a.DiscoverPeers(),
 		Clients:     a.ListClients(),
 	}
+	// The ids this machine trusts, matching the peer map by prefix: the
+	// server trusts what is in its config, the client what is in its
+	// settings (the Rust side uses the same lists).
+	if mode == ModeServer {
+		if cfg, err := a.LoadConfig(); err == nil {
+			snap.Trusted = nonNilStrings(cfg.Network.TrustedIDs)
+		}
+	} else {
+		a.mu.Lock()
+		snap.Trusted = nonNilStrings(a.settings.TrustedServers)
+		a.mu.Unlock()
+	}
+	return snap
 }
 
 // reconciledClientState makes the client state truthful against the

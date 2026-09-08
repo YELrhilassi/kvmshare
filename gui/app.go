@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -174,12 +175,15 @@ func NewApp() *App {
 		instanceLockPath: filepath.Join(stateDir, "gui.lock"),
 		settings: Settings{
 			Mode:          ModeServer,
-			ClientName:    hostnameOr("client"),
 			LogLevel:      "info",
 			LogEnabled:    true,
 			AcceptPairing: true,
 		},
 	}
+	// The generated machine name needs the machine id, which is created
+	// lazily on first use — so it is filled here, after the App exists
+	// (loadSettings keeps the name when the user has chosen one).
+	a.settings.ClientName = a.defaultClientName()
 	a.loadSettings()
 	a.notify = newNotify(a.serverLogPath)
 	a.disc = newDiscovery(a)
@@ -277,6 +281,43 @@ func hostnameOr(fallback string) string {
 	return fallback
 }
 
+// machineName is this machine's default friendly name: the real host
+// name plus a short random suffix derived from the stable machine id
+// ("bliss-8f3a"). The suffix keeps two machines with the same host
+// name distinct on the network, and being derived from the persisted id
+// it never changes between launches. Users can override it on the
+// Client page (the "name on the server"); nothing else in the product
+// invents "pc"/"hp"-style defaults.
+func machineName(host, machineID string) string {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		h = "machine"
+	}
+	suffix := shortID(machineID)
+	if len(suffix) > 4 {
+		suffix = suffix[:4]
+	}
+	return h + "-" + suffix
+}
+
+// defaultClientName returns the name this machine presents to servers
+// when the user has not chosen one yet.
+func (a *App) defaultClientName() string {
+	return machineName(hostnameOr("machine"), a.GetMachineId())
+}
+
+// displayName is the friendly name advertised on the network (beacons,
+// pairing requests, mDNS): the user-chosen name when there is one,
+// otherwise the generated machine name.
+func (a *App) displayName() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if n := strings.TrimSpace(a.settings.ClientName); n != "" {
+		return n
+	}
+	return a.defaultClientName()
+}
+
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
@@ -321,7 +362,7 @@ func (a *App) loadSettings() {
 		s.Mode = ModeServer
 	}
 	if s.ClientName == "" {
-		s.ClientName = hostnameOr("client")
+		s.ClientName = a.defaultClientName()
 	}
 	if !validLogLevel(s.LogLevel) {
 		s.LogLevel = "info"
@@ -373,14 +414,15 @@ func (a *App) ConnectToServer(addr string) error {
 // client is actually started (start validates it).
 func (a *App) SetSettings(s Settings) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if s.Mode != ModeServer && s.Mode != ModeClient {
+		a.mu.Unlock()
 		return fmt.Errorf("mode must be 'server' or 'client'")
 	}
 	if s.LogLevel == "" {
 		s.LogLevel = "info" // omitted (e.g. older callers) → default
 	}
 	if !validLogLevel(s.LogLevel) {
+		a.mu.Unlock()
 		return fmt.Errorf("unknown log level %q (use error, warn, info, debug or trace)", s.LogLevel)
 	}
 	a.settings = s
@@ -389,6 +431,13 @@ func (a *App) SetSettings(s Settings) error {
 	// instance (hot reload) and to whichever role starts next.
 	a.writeLogCtlLocked(roleServer)
 	a.writeLogCtlLocked(roleClient)
+	a.mu.Unlock()
+
+	// Everything below is done WITHOUT a.mu held: re-publishing the
+	// network advertisement reads the settings again (it takes the lock
+	// itself), and the input-access grant runs in the background.
+	// Holding the lock across these used to deadlock — SetSettings is
+	// the one path that reaches the advertisement from inside a.mu.
 	// A role switch changes what this machine advertises on the network
 	// (server vs client) — re-publish so nearby machines see the truth.
 	a.ReAdvertise()

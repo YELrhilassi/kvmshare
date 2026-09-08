@@ -7,13 +7,30 @@ import { Section } from "@/components/Section";
 import { cn, shortID } from "@/lib/utils";
 
 // Every machine on the network that can work with this one, in one
-// list, each with its own state — a connected machine never also
-// appears as a bare "nearby" entry, which used to show hp twice on the
-// server. The state badge says the direction out loud: on the server
-// "Connected" means "connected to this machine"; on the client it means
-// "this machine is connected to it".
+// list, each with its own state. A machine only counts as "nearby"
+// when its role is actually running: a GUI that is open but sharing
+// nothing is not a live machine (it used to linger as "nearby" forever
+// after you stopped every service on it). A trusted-but-idle machine
+// shows as "trusted" instead — you can still ask it to connect. A
+// machine that is neither running nor trusted is hidden: it is noise.
+//
+// Trust lives here, next to the machine it concerns: trust a machine
+// from its row, revoke it the same way.
+type RowState = "connected" | "nearby" | "trusted" | "hidden";
+
+// Same prefix contract as the backend (idTrusted): a trusted entry
+// matches a peer when either is a prefix of the other, and entries
+// shorter than 4 chars are ignored.
+function isTrusted(trusted: string[], id: string): boolean {
+  return trusted.some((t) => {
+    const entry = t.trim();
+    if (entry.length < 4) return false;
+    return id === entry || id.startsWith(entry) || entry.startsWith(id);
+  });
+}
+
 export default function LiveOverview() {
-  const { mode, clients, peers, clientState } = useApp();
+  const { mode, clients, peers, trusted, clientState } = useApp();
   const [err, setErr] = useState("");
   const [copiedId, setCopiedId] = useState("");
 
@@ -23,10 +40,15 @@ export default function LiveOverview() {
   // this machine here.
   const rows = peers.filter((p) => (isServer ? p.role === "client" : p.role === "server"));
 
-  const stateOf = (p: Peer): "connected" | "nearby" => {
-    if (isServer) return clients.some((c) => c.id === p.id) ? "connected" : "nearby";
-    const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
-    return clientState.status === "connected" && clientState.server === addr ? "connected" : "nearby";
+  const stateOf = (p: Peer): RowState => {
+    if (isServer) {
+      if (clients.some((c) => c.id === p.id)) return "connected";
+    } else {
+      const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
+      if (clientState.status === "connected" && clientState.server === addr) return "connected";
+    }
+    if (!p.active) return isTrusted(trusted, p.id) ? "trusted" : "hidden";
+    return "nearby";
   };
 
   const act = async (fn: () => Promise<unknown>) => {
@@ -44,19 +66,28 @@ export default function LiveOverview() {
     window.setTimeout(() => setCopiedId(""), 1500);
   };
 
+  const trust = (p: Peer, on: boolean) =>
+    act(() => (isServer ? (on ? api().TrustClient(p.id) : api().RevokeClient(p.id)) : on ? api().TrustServer(p.id) : api().RevokeServer(p.id)));
+
   const roleTag = isServer ? "client" : "server";
+  // Machines that are neither running nor trusted are hidden (they are
+  // not live and not actionable); the empty message covers that case
+  // too, so the section never renders as a bare title.
+  const visible = rows.filter((p) => stateOf(p) !== "hidden");
   const empty =
     "No other machines found yet. They show up here automatically once they're running — or connect by address from the Client page.";
 
   return (
     <Section title="On this network">
-      {rows.length === 0 ? (
+      {visible.length === 0 ? (
         <p className="text-sm text-muted-foreground">{empty}</p>
       ) : (
         <div className="divide-y divide-border/50">
-          {rows.map((p) => {
+          {visible.map((p) => {
             const state = stateOf(p);
             const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
+            const connected = state === "connected";
+            const trustedPeer = isTrusted(trusted, p.id);
             return (
               <div key={p.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3">
                 <div className="min-w-0">
@@ -68,11 +99,18 @@ export default function LiveOverview() {
                     <span
                       className={cn(
                         "rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide",
-                        state === "connected" ? "bg-emerald-500/10 text-emerald-500" : "bg-muted/40 text-muted-foreground",
+                        connected
+                          ? "bg-emerald-500/10 text-emerald-500"
+                          : state === "trusted"
+                            ? "bg-sky-500/10 text-sky-400"
+                            : "bg-muted/40 text-muted-foreground",
                       )}
                     >
-                      {state === "connected" ? (isServer ? "connected to you" : "in control") : "nearby"}
+                      {connected ? (isServer ? "connected to you" : "in control") : state === "trusted" ? "trusted" : "nearby"}
                     </span>
+                    {state === "trusted" && (
+                      <span className="text-[10px] text-muted-foreground/50">not running — ask it to connect</span>
+                    )}
                   </div>
                   <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-muted-foreground/60">
                     <span>{addr}</span>
@@ -90,24 +128,43 @@ export default function LiveOverview() {
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
                   {isServer ? (
-                    state === "connected" ? (
-                      <>
-                        <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "disconnect"))}>
-                          Disconnect
-                        </Button>
-                        <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "restart"))}>
-                          Restart
-                        </Button>
-                      </>
-                    ) : (
-                      <Button variant="outline" size="sm" onClick={() => void act(() => api().SendConnectRequest(p.id))}>
-                        Connect here
-                      </Button>
-                    )
-                  ) : state !== "connected" ? (
-                    <Button variant="outline" size="sm" onClick={() => void act(() => api().ConnectToServer(addr))}>
-                      Connect
+                    <>
+                      {connected ? (
+                        <>
+                          <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "disconnect"))}>
+                            Disconnect
+                          </Button>
+                          <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "restart"))}>
+                            Restart
+                          </Button>
+                          <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, false)}>
+                            Revoke
+                          </Button>
+                        </>
+                      ) : (
+                        <>
+                          <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, !trustedPeer)}>
+                            {trustedPeer ? "Revoke" : "Trust"}
+                          </Button>
+                          <Button variant="outline" size="sm" onClick={() => void act(() => api().SendConnectRequest(p.id))}>
+                            Connect here
+                          </Button>
+                        </>
+                      )}
+                    </>
+                  ) : state === "trusted" ? (
+                    <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, false)}>
+                      Revoke
                     </Button>
+                  ) : !connected ? (
+                    <>
+                      <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, !trustedPeer)}>
+                        {trustedPeer ? "Revoke" : "Trust"}
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={() => void act(() => api().ConnectToServer(addr))}>
+                        Connect
+                      </Button>
+                    </>
                   ) : null}
                 </div>
               </div>
