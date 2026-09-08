@@ -186,10 +186,12 @@ impl Session {
         }
         let used: std::collections::HashSet<u8> = self.layout.screens.iter().map(|s| s.id).collect();
         let id = (1u8..=u8::MAX).find(|c| !used.contains(c))?;
-        // Reported geometry is physical pixels; the layout works in
-        // logical ones (same conversion as [`Self::update_screen_info`]).
-        let w = (info.width as f32 / info.scale.max(0.1)) as i32;
-        let h = (info.height as f32 / info.scale.max(0.1)) as i32;
+        // The layout lives in the same space the injector reports and
+        // beacons from (physical pixels on Windows, root pixels on X11 —
+        // where the scale is always 1.0), so the reported size is used
+        // as-is.
+        let w = info.width.max(1) as i32;
+        let h = info.height.max(1) as i32;
         // To the right of everything currently on the desktop — the
         // plug-and-play default, collision-free because no existing
         // screen extends further right. The user rearranges it later in
@@ -213,10 +215,9 @@ impl Session {
     /// resolution/scale changes.
     pub fn update_screen_info(&mut self, id: u8, info: ScreenInfo) {
         if let Some(s) = self.layout.screens.iter_mut().find(|s| s.id == id) {
-            let w = (info.width as f32 / info.scale.max(0.1)) as i32;
-            let h = (info.height as f32 / info.scale.max(0.1)) as i32;
-            s.rect.w = w;
-            s.rect.h = h;
+            // Same space as [`Self::admit_client`] — see its comment.
+            s.rect.w = info.width.max(1) as i32;
+            s.rect.h = info.height.max(1) as i32;
         }
     }
 

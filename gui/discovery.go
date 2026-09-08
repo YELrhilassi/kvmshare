@@ -405,18 +405,19 @@ func (d *discovery) upsertBeacon(bp beaconPayload, from *net.UDPAddr) {
 	d.mu.Unlock()
 }
 
-// expire drops peers that went silent (their beacons or probe replies
-// stopped). mDNS peers are handled by the library's own TTL and are
-// left alone; broadcast and probe peers are refreshed by our own
-// packets and aged here.
+// expire drops peers that went silent (their beacons, probe replies or
+// mDNS announcements stopped). Every channel stamps `seen` on every
+// contact, so a live peer keeps refreshing it and a dead one ages out
+// after peerTTL — regardless of which channel first discovered it. The
+// mDNS library delivers announcements but never tells us when a service
+// disappears, so leaving mDNS peers unaged would let a machine that
+// closed its GUI linger forever.
 func (d *discovery) expire() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	cutoff := time.Now().Add(-peerTTL)
 	for id, p := range d.peers {
-		if p.Source == "discovery" {
-			continue
-		}
+		_ = p
 		if last, ok := d.seen[id]; ok && last.Before(cutoff) {
 			delete(d.peers, id)
 			delete(d.seen, id)

@@ -94,6 +94,8 @@ export interface UpdateResult {
 export interface ClientState {
   status: "connected" | "connecting" | "disconnected";
   server: string;
+  /** When the current connecting run began (unix ms, 0 when not connecting). */
+  connectingSinceMs: number;
 }
 
 export interface LiveSnapshot {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useApp } from "@/app/AppProvider";
 import { api } from "@/lib/bridge";
 import { Button } from "@/components/ui/button";
@@ -14,11 +14,29 @@ export default function ShareStatus() {
   const { mode, running, clientState, clientName, peers, refresh } = useApp();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // A wall-clock tick while connecting, so the "Connecting… → Server
+  // unreachable" transition happens on its own (the backend only
+  // emits events on state *changes*, and a stuck connection changes
+  // nothing). Stopped when nothing is connecting.
+  const [now, setNow] = useState(() => Date.now());
+  const connectingActive = !(mode === "server") && running.client && clientState.status !== "connected";
+  useEffect(() => {
+    if (!connectingActive) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [connectingActive]);
 
   const isServer = mode === "server";
   const active = isServer ? running.server : running.client;
   const connected = clientState.status === "connected";
   const connecting = !isServer && running.client && !connected;
+  // A client that has been "connecting" past a short grace period is
+  // not really on its way — the server is unreachable and it keeps
+  // retrying. Say that instead of a forever-"Connecting…".
+  const stuckConnecting =
+    connecting &&
+    clientState.connectingSinceMs > 0 &&
+    now - clientState.connectingSinceMs > 8_000;
 
   // Name the server this client talks to, when discovery knows it —
   // otherwise fall back to its address.
@@ -49,7 +67,9 @@ export default function ShareStatus() {
     : connected
       ? `Connected to ${serverLabel}`
       : connecting
-        ? "Connecting…"
+        ? stuckConnecting
+          ? "Server unreachable"
+          : "Connecting…"
         : "Not connected";
 
   const blurb = isServer
@@ -59,7 +79,9 @@ export default function ShareStatus() {
     : connected
       ? `${serverLabel} is using this machine's keyboard and mouse${clientName ? ` (as ${clientName})` : ""}.`
       : connecting
-        ? "Connecting to the server — nothing is shared yet."
+        ? stuckConnecting
+          ? `Can't reach ${serverLabel} — retrying every few seconds.`
+          : "Connecting to the server — nothing is shared yet."
         : "No one is controlling this machine right now. Pick a machine below to connect.";
 
   const verb = isServer

@@ -10,13 +10,14 @@ import { cn, shortID } from "@/lib/utils";
 // list, each with its own state. A machine only counts as "nearby"
 // when its role is actually running: a GUI that is open but sharing
 // nothing is not a live machine (it used to linger as "nearby" forever
-// after you stopped every service on it). A trusted-but-idle machine
-// shows as "trusted" instead — you can still ask it to connect. A
-// machine that is neither running nor trusted is hidden: it is noise.
+// after you stopped every service on it). An idle machine stays
+// visible as "idle" (or "trusted" when trusted) so it can still be
+// trusted and asked to connect — hiding it entirely would make it
+// impossible to ever set up a first connection.
 //
 // Trust lives here, next to the machine it concerns: trust a machine
 // from its row, revoke it the same way.
-type RowState = "connected" | "nearby" | "trusted" | "hidden";
+type RowState = "connected" | "nearby" | "trusted" | "idle";
 
 // Same prefix contract as the backend (idTrusted): a trusted entry
 // matches a peer when either is a prefix of the other, and entries
@@ -47,7 +48,7 @@ export default function LiveOverview() {
       const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
       if (clientState.status === "connected" && clientState.server === addr) return "connected";
     }
-    if (!p.active) return isTrusted(trusted, p.id) ? "trusted" : "hidden";
+    if (!p.active) return isTrusted(trusted, p.id) ? "trusted" : "idle";
     return "nearby";
   };
 
@@ -70,10 +71,10 @@ export default function LiveOverview() {
     act(() => (isServer ? (on ? api().TrustClient(p.id) : api().RevokeClient(p.id)) : on ? api().TrustServer(p.id) : api().RevokeServer(p.id)));
 
   const roleTag = isServer ? "client" : "server";
-  // Machines that are neither running nor trusted are hidden (they are
-  // not live and not actionable); the empty message covers that case
-  // too, so the section never renders as a bare title.
-  const visible = rows.filter((p) => stateOf(p) !== "hidden");
+  // Every discovered machine is actionable (trust, connect); there is
+  // nothing to filter out. The empty message only covers "nothing on
+  // the network at all".
+  const visible = rows;
   const empty =
     "No other machines found yet. They show up here automatically once they're running — or connect by address from the Client page.";
 
@@ -103,14 +104,25 @@ export default function LiveOverview() {
                           ? "bg-emerald-500/10 text-emerald-500"
                           : state === "trusted"
                             ? "bg-sky-500/10 text-sky-400"
-                            : "bg-muted/40 text-muted-foreground",
+                            : state === "nearby"
+                              ? "bg-amber-500/10 text-amber-500"
+                              : "bg-muted/40 text-muted-foreground",
                       )}
                     >
-                      {connected ? (isServer ? "connected to you" : "in control") : state === "trusted" ? "trusted" : "nearby"}
+                      {connected
+                        ? isServer
+                          ? "connected to you"
+                          : "in control"
+                        : state === "trusted"
+                          ? "trusted"
+                          : state === "nearby"
+                            ? "nearby"
+                            : "idle"}
                     </span>
                     {state === "trusted" && (
                       <span className="text-[10px] text-muted-foreground/50">not running — ask it to connect</span>
                     )}
+                    {state === "idle" && <span className="text-[10px] text-muted-foreground/50">not running</span>}
                   </div>
                   <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-muted-foreground/60">
                     <span>{addr}</span>

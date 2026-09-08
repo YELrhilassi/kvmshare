@@ -95,10 +95,13 @@ type App struct {
 	instanceLockPath string
 	instanceLock     *os.File
 
-	mu         sync.Mutex
-	settings   Settings
-	serverProc *proc
-	clientProc *proc
+	mu              sync.Mutex
+	settings        Settings
+	serverProc      *proc
+	clientProc      *proc
+	// When the current "connecting" run began (see ClientStatus).
+	// Only meaningful while the client process is actually running.
+	connectingSince time.Time
 
 	// Lifecycle notifications (client connect/disconnect from the server
 	// log). nil until StartNotifyWatcher is called.

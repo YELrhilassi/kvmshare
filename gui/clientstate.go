@@ -11,12 +11,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// How long the client may stay in "connecting" before the UI calls it
+// what it is: the server is unreachable, and the client keeps retrying.
+const connectingGrace = 8 * time.Second
 
 // ClientState is what the Home page's connection panel shows.
 type ClientState struct {
 	Status string `json:"status"` // "connected" | "connecting" | "disconnected"
 	Server string `json:"server"` // address the client talks to
+	// ConnectingSinceMs is when the current "connecting" run began
+	// (unix ms, 0 when not connecting). The page uses it to say
+	// "can't reach the server" instead of a forever-"Connecting…".
+	ConnectingSinceMs int64 `json:"connectingSinceMs"`
 }
 
 // ClientStatus reads the client's live state file. Missing or unreadable
@@ -41,6 +50,20 @@ func (a *App) ClientStatus() ClientState {
 		case "server":
 			st.Server = kv[1]
 		}
+	}
+	// Remember when the client started waiting, so "connecting" can
+	// age into "unreachable". Only the process state says whether it
+	// is really connecting; the file alone cannot tell a stale
+	// "connecting" from a live one (reconciledClientState fixes that
+	// before this reaches the page).
+	if st.Status == "connecting" {
+		now := time.Now()
+		if a.connectingSince.IsZero() {
+			a.connectingSince = now
+		}
+		st.ConnectingSinceMs = a.connectingSince.UnixMilli()
+	} else {
+		a.connectingSince = time.Time{}
 	}
 	return st
 }
