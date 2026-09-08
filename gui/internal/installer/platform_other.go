@@ -25,3 +25,7 @@ func removeDesktopIntegration(string) error { return nil }
 // launchGUI is a no-op outside Windows (Linux installs print instructions
 // instead; the GUI is launched from the desktop entry).
 func launchGUI(string) error { return nil }
+
+// EnsureFirewall is a no-op outside Windows (Windows Firewall is the only
+// platform that needs explicit per-app inbound rules).
+func EnsureFirewall() error { return nil }

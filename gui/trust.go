@@ -6,7 +6,8 @@ package main
 //   - Server side — a server operator sees a nearby machine in the
 //     discovery list and clicks "trust": its machine id is added to the
 //     config's `[network] trusted_ids`, so the allowlist accepts it even
-//     before a layout screen is pinned for it.
+//     before a layout screen is pinned for it. Entries accept the short
+//     id (8 chars) or the full 32-char id — matching is by prefix.
 //   - Client side — the GUI's settings carry a trusted-servers list and
 //     an auto-connect flag. When auto-connect is on and a server whose
 //     id is trusted (or whose address matches the last-used server)
@@ -19,11 +20,12 @@ import (
 )
 
 // TrustClient adds a machine id to the server config's trusted_ids list
-// (persisted; the running server hot-reloads it). Idempotent.
+// (persisted; the running server hot-reloads it). Idempotent. Accepts a
+// short (8-char) or full id.
 func (a *App) TrustClient(id string) error {
 	id = strings.TrimSpace(id)
-	if id == "" {
-		return fmt.Errorf("machine id is required")
+	if len(id) < 4 {
+		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -32,8 +34,8 @@ func (a *App) TrustClient(id string) error {
 		return err
 	}
 	for _, t := range cfg.Network.TrustedIDs {
-		if t == id {
-			return nil // already trusted
+		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
+			return nil // already trusted (full or prefix)
 		}
 	}
 	cfg.Network.TrustedIDs = append(cfg.Network.TrustedIDs, id)
@@ -41,16 +43,17 @@ func (a *App) TrustClient(id string) error {
 }
 
 // TrustServer adds a server machine id to this machine's trusted-servers
-// list (the client accepts connection requests from it). Idempotent.
+// list (the client accepts connection requests from it). Idempotent;
+// accepts short or full ids.
 func (a *App) TrustServer(id string) error {
 	id = strings.TrimSpace(id)
-	if id == "" {
-		return fmt.Errorf("machine id is required")
+	if len(id) < 4 {
+		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, t := range a.settings.TrustedServers {
-		if t == id {
+		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
 			return nil
 		}
 	}
@@ -88,7 +91,7 @@ func (a *App) AutoConnectLoop() {
 				if lastSeen[p.ID] {
 					continue // seen before; don't re-trigger
 				}
-				if a.settingsTrustsServer(p.ID) || a.peerMatchesClientAddr(p) {
+				if idTrusted(s.TrustedServers, p.ID) || a.peerMatchesClientAddr(p) {
 					addr := fmt.Sprintf("%s:%d", p.Addr, portOrDefault(p.Port))
 					_ = a.ConnectToServer(addr)
 					break

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -167,6 +169,40 @@ func TestConfigNetworkNeverNil(t *testing.T) {
 	// The legacy default is secure: allowlist + local-only on.
 	if !cfg.Network.Allowlist || !cfg.Network.LocalOnly {
 		t.Fatalf("legacy config should default to allowlist+local-only, got %+v", cfg.Network)
+	}
+}
+
+// Trusted-id entries accept the full id or its 8-char short form
+// (prefix match), and never match on tiny prefixes.
+func TestIdTrustedShortAndFull(t *testing.T) {
+	full := "70b97d38631dda4b8f6ef627d753022d"
+	short := full[:8]
+	if !idTrusted([]string{full}, full) {
+		t.Fatal("full id should match itself")
+	}
+	if !idTrusted([]string{short}, full) {
+		t.Fatal("short id should match by prefix")
+	}
+	if idTrusted([]string{short}, "70b97dXXffffffffffffffffffffffffff") {
+		t.Fatal("different id sharing only 4 chars must not match")
+	}
+	if idTrusted([]string{"ab"}, "abcdef") {
+		t.Fatal("trusted entries shorter than 4 chars must never match")
+	}
+	if idTrusted([]string{""}, full) {
+		t.Fatal("empty trusted entries must never match")
+	}
+	if shortID(full) != short {
+		t.Fatalf("shortID(%q) = %q, want %q", full, shortID(full), short)
+	}
+}
+
+// Pairing defaults to ON so "connect here" works out of the box, and a
+// fresh App (no gui.json yet) has it set.
+func TestAcceptPairingDefaultsOn(t *testing.T) {
+	a, _ := newTestApp(t)
+	if !a.GetSettings().AcceptPairing {
+		t.Fatal("acceptPairing should default to on (trust on first use)")
 	}
 }
 
@@ -716,5 +752,61 @@ func TestSingleInstanceWritesPid(t *testing.T) {
 	}
 	if pid != os.Getpid() {
 		t.Fatalf("pid file records %d, want %d", pid, os.Getpid())
+	}
+}
+
+// A beacon (id + role + port) lands in the peer map; a pairing request
+// (cmd + id) must NOT — the two shapes share the `id` field, and
+// misclassifying a pairing request as a beacon used to swallow
+// "connect here" silently.
+func TestDatagramClassification(t *testing.T) {
+	a, _ := newTestApp(t)
+	d := newDiscovery(a)
+	from := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 72), Port: discoveryPort}
+
+	beacon, err := json.Marshal(beaconPayload{ID: "bbbbbbbb11111111", Name: "laptop", Role: "client", Port: 24800})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.handleDatagram(beacon, from)
+	peers := d.list()
+	if len(peers) != 1 || peers[0].ID != "bbbbbbbb11111111" {
+		t.Fatalf("beacon not upserted as peer: %+v", peers)
+	}
+
+	req, err := json.Marshal(pairRequest{Cmd: "connect", ID: "cccccccc22222222", Name: "desk", Addr: "192.168.1.86:24800"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.handleDatagram(req, from)
+	if got := d.list(); len(got) != 1 {
+		t.Fatalf("pairing request leaked into the peer map: %+v", got)
+	}
+}
+
+// The full pairing path: a "connect" datagram from a local server is
+// accepted on first use (trust recorded) and starts this machine's
+// client pointed at the sender.
+func TestPairingRequestConnects(t *testing.T) {
+	a, _ := newTestApp(t)
+	d := newDiscovery(a)
+	from := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 86), Port: discoveryPort}
+
+	req, err := json.Marshal(pairRequest{Cmd: "connect", ID: "cccccccc22222222", Name: "desk", Addr: "192.168.1.86:24800"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.handleDatagram(req, from)
+
+	// Trust-on-first-use recorded the sender's id.
+	if !idTrusted(a.GetSettings().TrustedServers, "cccccccc22222222") {
+		t.Fatalf("pairing did not record the server as trusted: %v", a.GetSettings().TrustedServers)
+	}
+	// The client was pointed at the sender's address and started.
+	if a.GetSettings().ClientAddr != "192.168.1.86:24800" {
+		t.Fatalf("client addr = %q, want 192.168.1.86:24800", a.GetSettings().ClientAddr)
+	}
+	if !a.ClientRunning() {
+		t.Fatal("client did not start after a pairing request")
 	}
 }

@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Section } from "@/components/Section";
+import { shortID } from "@/lib/utils";
 
 // Server settings: how this machine shares its keyboard and mouse, and
 // who is allowed to connect. Live state (who is connected, what is on
@@ -128,7 +129,7 @@ export default function ServerPage() {
                 key={id}
                 className="inline-flex items-center gap-1 rounded-full border border-border/70 px-2 py-0.5 font-mono text-[11px]"
               >
-                {id.slice(0, 8)}…
+                {shortID(id)}
                 <button
                   className="text-muted-foreground/60 hover:text-destructive"
                   onClick={() => patchNetwork({ trustedIds: network.trustedIds.filter((t) => t !== id) })}
@@ -142,7 +143,7 @@ export default function ServerPage() {
           <div className="flex items-center gap-2">
             <Input
               className="w-64 font-mono"
-              placeholder="paste a machine id"
+              placeholder="paste a machine id (short form works)"
               value={trustInput}
               onChange={(e) => setTrustInput(e.target.value)}
               aria-label="Machine id to trust"
@@ -173,7 +174,8 @@ export default function ServerPage() {
 
         <footer className="mt-14 space-y-1 border-t border-border/60 pt-4 text-[11px] text-muted-foreground/50">
           <div>
-            This machine's id: <span className="font-mono">{machineId || "…"}</span>
+            This machine's id: <span className="font-mono">{shortID(machineId) || "…"}</span>
+            {machineId && <span className="ml-1 text-muted-foreground/40">(short form — other machines paste this)</span>}
           </div>
           <div>
             Config: <span className="font-mono">{paths?.configPath ?? "…"}</span>

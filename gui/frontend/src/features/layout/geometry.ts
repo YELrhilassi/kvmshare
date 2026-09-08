@@ -12,7 +12,7 @@ import { DEFAULT_SCREEN_HEIGHT, DEFAULT_SCREEN_WIDTH } from "@/lib/constants";
 // grid, snap, zoom — is in model units; real↔model conversion happens
 // only at the data boundary (toModel, and the drag commit in Canvas).
 
-export const MODEL_SCALE = 0.1; // 1 model unit = 10 real pixels
+export const MODEL_SCALE = 0.2; // 1 model unit = 5 real pixels — screens read as nicely-sized blocks
 
 // Zoom is expressed as a percentage of model 1:1 — 100% is the natural
 // size (a 1080p screen is a 192×108 block), and the range is fixed and
