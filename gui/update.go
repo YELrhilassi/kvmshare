@@ -18,6 +18,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"kvmshare/gui/internal/selfupdate"
@@ -44,9 +46,15 @@ func (a *App) GetVersion() string {
 
 // CheckForUpdate compares this build against the latest GitHub release.
 // A release with no archive for this platform is reported as an error —
-// an \"update available\" that cannot be installed is a lie.
+// an \"update available\" that cannot be installed is a lie. Dev builds
+// (unreleased, e.g. the default v0.0.0-dev) are simply reported as
+// having no update: they have no upstream to compare against, and a
+// confusing failure would be worse than no claim.
 func (a *App) CheckForUpdate() UpdateInfo {
 	info := UpdateInfo{Current: selfupdate.Version}
+	if !selfupdate.IsRelease(selfupdate.Version) {
+		return info
+	}
 	rel, err := selfupdate.FetchRelease(os.Getenv("KVMSHARE_UPSTREAM"))
 	if err != nil {
 		info.Error = err.Error()
@@ -65,6 +73,12 @@ func (a *App) CheckForUpdate() UpdateInfo {
 // hands off to the new GUI. Returns before the restart (the frontend
 // shows a \"restarting\" state; this process exits shortly after).
 func (a *App) ApplyUpdate() UpdateResult {
+	// Dev builds never apply an update: there is no released archive for
+	// them, and replacing a hand-built binary with a release is not what
+	// self-update is for.
+	if !selfupdate.IsRelease(selfupdate.Version) {
+		return UpdateResult{Error: fmt.Sprintf("this is a development build (%s) — update it by reinstalling", selfupdate.Version)}
+	}
 	rel, err := selfupdate.FetchRelease(os.Getenv("KVMSHARE_UPSTREAM"))
 	if err != nil {
 		return UpdateResult{Error: err.Error()}
@@ -122,29 +136,33 @@ func (a *App) ApplyUpdate() UpdateResult {
 		return UpdateResult{Error: err.Error()}
 	}
 	// Everything the release must contain, mapped to where it lives on
-	// this machine. Replacing is one transaction (ReplaceSet): a failure
-	// anywhere restores every already-replaced file, so the machine is
-	// never left with a mix of versions.
-	replacements := map[string]string{
-		"kvmshare-gui":    exe,
-		"kvmshare-server": a.serverPath,
-		"kvmshare-client": a.clientPath,
+	// this machine. The binary names carry the platform extension
+	// (kvmshare-gui.exe on Windows), so match against the extracted set
+	// exactly — a mismatch here used to reject every Windows release as
+	// "missing binaries". Replacing is one transaction (ReplaceSet): a
+	// failure anywhere restores every already-replaced file, so the
+	// machine is never left with a mix of versions.
+	dest := map[string]string{
+		"kvmshare-gui":     exe,
+		"kvmshare-server":  a.serverPath,
+		"kvmshare-client":  a.clientPath,
 		"kvmshare-install": a.installPath,
 	}
-	missing := false
-	for bin := range replacements {
+	var missingBins []string
+	for _, bin := range selfupdate.Binaries() {
 		if _, ok := extracted[bin]; !ok {
-			missing = true
-			break
+			missingBins = append(missingBins, bin)
 		}
 	}
-	if missing {
+	if len(missingBins) > 0 {
+		sort.Strings(missingBins)
 		clean()
-		return UpdateResult{Error: fmt.Sprintf("release is missing one or more binaries")}
+		return UpdateResult{Error: fmt.Sprintf("the release archive is missing: %s", strings.Join(missingBins, ", "))}
 	}
-	installTargets := make(map[string]string, len(replacements))
-	for bin, dst := range replacements {
-		installTargets[dst] = extracted[bin]
+	installTargets := make(map[string]string, len(dest))
+	for _, bin := range selfupdate.Binaries() {
+		base := strings.TrimSuffix(bin, ".exe")
+		installTargets[dest[base]] = extracted[bin]
 	}
 	if err := selfupdate.ReplaceSet(installTargets); err != nil {
 		clean()

@@ -203,6 +203,12 @@ func (a *App) stopRoleLocked(role string) error {
 	if a.roleActive(role) {
 		return fmt.Errorf("could not stop the running %s (pid %d): it is still holding its lock", role, a.pidFromLock(role))
 	}
+	// The client's state file must not outlive the process: a stale
+	// "connected" file would make the Home page claim a connection that
+	// does not exist. The next start writes it fresh again.
+	if role == roleClient {
+		_ = os.Remove(filepath.Join(a.stateDir, "client.state"))
+	}
 	return nil
 }
 

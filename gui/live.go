@@ -63,10 +63,31 @@ func (a *App) snapshot() LiveSnapshot {
 		Mode:        mode,
 		ClientName:  clientName,
 		Running:     runningSnapshot{Server: server, Client: client},
-		ClientState: a.ClientStatus(),
+		ClientState: a.reconciledClientState(client),
 		Peers:       a.DiscoverPeers(),
 		Clients:     a.ListClients(),
 	}
+}
+
+// reconciledClientState makes the client state truthful against the
+// process itself, because the state file outlives the process: a killed
+// or crashed client leaves a stale "connected" file behind, which used
+// to make the Home page claim a connection that did not exist. The
+// process is the source of truth:
+//
+//   - no client process → disconnected, whatever the file says
+//   - client running, not (yet) connected → connecting
+//   - client running and the file says connected → connected
+func (a *App) reconciledClientState(clientRunning bool) ClientState {
+	cs := a.ClientStatus()
+	if !clientRunning {
+		cs.Status = "disconnected"
+		return cs
+	}
+	if cs.Status != "connected" {
+		cs.Status = "connecting"
+	}
+	return cs
 }
 
 // emitState pushes the snapshot only when it changed since the last

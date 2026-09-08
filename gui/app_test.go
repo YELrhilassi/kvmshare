@@ -854,3 +854,30 @@ func TestShouldEmitDedupes(t *testing.T) {
 		t.Fatal("repeated changed snapshot must not emit again")
 	}
 }
+
+// The client state must never lie: a stale "connected" state file with
+// no client process must read as disconnected, and a running client
+// that has not written a state file yet must read as connecting.
+func TestReconciledClientState(t *testing.T) {
+	a, _ := newTestApp(t)
+	statePath := filepath.Join(a.stateDir, "client.state")
+
+	// No process, stale file → disconnected (the file outlives a kill).
+	if err := os.WriteFile(statePath, []byte("status=connected\nserver=192.168.1.86:24800\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cs := a.reconciledClientState(false); cs.Status != "disconnected" {
+		t.Fatalf("no process + stale file = %q, want disconnected", cs.Status)
+	}
+
+	// Process running, file says connected → connected.
+	if cs := a.reconciledClientState(true); cs.Status != "connected" {
+		t.Fatalf("running + connected file = %q, want connected", cs.Status)
+	}
+
+	// Process running, no file yet → connecting.
+	_ = os.Remove(statePath)
+	if cs := a.reconciledClientState(true); cs.Status != "connecting" {
+		t.Fatalf("running + no file = %q, want connecting", cs.Status)
+	}
+}
