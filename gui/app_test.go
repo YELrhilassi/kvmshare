@@ -206,6 +206,118 @@ func TestAcceptPairingDefaultsOn(t *testing.T) {
 	}
 }
 
+// The default machine name is the real host name plus a short random
+// suffix derived from the stable machine id — never an invented
+// "pc"/"hp" placeholder, and stable across launches.
+func TestDefaultClientNameIsHostnamePlusSuffix(t *testing.T) {
+	a, _ := newTestApp(t)
+	s := a.GetSettings()
+	if s.ClientName == "" {
+		t.Fatal("default client name should be set")
+	}
+	if !strings.Contains(s.ClientName, "-") {
+		t.Fatalf("default client name %q should carry a hostname-suffix form", s.ClientName)
+	}
+	host, _ := os.Hostname()
+	if host != "" && !strings.HasPrefix(s.ClientName, host) {
+		t.Fatalf("default client name %q should start with the real host name %q", s.ClientName, host)
+	}
+	// Derived from the machine id, so a second App (or a restart) sees
+	// the same default.
+	a2 := NewApp()
+	if a2.GetSettings().ClientName != s.ClientName {
+		t.Fatalf("default client name changed between launches: %q vs %q", a2.GetSettings().ClientName, s.ClientName)
+	}
+}
+
+// Trust and revoke must round-trip on both roles, by short or full id,
+// and revoke must not remove a *different* id that merely shares a
+// prefix longer than 4 chars with the target.
+func TestTrustAndRevoke(t *testing.T) {
+	a, _ := newTestApp(t)
+	full := "70b97d38631dda4b8f6ef627d753022d"
+	short := full[:8]
+
+	// Server side.
+	if err := a.TrustClient(short); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := a.LoadConfig()
+	if !idTrusted(cfg.Network.TrustedIDs, full) {
+		t.Fatalf("TrustClient should record the id: %v", cfg.Network.TrustedIDs)
+	}
+	// Idempotent.
+	if err := a.TrustClient(full); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RevokeClient(full); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = a.LoadConfig()
+	if idTrusted(cfg.Network.TrustedIDs, full) {
+		t.Fatalf("RevokeClient should remove the id: %v", cfg.Network.TrustedIDs)
+	}
+
+	// Client side.
+	if err := a.TrustServer(short); err != nil {
+		t.Fatal(err)
+	}
+	if !idTrusted(a.GetSettings().TrustedServers, full) {
+		t.Fatalf("TrustServer should record the id: %v", a.GetSettings().TrustedServers)
+	}
+	if err := a.RevokeServer(short); err != nil {
+		t.Fatal(err)
+	}
+	if idTrusted(a.GetSettings().TrustedServers, full) {
+		t.Fatalf("RevokeServer should remove the id: %v", a.GetSettings().TrustedServers)
+	}
+
+	// Revoking by a short prefix must only remove entries matching THAT
+	// id — never a different trusted entry.
+	if err := a.TrustClient(full); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.TrustClient("aaaaaaaa11111111"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RevokeClient(full[:6]); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = a.LoadConfig()
+	if len(cfg.Network.TrustedIDs) != 1 || cfg.Network.TrustedIDs[0] != "aaaaaaaa11111111" {
+		t.Fatalf("revoke must only remove the matching id: %v", cfg.Network.TrustedIDs)
+	}
+}
+
+// Role switching must work while discovery is running: SetSettings
+// re-publishes the network advertisement on a mode change, and the
+// advertisement reads the settings under the same mutex. Holding a.mu
+// across that re-publish used to deadlock the role picker on both
+// machines (clicking a role did nothing).
+func TestSetSettingsWithDiscoveryDoesNotDeadlock(t *testing.T) {
+	a, _ := newTestApp(t)
+	a.disc.start() // discovery goroutines now call displayName()
+	defer close(a.disc.stop)
+
+	done := make(chan error, 1)
+	go func() {
+		s := a.GetSettings()
+		s.Mode = ModeClient
+		done <- a.SetSettings(s)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SetSettings with discovery running: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SetSettings deadlocked with discovery running")
+	}
+	if a.GetSettings().Mode != ModeClient {
+		t.Fatal("mode should have switched to client")
+	}
+}
+
 // The client's real connection state comes from client.state (written by
 // the Rust client). Missing file means "disconnected".
 func TestClientStatusReadsStateFile(t *testing.T) {
@@ -764,7 +876,7 @@ func TestDatagramClassification(t *testing.T) {
 	d := newDiscovery(a)
 	from := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 72), Port: discoveryPort}
 
-	beacon, err := json.Marshal(beaconPayload{ID: "bbbbbbbb11111111", Name: "laptop", Role: "client", Port: 24800})
+	beacon, err := json.Marshal(beaconPayload{ID: "bbbbbbbb11111111", Name: "laptop", Role: "client", Port: 24800, Running: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -772,6 +884,21 @@ func TestDatagramClassification(t *testing.T) {
 	peers := d.list()
 	if len(peers) != 1 || peers[0].ID != "bbbbbbbb11111111" {
 		t.Fatalf("beacon not upserted as peer: %+v", peers)
+	}
+	if !peers[0].Active {
+		t.Fatalf("beacon with running=true must record the peer as active: %+v", peers[0])
+	}
+
+	// A beacon that advertises "GUI up but nothing running" records the
+	// peer as inactive — a machine that stopped every service must not
+	// linger as a live "nearby" machine.
+	idle, err := json.Marshal(beaconPayload{ID: "bbbbbbbb11111111", Name: "laptop", Role: "client", Port: 24800, Running: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.handleDatagram(idle, from)
+	if got := d.list(); len(got) != 1 || got[0].Active {
+		t.Fatalf("idle beacon must mark the peer inactive: %+v", got)
 	}
 
 	req, err := json.Marshal(pairRequest{Cmd: "connect", ID: "cccccccc22222222", Name: "desk", Addr: "192.168.1.86:24800"})

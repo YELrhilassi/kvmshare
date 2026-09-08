@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Stage, Layer, Rect, Text, Group } from "react-konva";
+import { Stage, Layer, Rect, Text, Group, Circle } from "react-konva";
 import type { KonvaEventObject } from "konva/lib/Node";
 import type { Screen } from "@/lib/bridge";
 import { gridStyle, MODEL_SCALE, snapTo, WORLD_SPAN, type View } from "@/features/layout/geometry";
@@ -267,8 +267,14 @@ export default function Canvas({
   );
 }
 
-// One screen as a Konva Group (rect + labels). Draggable unless locked;
-// the own screen (index 0) carries a "you" badge.
+// One screen as a Konva Group: a soft glass panel with a header strip
+// (accent dot + name, like a window title bar), a "you" badge on the
+// own screen, and the resolution pinned to the bottom corner. Draggable
+// unless locked. Text lives in a header so it reads at any zoom; the
+// pill-free layout keeps screens looking like screens, not tags.
+const OWN_ACCENT = "#34d399"; // emerald — this machine
+const OTHER_ACCENT = "#7dd3fc"; // sky — other machines
+
 function ScreenRect({
   screen,
   selected,
@@ -291,12 +297,12 @@ function ScreenRect({
   const w = screen.width * MODEL_SCALE;
   const h = screen.height * MODEL_SCALE;
 
-  // The name badge: a dark pill behind the label so it reads against
-  // the dot grid at any zoom. The pill width adapts to the label.
   const name = screen.name || "screen";
-  const badgeW = Math.min(w - 8, name.length * 8 + 22);
-  const badgeH = 22;
-  const badgeX = (w - badgeW) / 2;
+  const accent = own ? OWN_ACCENT : OTHER_ACCENT;
+  // The header is a fixed fraction of the screen height so a small
+  // screen never drowns in chrome, and never so tall it eats the body.
+  const headerH = Math.min(28, Math.max(20, h * 0.14));
+  const res = `${screen.width}×${screen.height}`;
 
   return (
     <Group
@@ -310,70 +316,98 @@ function ScreenRect({
         onSelect();
       }}
     >
+      {/* Body: a dark glass panel with a subtle top glow; the own screen
+          carries a faint emerald tint so it reads as "this machine" at
+          a glance, not just from its badge. */}
       <Rect
         width={w}
         height={h}
         cornerRadius={10}
-        fill={own ? "rgba(255,255,255,0.15)" : "rgba(255,255,255,0.09)"}
-        stroke={selected ? "#fafafa" : own ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.3)"}
+        fillLinearGradientStartPoint={{ x: 0, y: 0 }}
+        fillLinearGradientEndPoint={{ x: 0, y: h }}
+        fillLinearGradientColorStops={
+          own
+            ? [0, "rgba(52,211,153,0.12)", 0.35, "rgba(30,33,42,0.92)", 1, "rgba(17,19,26,0.94)"]
+            : [0, "rgba(125,211,252,0.08)", 0.35, "rgba(30,33,42,0.9)", 1, "rgba(17,19,26,0.93)"]
+        }
+        stroke={selected ? accent : own ? "rgba(52,211,153,0.5)" : "rgba(148,163,184,0.32)"}
         strokeWidth={selected ? 2.5 : 1.25}
-        shadowColor="rgba(0,0,0,0.45)"
-        shadowBlur={16}
+        shadowColor={selected ? accent : "rgba(0,0,0,0.5)"}
+        shadowBlur={selected ? 26 : 14}
+        shadowOpacity={selected ? 0.5 : 1}
         shadowOffsetY={4}
       />
-      {/* Name badge: dark pill for contrast over the grid. */}
+      {/* Header strip: a slightly lighter band with a hairline below it,
+          framing the name like a window title bar. */}
       <Rect
-        x={badgeX}
-        y={8}
-        width={badgeW}
-        height={badgeH}
-        cornerRadius={badgeH / 2}
-        fill="rgba(10,10,14,0.75)"
+        width={w}
+        height={headerH}
+        cornerRadius={[10, 10, 0, 0]}
+        fill="rgba(255,255,255,0.05)"
         listening={false}
       />
+      <Rect y={headerH - 1} width={w} height={1} fill="rgba(255,255,255,0.06)" listening={false} />
+      {/* Accent dot + name, left-aligned in the header. */}
+      <Circle x={13} y={headerH / 2} radius={3.5} fill={accent} listening={false} />
       <Text
         text={name}
         fontSize={13}
         fontStyle="600"
-        fill="rgba(255,255,255,0.95)"
-        align="center"
-        width={w}
-        y={9}
-        height={badgeH}
+        fill="rgba(255,255,255,0.96)"
+        x={22}
+        y={0}
+        width={Math.max(0, w - 22 - (own ? 40 : 8))}
+        height={headerH}
         verticalAlign="middle"
+        ellipsis
         listening={false}
       />
+      {/* "you" pill, top-right in the header. */}
       {own && (
-        <Text
-          text="you"
-          fontSize={9}
-          fontStyle="700"
-          fill="#000"
-          align="center"
-          width={w}
-          y={34}
-          listening={false}
-        />
+        <>
+          <Rect
+            x={w - 36}
+            y={(headerH - 15) / 2}
+            width={26}
+            height={15}
+            cornerRadius={7.5}
+            fill="rgba(52,211,153,0.18)"
+            listening={false}
+          />
+          <Text
+            text="you"
+            fontSize={9}
+            fontStyle="700"
+            fill={OWN_ACCENT}
+            align="center"
+            width={26}
+            x={w - 36}
+            y={(headerH - 15) / 2}
+            height={15}
+            verticalAlign="middle"
+            listening={false}
+          />
+        </>
       )}
-      {/* Resolution: a small dark pill at the bottom, readable against
-          anything behind it. */}
+      {/* Resolution: a small pill pinned to the bottom-right, readable
+          against anything behind it. */}
       <Rect
-        x={(w - 64) / 2}
-        y={h - 22}
-        width={64}
+        x={Math.max(4, w - 72)}
+        y={Math.max(headerH + 6, h - 22)}
+        width={Math.min(64, w - 8)}
         height={16}
         cornerRadius={8}
-        fill="rgba(10,10,14,0.6)"
+        fill="rgba(10,10,14,0.65)"
         listening={false}
       />
       <Text
-        text={`${screen.width}×${screen.height}`}
-        fontSize={10}
+        text={res}
+        fontSize={9.5}
         fontFamily="monospace"
-        fill="rgba(255,255,255,0.7)"
+        fill="rgba(255,255,255,0.68)"
         align="center"
         width={w}
-        y={h - 21}
+        y={Math.max(headerH + 7, h - 21)}
         listening={false}
       />
     </Group>

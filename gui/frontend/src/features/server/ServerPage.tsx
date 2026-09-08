@@ -72,7 +72,7 @@ export default function ServerPage() {
         <header className="mb-10 space-y-2">
           <h1 className="text-2xl font-semibold tracking-tight">Server settings</h1>
           <p className="text-sm text-muted-foreground">
-            How this machine shares its keyboard and mouse, and who may connect to it.
+            How this machine shares its keyboard and mouse — and who may connect to it.
           </p>
         </header>
 
@@ -99,7 +99,8 @@ export default function ServerPage() {
               <div>
                 <div className="text-sm">Only machines in the layout</div>
                 <p className="text-xs text-muted-foreground">
-                  Accept only machines whose name appears in the layout, plus the trusted ids below.
+                  Machines whose name is in the layout can connect; everyone else is refused unless
+                  trusted below.
                 </p>
               </div>
               <Switch checked={network.allowlist} onCheckedChange={(v) => patchNetwork({ allowlist: v })} />
@@ -117,8 +118,8 @@ export default function ServerPage() {
 
         <Section title="Trusted machines" className="mt-12">
           <p className="text-sm text-muted-foreground">
-            A trusted machine may connect even before it appears in the layout. Its id is shown on its own
-            Home page.
+            A trusted machine may connect even before it appears in the layout. You can also trust a machine
+            from its row on the Home page — its id is shown there.
           </p>
           <div className="flex flex-wrap gap-1.5">
             {network.trustedIds.length === 0 && (

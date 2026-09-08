@@ -74,11 +74,11 @@ export default function ClientPage() {
         <header className="mb-10 space-y-2">
           <h1 className="text-2xl font-semibold tracking-tight">Client settings</h1>
           <p className="text-sm text-muted-foreground">
-            Which machine controls this one, and how it connects.
+            How this machine connects to a server, and when it is allowed to.
           </p>
         </header>
 
-        <Section title="Controlled by">
+        <Section title="Server to connect to">
           <div className="grid max-w-lg grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="space-y-1.5">
               <Label htmlFor="addr">Server address</Label>
@@ -90,10 +90,10 @@ export default function ClientPage() {
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="name">Screen name</Label>
+              <Label htmlFor="name">Name on the server</Label>
               <Input
                 id="name"
-                placeholder="hp"
+                placeholder="machine name"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
               />
@@ -117,7 +117,7 @@ export default function ClientPage() {
             <div>
               <div className="text-sm">Connect automatically</div>
               <p className="text-xs text-muted-foreground">
-                Connect to this machine's server whenever it is on the network.
+                Automatically connect to the server above whenever it is on this network.
               </p>
             </div>
             <Switch checked={settings?.autoConnect ?? false} onCheckedChange={(v) => void flip({ autoConnect: v })} />
@@ -127,7 +127,7 @@ export default function ClientPage() {
             <div>
               <div className="text-sm">Accept connection requests</div>
               <p className="text-xs text-muted-foreground">
-                Let a server on the network ask this machine to connect (convenient, less strict).
+                Allow nearby servers to request a connection. Handy for first-time setup.
               </p>
             </div>
             <Switch checked={settings?.acceptPairing ?? false} onCheckedChange={(v) => void flip({ acceptPairing: v })} />

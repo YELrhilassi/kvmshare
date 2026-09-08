@@ -103,6 +103,8 @@ export interface LiveSnapshot {
   clientState: ClientState;
   peers: Peer[];
   clients: ConnectedClient[];
+  /** Machine ids this machine trusts (config ids on a server, trusted-server ids on a client). */
+  trusted: string[];
 }
 
 /** The Wails event object delivered to `Events.On` callbacks. */
@@ -157,7 +159,9 @@ interface GoApp {
   ListClients(): Promise<ConnectedClient[]>;
   ClientCommand(name: string, action: string): Promise<void>;
   TrustClient(id: string): Promise<void>;
+  RevokeClient(id: string): Promise<void>;
   TrustServer(id: string): Promise<void>;
+  RevokeServer(id: string): Promise<void>;
   ConnectToServer(addr: string): Promise<void>;
   SendConnectRequest(peerId: string): Promise<void>;
   ClientStatus(): Promise<ClientState>;
@@ -249,7 +253,9 @@ export const api = (): GoApp => ({
   ListClients: () => call<ConnectedClient[]>("ListClients"),
   ClientCommand: (name, action) => call<void>("ClientCommand", name, action),
   TrustClient: (id) => call<void>("TrustClient", id),
+  RevokeClient: (id) => call<void>("RevokeClient", id),
   TrustServer: (id) => call<void>("TrustServer", id),
+  RevokeServer: (id) => call<void>("RevokeServer", id),
   ConnectToServer: (addr) => call<void>("ConnectToServer", addr),
   SendConnectRequest: (peerId) => call<void>("SendConnectRequest", peerId),
   ClientStatus: () => call<ClientState>("ClientStatus"),

@@ -68,6 +68,11 @@ type Peer struct {
 	Addr   string `json:"addr"` // IP address (without port)
 	Port   int    `json:"port"`
 	Source string `json:"source"` // "broadcast" | "probe" | "discovery" (mDNS)
+	// Active reports whether the peer's advertised role is actually
+	// running there (its GUI is up but no server/client process →
+	// inactive). A machine with all services stopped must not appear as
+	// a live "nearby" machine.
+	Active bool `json:"active"`
 }
 
 // shortID is the human-facing form of a machine id: its first 8 chars.
@@ -101,6 +106,10 @@ type beaconPayload struct {
 	Name string `json:"name"`
 	Role string `json:"role"`
 	Port int    `json:"port"`
+	// Running tells listeners whether the advertised role is actually
+	// running here, so a GUI that is open but not sharing anything never
+	// shows up as a live "nearby" machine.
+	Running bool `json:"running"`
 }
 
 // discovery is the single discovery service instance for the GUI lifetime.
@@ -207,10 +216,11 @@ func (d *discovery) beaconLoop() {
 		case <-ticker.C:
 			s := d.core.GetSettings()
 			payload, _ := json.Marshal(beaconPayload{
-				ID:   d.core.GetMachineId(),
-				Name: hostnameOr("kvmshare"),
-				Role: string(s.Mode),
-				Port: d.core.serverPort(),
+				ID:      d.core.GetMachineId(),
+				Name:    d.core.displayName(),
+				Role:    string(s.Mode),
+				Port:    d.core.serverPort(),
+				Running: d.core.roleActive(string(s.Mode)),
 			})
 			for _, dst := range broadcastAddrs() {
 				_, _ = conn.WriteToUDP(payload, dst)
@@ -360,10 +370,11 @@ func probeTargets() []*net.UDPAddr {
 func (d *discovery) replyProbe(to *net.UDPAddr) {
 	s := d.core.GetSettings()
 	payload, _ := json.Marshal(beaconPayload{
-		ID:   d.core.GetMachineId(),
-		Name: hostnameOr("kvmshare"),
-		Role: string(s.Mode),
-		Port: d.core.serverPort(),
+		ID:      d.core.GetMachineId(),
+		Name:    d.core.displayName(),
+		Role:    string(s.Mode),
+		Port:    d.core.serverPort(),
+		Running: d.core.roleActive(string(s.Mode)),
 	})
 	conn, err := net.DialUDP("udp4", nil, to)
 	if err != nil {
@@ -388,6 +399,7 @@ func (d *discovery) upsertBeacon(bp beaconPayload, from *net.UDPAddr) {
 		Addr:   addr,
 		Port:   bp.Port,
 		Source: "broadcast",
+		Active: bp.Running,
 	}
 	d.seen[bp.ID] = time.Now()
 	d.mu.Unlock()
@@ -452,9 +464,10 @@ func (d *discovery) republish() {
 		port,
 		[]string{
 			"id=" + id,
-			"name=" + hostnameOr("kvmshare"),
+			"name=" + d.core.displayName(),
 			"role=" + string(s.Mode),
 			"port=" + itoa(port),
+			"running=" + strconv.FormatBool(d.core.roleActive(string(s.Mode))),
 		},
 		nil,
 	)
@@ -499,6 +512,7 @@ func (d *discovery) browse() {
 // liveness — broadcast and mDNS have independent lifetimes).
 func (d *discovery) upsertMDNS(e *zeroconf.ServiceEntry) {
 	var id, name, role string
+	var running bool
 	var port = e.Port
 	for _, txt := range e.Text {
 		kv := strings.SplitN(txt, "=", 2)
@@ -512,6 +526,8 @@ func (d *discovery) upsertMDNS(e *zeroconf.ServiceEntry) {
 			name = kv[1]
 		case "role":
 			role = kv[1]
+		case "running":
+			running = kv[1] == "true"
 		case "port":
 			if p, ok := atoi(kv[1]); ok {
 				port = p
@@ -535,7 +551,7 @@ func (d *discovery) upsertMDNS(e *zeroconf.ServiceEntry) {
 		d.mu.Unlock()
 		return
 	}
-	d.peers[id] = &Peer{ID: id, Name: name, Role: role, Addr: addr, Port: port, Source: "discovery"}
+	d.peers[id] = &Peer{ID: id, Name: name, Role: role, Addr: addr, Port: port, Source: "discovery", Active: running}
 	d.seen[id] = time.Now()
 	d.mu.Unlock()
 }
@@ -620,7 +636,7 @@ func (a *App) SendConnectRequest(peerID string) error {
 	req := pairRequest{
 		Cmd:  "connect",
 		ID:   a.GetMachineId(),
-		Name: hostnameOr("kvmshare"),
+		Name: a.displayName(),
 		Addr: net.JoinHostPort(a.primaryLANAddr(), itoa(a.serverPort())),
 	}
 	data, _ := json.Marshal(req)

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
@@ -22,6 +23,22 @@ import (
 
 	"kvmshare/gui/internal/selfupdate"
 )
+
+// createNoWindow makes a spawned console child run without its own
+// console. This GUI is a windowsgui (no console) binary, so a plain
+// spawn of a console tool (netsh, powershell, taskkill) would pop a cmd
+// window for the child's duration — a visible flash at every startup and
+// update. CREATE_NO_WINDOW gives the child no console at all; its
+// stdout/stderr are still captured by the caller.
+const createNoWindow = 0x08000000
+
+// hiddenCmd returns an exec.Cmd that runs `name` without flashing a
+// console window (see createNoWindow).
+func hiddenCmd(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	return cmd
+}
 
 const icoName = "kvmshare.ico"
 
@@ -219,13 +236,13 @@ func EnsureFirewall() error {
 		// Delete first so the rule is recreated with the current program
 		// path after an install moved the binaries; a missing rule is
 		// fine (delete returns non-zero).
-		_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+rule).Run()
+		_ = hiddenCmd("netsh", "advfirewall", "firewall", "delete", "rule", "name="+rule).Run()
 		args := []string{
 			"advfirewall", "firewall", "add", "rule", "name=" + rule,
 			"dir=in", "action=allow", "protocol=udp", "localport=" + p,
 			"profile=private,domain", "enable=yes",
 		}
-		if out, err := exec.Command("netsh", args...).CombinedOutput(); err != nil {
+		if out, err := hiddenCmd("netsh", args...).CombinedOutput(); err != nil {
 			return fmt.Errorf("firewall rule %s: %v: %s", rule, err, strings.TrimSpace(string(out)))
 		}
 	}
@@ -334,7 +351,7 @@ func runPS(script string) error {
 		buf[i*2+1] = byte(r >> 8)
 	}
 	enc := base64.StdEncoding.EncodeToString(buf)
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc)
+	cmd := hiddenCmd("powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("powershell: %v: %s", err, strings.TrimSpace(string(out)))

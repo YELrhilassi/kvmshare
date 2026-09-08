@@ -19,18 +19,31 @@ import (
 )
 
 // CREATE_NEW_PROCESS_GROUP gives the child its own console process
-// group, and HideWindow keeps the console hidden in GUI sessions.
-const createNewProcessGroup = 0x00000200
+// group; CREATE_NO_WINDOW gives it no console at all — this GUI is a
+// windowsgui binary, so a console child (the Rust roles, taskkill)
+// would otherwise flash a cmd window. HideWindow is belt-and-braces.
+const (
+	createNewProcessGroup = 0x00000200
+	createNoWindow        = 0x08000000
+)
 
-// processGroupAttrs puts the spawned child in its own process group.
+// processGroupAttrs puts the spawned child in its own process group
+// with no console window.
 func processGroupAttrs() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{CreationFlags: createNewProcessGroup, HideWindow: true}
+	return &syscall.SysProcAttr{CreationFlags: createNewProcessGroup | createNoWindow, HideWindow: true}
 }
 
 // restartAttrs is like processGroupAttrs (Windows has no sessions); used
 // when the GUI restarts itself into a new version.
 func restartAttrs() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{CreationFlags: createNewProcessGroup, HideWindow: true}
+	return &syscall.SysProcAttr{CreationFlags: createNewProcessGroup | createNoWindow, HideWindow: true}
+}
+
+// hiddenCmd runs a console tool (taskkill) without flashing a window.
+func hiddenCmd(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	return cmd
 }
 
 // No signals on Windows: both the graceful and forced stop map to
@@ -124,7 +137,7 @@ func forceKillPid(pid int) error {
 	if err := terminateProcess(pid); err == nil {
 		return nil
 	}
-	out, err := exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
+	out, err := hiddenCmd("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("taskkill %d: %v (%s)", pid, err, strings.TrimSpace(string(out)))
 	}
@@ -136,7 +149,7 @@ func forceKillPid(pid int) error {
 // locking and writing, or an old binary): the role lock may be held by a
 // process we cannot address by pid, but its name is stable.
 func killRoleByName(bin string) error {
-	out, err := exec.Command("taskkill", "/F", "/IM", bin).CombinedOutput()
+	out, err := hiddenCmd("taskkill", "/F", "/IM", bin).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("taskkill /IM %s: %v (%s)", bin, err, strings.TrimSpace(string(out)))
 	}
