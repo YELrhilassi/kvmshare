@@ -44,11 +44,11 @@ export default function ConnectInfo() {
   };
 
   const idBlurb = isServer
-    ? "Other machines add this to trust your “connect here” requests."
-    : "The server's operator adds this to let this machine connect.";
+    ? "Other machines check this id when you ask them to connect."
+    : "Add this id on the server to let this machine connect.";
 
   return (
-    <Section title={isServer ? "How machines reach this one" : "This machine's identity"}>
+    <Section title={isServer ? "How others connect" : "About this machine"}>
       {isServer ? (
         <div className="space-y-3">
           <div className="space-y-1">
@@ -65,7 +65,7 @@ export default function ConnectInfo() {
       ) : (
         <div className="space-y-3">
           <div className="space-y-1">
-            <div className="text-xs uppercase tracking-wide text-muted-foreground/60">This machine presents itself as</div>
+            <div className="text-xs uppercase tracking-wide text-muted-foreground/60">Shows up on the server as</div>
             <div className="text-lg">
               <span className="font-mono">{clientName || "—"}</span>
             </div>

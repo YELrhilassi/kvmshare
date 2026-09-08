@@ -6,8 +6,8 @@ import { Section } from "@/components/Section";
 // The one place a machine picks its role. The copy is plain language:
 // what the user gets, not what the process is called.
 const OPTIONS: { id: Mode; name: string; what: string }[] = [
-  { id: "server", name: "Server", what: "Share this machine's keyboard and mouse" },
-  { id: "client", name: "Client", what: "Control this machine from another computer" },
+  { id: "server", name: "Server", what: "Shares its keyboard and mouse with other machines" },
+  { id: "client", name: "Client", what: "Lets another machine use its keyboard and mouse" },
 ];
 
 export default function RolePicker() {
@@ -15,7 +15,7 @@ export default function RolePicker() {
   const active = running[mode];
 
   return (
-    <Section title="How this machine is used">
+    <Section title="What is this machine?">
       <div className="grid gap-px overflow-hidden rounded-md border border-border/70 bg-border/70 sm:grid-cols-2">
         {OPTIONS.map((opt) => {
           const on = mode === opt.id;
@@ -45,7 +45,7 @@ export default function RolePicker() {
         })}
       </div>
       <p className="text-xs text-muted-foreground/70">
-        A machine runs as one role at a time — switching stops the running process.
+        One role at a time — switching stops the other.
       </p>
     </Section>
   );

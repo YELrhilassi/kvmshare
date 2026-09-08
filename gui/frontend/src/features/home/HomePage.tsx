@@ -15,7 +15,7 @@ export default function HomePage(_props: { onNavigate: (p: Page) => void }) {
         <header className="mb-12 space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">This machine</h1>
           <p className="text-sm text-muted-foreground">
-            What it is doing right now — and who is on the network.
+            What it's doing right now — and who else is around.
           </p>
         </header>
 
