@@ -235,7 +235,7 @@ func (a *App) SingleInstance() (raised bool, err error) {
 		// write the pid in case it is still starting up.
 		for i := 0; i < 10; i++ {
 			if pid := a.pidFromLock("gui"); pid > 0 {
-				if raiseInstance(pid) == nil {
+				if raiseInstance(pid, a.raiseScope()) == nil {
 					return true, nil
 				}
 				break

@@ -209,8 +209,11 @@ func setupTray(app *application.App, core *App, win *application.WebviewWindow) 
 		// Windows, keep the elevated client's input gate on) with no
 		// tray left to control it. Stop everything first; on a stubborn
 		// process, quit anyway — a background role is better than a GUI
-		// that refuses to leave.
-		_ = core.StopAll()
+		// that refuses to leave. A failed stop is logged, not silently
+		// dropped: the next launch then shows what was left behind.
+		if err := core.StopAll(); err != nil {
+			app.Logger.Warn("tray: quit — could not stop every role process, quitting anyway", "err", err)
+		}
 		app.Quit()
 	})
 	systemTray.SetMenu(menu)

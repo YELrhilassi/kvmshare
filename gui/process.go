@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -90,6 +92,15 @@ func (a *App) roleLockPath(role string) string {
 // the lock file would read back as empty (pid 0) and break stop-by-pid.
 func (a *App) rolePidPath(role string) string {
 	return filepath.Join(a.stateDir, role+".pid")
+}
+
+// raiseScope returns a stable per-install string used to name the
+// "show your window" event between GUI instances (Windows; Unix ignores
+// it). Both instances of the same install (same state dir) compute the
+// same name; a different install or user never collides.
+func (a *App) raiseScope() string {
+	sum := sha256.Sum256([]byte(a.stateDir))
+	return hex.EncodeToString(sum[:6])
 }
 
 // roleActive reports whether a kvmshare process of `role` is running on
