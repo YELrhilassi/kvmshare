@@ -86,16 +86,20 @@ fn admit_unknown_client_keeps_its_id_across_reconnects() {
 }
 
 #[test]
-fn admit_client_scales_reported_physical_pixels_to_logical() {
+fn admit_client_uses_reported_geometry_as_is() {
     let mut s = two_screens();
-    // A 150%-scaled 4K display reports physical pixels; the layout
-    // works in logical ones.
+    // The layout lives in the same space the injector reports and
+    // beacons from (physical pixels on Windows, root pixels on X11 —
+    // the reported scale is informational), so the reported size is
+    // used as-is. Dividing by scale used to shrink the layout below
+    // the real cursor space, which broke boundary arms on scaled
+    // displays.
     let (id, admitted) = s
         .admit_client("hi", kvmshare_protocol::message::ScreenInfo { width: 3840, height: 2160, scale: 1.5 })
         .unwrap();
     assert!(admitted);
-    assert_eq!(s.layout().find(id).unwrap().rect.w, 2560);
-    assert_eq!(s.layout().find(id).unwrap().rect.h, 1440);
+    assert_eq!(s.layout().find(id).unwrap().rect.w, 3840);
+    assert_eq!(s.layout().find(id).unwrap().rect.h, 2160);
 }
 
 #[test]

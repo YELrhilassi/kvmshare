@@ -51,7 +51,26 @@ fn run() -> Result<(), String> {
     // permanently; until then each client is admitted dynamically on
     // its first connect.
     let config_path = args.config.unwrap_or_else(default_config_path);
-    let (cfg, created) = Config::load_or_create(&config_path)?;
+    let (mut cfg, created) = Config::load_or_create(&config_path)?;
+    // The local screen's size is this machine's display, not a choice.
+    // A stale config (an old default, or the display changed) leaves the
+    // boundary walls far from the real cursor space, so the cursor can
+    // never cross to a neighbor. Correct it to the platform's real
+    // geometry and persist, so the GUI's Layout page shows the truth and
+    // the next start agrees. Neighbors placed against the old edges are
+    // shifted to stay adjacent (see Config::correct_local_screen).
+    if cfg.correct_local_screen() {
+        let local = &cfg.screens[0];
+        log_info!(
+            "corrected local screen {:?} to {}x{} from the platform's display geometry (neighbors kept adjacent)",
+            local.name,
+            local.width,
+            local.height
+        );
+        if let Err(e) = cfg.save(&config_path) {
+            log_warn!("could not persist corrected local screen size: {e}");
+        }
+    }
     let port = if args.port != 0 { args.port } else { cfg.port };
     log_info!(
         "layout {} screens (local: {}), listening on :{port}",
@@ -206,8 +225,12 @@ fn auto_config_screen_size(config_path: &PathBuf, name: &str, info: &ScreenInfo)
     if !is_default {
         return Ok(()); // user set a size; keep it
     }
-    let w = (info.width as f32 / info.scale.max(0.1)) as u32;
-    let h = (info.height as f32 / info.scale.max(0.1)) as u32;
+    // Layout coordinates are the same space the client injects into and
+    // beacons from (physical pixels on Windows, root pixels on X11 — the
+    // reported scale is informational), so the reported size is used
+    // as-is.
+    let w = info.width.max(1);
+    let h = info.height.max(1);
     if w < 1 || h < 1 || (w == screen.width && h == screen.height) {
         return Ok(());
     }
