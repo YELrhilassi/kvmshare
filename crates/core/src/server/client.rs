@@ -251,9 +251,12 @@ fn exchange_hello(
     // Allowlist: the name must be in the layout, or the machine id must
     // be trusted (then it is admitted dynamically). Anything else is
     // refused — a client has to be named in the layout first.
+    // Trusted ids may be full 32-char hex or the 8-char short form
+    // (matching by prefix), so a user can paste the short id shown in
+    // the GUI instead of the whole string.
     if ctx.policy.allowlist {
         let named = ctx.session.lock().unwrap().assign_screen_id(&name).is_some();
-        let trusted = ctx.policy.trusted_ids.iter().any(|t| t == &machine_id);
+        let trusted = ctx.policy.trusted_ids.iter().any(|t| id_matches(&machine_id, t));
         if !named && !trusted {
             let _ = transport.send(&Message::Error {
                 code: errors::NOT_ALLOWED,
@@ -278,6 +281,18 @@ fn exchange_hello(
         }
     };
     Ok((id, machine_id, name, info, admitted))
+}
+
+/// Does a machine id match a trusted entry? A trusted entry may be the
+/// full id or its 8-char short form (prefix match). Guards: empty
+/// entries never match; a short form must be at least 4 chars so a
+/// typo'd one-char "trust" cannot silently admit everything starting
+/// with it.
+fn id_matches(id: &str, trusted: &str) -> bool {
+    if trusted.is_empty() || trusted.len() < 4 {
+        return false;
+    }
+    id == trusted || id.starts_with(trusted)
 }
 
 /// Is `addr` (a `peer_addr()` string, possibly with port) on the local

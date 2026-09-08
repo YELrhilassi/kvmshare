@@ -163,10 +163,11 @@ func NewApp() *App {
 		clientLogPath:    filepath.Join(stateDir, "client.log"),
 		instanceLockPath: filepath.Join(stateDir, "gui.lock"),
 		settings: Settings{
-			Mode:       ModeServer,
-			ClientName: hostnameOr("client"),
-			LogLevel:   "info",
-			LogEnabled: true,
+			Mode:          ModeServer,
+			ClientName:    hostnameOr("client"),
+			LogLevel:      "info",
+			LogEnabled:    true,
+			AcceptPairing: true,
 		},
 	}
 	a.loadSettings()
@@ -317,6 +318,12 @@ func (a *App) loadSettings() {
 	}
 	if _, ok := present["logEnabled"]; !ok {
 		s.LogEnabled = true // logging defaults to ON
+	}
+	// Pairing defaults to ON: trust-on-first-use means a discovered
+	// server's request is accepted once and remembered, so "connect
+	// here" works out of the box. The toggle exists for stricter setups.
+	if _, ok := present["acceptPairing"]; !ok {
+		s.AcceptPairing = true
 	}
 	a.settings = s
 }

@@ -67,6 +67,12 @@ func main() {
 	// and the uninstall restores the original policy.
 	core.ensureUacAnswerable()
 
+	// Discovery beacons + pairing ride a UDP port that Windows Firewall
+	// silently drops without an explicit rule (the session port usually
+	// earns one when the server first runs). Open both inbound — the
+	// elevated GUI can — so "on this network" and "connect here" work.
+	core.ensureFirewall()
+
 	assets, err := fs.Sub(dist, "frontend/dist")
 	if err != nil {
 		log.Fatalf("kvmshare: embedded frontend: %v", err)

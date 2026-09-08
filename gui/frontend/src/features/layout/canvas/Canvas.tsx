@@ -291,6 +291,13 @@ function ScreenRect({
   const w = screen.width * MODEL_SCALE;
   const h = screen.height * MODEL_SCALE;
 
+  // The name badge: a dark pill behind the label so it reads against
+  // the dot grid at any zoom. The pill width adapts to the label.
+  const name = screen.name || "screen";
+  const badgeW = Math.min(w - 8, name.length * 8 + 22);
+  const badgeH = 22;
+  const badgeX = (w - badgeW) / 2;
+
   return (
     <Group
       x={x}
@@ -306,34 +313,68 @@ function ScreenRect({
       <Rect
         width={w}
         height={h}
-        cornerRadius={8}
-        fill={own ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.08)"}
-        stroke={selected ? "#fafafa" : own ? "rgba(255,255,255,0.5)" : "rgba(255,255,255,0.28)"}
-        strokeWidth={selected ? 2 : 1}
-        shadowColor="rgba(0,0,0,0.35)"
-        shadowBlur={12}
-        shadowOffsetY={3}
+        cornerRadius={10}
+        fill={own ? "rgba(255,255,255,0.15)" : "rgba(255,255,255,0.09)"}
+        stroke={selected ? "#fafafa" : own ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.3)"}
+        strokeWidth={selected ? 2.5 : 1.25}
+        shadowColor="rgba(0,0,0,0.45)"
+        shadowBlur={16}
+        shadowOffsetY={4}
+      />
+      {/* Name badge: dark pill for contrast over the grid. */}
+      <Rect
+        x={badgeX}
+        y={8}
+        width={badgeW}
+        height={badgeH}
+        cornerRadius={badgeH / 2}
+        fill="rgba(10,10,14,0.75)"
+        listening={false}
       />
       <Text
-        text={screen.name || "screen"}
-        fontSize={12}
-        fontStyle="bold"
-        fill="rgba(255,255,255,0.9)"
+        text={name}
+        fontSize={13}
+        fontStyle="600"
+        fill="rgba(255,255,255,0.95)"
         align="center"
         width={w}
-        y={6}
+        y={9}
+        height={badgeH}
+        verticalAlign="middle"
+        listening={false}
       />
       {own && (
-        <Text text="you" fontSize={9} fontStyle="bold" fill="#000" align="center" width={w} y={22} />
+        <Text
+          text="you"
+          fontSize={9}
+          fontStyle="700"
+          fill="#000"
+          align="center"
+          width={w}
+          y={34}
+          listening={false}
+        />
       )}
+      {/* Resolution: a small dark pill at the bottom, readable against
+          anything behind it. */}
+      <Rect
+        x={(w - 64) / 2}
+        y={h - 22}
+        width={64}
+        height={16}
+        cornerRadius={8}
+        fill="rgba(10,10,14,0.6)"
+        listening={false}
+      />
       <Text
         text={`${screen.width}×${screen.height}`}
-        fontSize={9.5}
+        fontSize={10}
         fontFamily="monospace"
-        fill="rgba(255,255,255,0.5)"
+        fill="rgba(255,255,255,0.7)"
         align="center"
         width={w}
-        y={h - 16}
+        y={h - 21}
+        listening={false}
       />
     </Group>
   );

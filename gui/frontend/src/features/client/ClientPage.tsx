@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Section } from "@/components/Section";
+import { shortID } from "@/lib/utils";
 
 // Client settings: which machine controls this one and how it connects.
 // Live state (nearby servers, the current connection) is on Home — this
@@ -145,7 +146,7 @@ export default function ClientPage() {
                   key={id}
                   className="inline-flex items-center gap-1 rounded-full border border-border/70 px-2 py-0.5 font-mono text-[11px]"
                 >
-                  {id.slice(0, 8)}…
+                  {shortID(id)}
                   <button
                     className="text-muted-foreground/60 hover:text-destructive"
                     onClick={() => void saveTrust((settings?.trustedServers ?? []).filter((t) => t !== id))}
@@ -160,7 +161,7 @@ export default function ClientPage() {
               <Input
                 id="trusted-servers"
                 className="w-64 font-mono"
-                placeholder="paste a server machine id"
+                placeholder="paste a server machine id (short form works)"
                 value={trustInput}
                 onChange={(e) => setTrustInput(e.target.value)}
               />

@@ -512,6 +512,66 @@ fn allowlist_refuses_unknown_and_admits_trusted() {
     assert_eq!(server.client_count(), 1, "trusted client should be admitted");
 }
 
+/// A trusted id may be the 8-char short form (prefix match): the user
+/// pastes the short id shown in the GUI, and the server still admits the
+/// machine whose full id starts with it.
+#[test]
+fn allowlist_admits_by_short_id_prefix() {
+    let session = Session::new(two_screen_layout(), 0);
+    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let full = "70b97d38631dda4b8f6ef627d753022d";
+    let policy = Policy {
+        allowlist: true,
+        local_only: false,
+        trusted_ids: vec![full[..8].to_string()], // short form
+    };
+    let server = Arc::new(
+        Server::with_options(
+            session,
+            0,
+            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+        )
+        .unwrap(),
+    );
+    let port = server.local_addr().unwrap().port();
+    let (input_tx, input_rx) = mpsc::channel::<Message>();
+    let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
+    let clipboard: kvmshare_core::server::ServerClipboard =
+        Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
+    thread::spawn({
+        let server = server.clone();
+        let engine = engine.clone();
+        let clipboard = clipboard.clone();
+        move || {
+            server
+                .run(input_rx, engine, clipboard, Arc::new(kvmshare_core::server::Liveness::default()))
+                .unwrap()
+        }
+    });
+
+    // Full id starts with the trusted 8-char prefix → admitted even
+    // though the name is not in the layout.
+    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "short-id-peer", full, info).unwrap();
+    assert_eq!(client.own_id(), 2);
+    for _ in 0..100 {
+        if server.client_count() >= 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(server.client_count(), 1, "short-id-trusted client should be admitted");
+
+    // A DIFFERENT id sharing only 4 chars of the prefix must NOT be
+    // admitted (the 8-char short form is specific enough).
+    let err = Client::connect(&format!("127.0.0.1:{port}"), "wrong-peer", "70b97dXXffffffffffffffffffffffffff", info)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("rejected"),
+        "id not matching the short prefix should be refused, got: {err}"
+    );
+}
+
 #[test]
 fn config_hot_reload_returns_cursor_home_and_broadcasts() {
     let h = start_server();

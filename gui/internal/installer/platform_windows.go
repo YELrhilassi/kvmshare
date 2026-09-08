@@ -202,6 +202,36 @@ func restoreUacPolicy() error {
 	return nil
 }
 
+// EnsureFirewall opens the ports kvmshare needs inbound on Windows:
+// 24800 (the KVM session) and 24801 (discovery beacons + pairing). The
+// session port usually earns a rule the first time the server runs, but
+// the discovery/pairing UDP port is only touched by the GUI and Windows
+// Firewall often drops its inbound datagrams — which silently kills
+// network discovery and "connect here". Runs elevated (the GUI is), is
+// idempotent (netsh skips existing rules with a warning), and best-
+// effort: a locked-down network that refuses rule creation simply falls
+// back to manual addresses.
+func EnsureFirewall() error {
+	// netsh advfirewall firewall add rule ... is the standard, scriptable
+	// way; it works elevated without extra modules.
+	for _, p := range []string{"24800", "24801"} {
+		rule := fmt.Sprintf("kvmshare UDP %s", p)
+		// Delete first so the rule is recreated with the current program
+		// path after an install moved the binaries; a missing rule is
+		// fine (delete returns non-zero).
+		_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name="+rule).Run()
+		args := []string{
+			"advfirewall", "firewall", "add", "rule", "name=" + rule,
+			"dir=in", "action=allow", "protocol=udp", "localport=" + p,
+			"profile=private,domain", "enable=yes",
+		}
+		if out, err := exec.Command("netsh", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("firewall rule %s: %v: %s", rule, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
 // ensureInputAccess is unsupported on Windows.
 func ensureInputAccess() error { return fmt.Errorf("--input-access is Linux-only") }
 

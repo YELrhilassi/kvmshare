@@ -3,18 +3,30 @@ package main
 // Network discovery: machines running kvmshare on the local network find
 // each other without typing IPs or ports.
 //
-//   - Advertise — this machine announces itself over mDNS/DNS-SD
-//     (`_kvmshare._tcp`) with its machine id, name, role and port, so a
-//     nearby client can find the server and vice versa.
-//   - Browse    — the GUI watches the same service and keeps a live list
-//     of peers (id, name, role, address, port), exposed to the frontend.
-//   - Pairing   — a small UDP command listener on `discoveryPort` lets a
-//     server ask a discovered client to connect: `{"cmd":"connect",...}`.
-//     The client only honors it when the server's id is trusted (or the
-//     user enabled pairing), so a stranger cannot commandeer a machine.
+// Two discovery channels, deliberately:
 //
-// Manual IP:port connection always remains as the fallback — discovery is
-// a convenience on top, never a requirement.
+//   - Broadcast — every 2 s each machine sends a tiny UDP datagram to the
+//     subnet broadcast address (`discoveryPort`): its id, name, role and
+//     port. Broadcast is forwarded by essentially every home/office
+//     router, whereas mDNS multicast is frequently blocked (AP client
+//     isolation, smart-switch filtering). This is the primary channel.
+//   - mDNS     — DNS-SD (`_kvmshare._tcp`) announce + browse, kept as a
+//     second channel for networks where multicast works and broadcast
+//     is filtered (some corporate networks do the opposite). Peers from
+//     either channel land in the same map.
+//
+// Pairing: the same UDP port carries a small command channel. A server
+// operator clicks \"connect here\" on a discovered client, and the client
+// (if it accepts pairing) starts its own client pointed at that server —
+// no mouse-plugging or IP typing on the client machine. Trust is
+// first-use: the first request from a server is accepted and that
+// server's id is remembered, so the second time (and every time after)
+// it is already trusted. The user can disable pairing entirely in
+// Client settings (acceptPairing off + no trusted servers → strangers'
+// requests are dropped silently).
+//
+// Manual IP:port connection always remains as the fallback — discovery
+// is a convenience on top, never a requirement.
 
 import (
 	"context"
@@ -34,10 +46,15 @@ import (
 // The mDNS service type all kvmshare machines share.
 const discoveryService = "_kvmshare._tcp"
 
-// discoveryPort carries pairing commands (UDP). Deliberately the KVM port
-// plus one, and independent of the KVM port itself: pairing must work
-// whether or not a role is currently running.
+// discoveryPort carries discovery beacons and pairing commands (UDP).
+// Deliberately the KVM port plus one, and independent of the KVM port
+// itself: discovery must work whether or not a role is currently running.
 const discoveryPort = defaultPort + 1
+
+// How often a beacon is broadcast, and how long a peer may go silent
+// before it is dropped from the list.
+const beaconInterval = 2 * time.Second
+const peerTTL = 6 * time.Second
 
 // A machine seen on the local network.
 type Peer struct {
@@ -46,47 +63,249 @@ type Peer struct {
 	Role   string `json:"role"` // "server" | "client"
 	Addr   string `json:"addr"` // IP address (without port)
 	Port   int    `json:"port"`
-	Source string `json:"source"` // "discovery" (mDNS) — room for more later
+	Source string `json:"source"` // "broadcast" | "discovery" (mDNS)
 }
 
-// discovery is the single mDNS service instance for the GUI lifetime.
+// shortID is the human-facing form of a machine id: its first 8 chars.
+// Trusted-id entries accept this short form (prefix match on both the
+// Go side and the Rust server), so users never type 32 hex chars.
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// idTrusted reports whether `id` is in a trusted list (full ids or
+// short prefixes, minimum 4 chars so a typo can't trust everything).
+func idTrusted(trusted []string, id string) bool {
+	for _, t := range trusted {
+		t = strings.TrimSpace(t)
+		if len(t) < 4 {
+			continue
+		}
+		if id == t || strings.HasPrefix(id, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// The beacon payload sent on the wire (JSON, one line).
+type beaconPayload struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Role string `json:"role"`
+	Port int    `json:"port"`
+}
+
+// discovery is the single discovery service instance for the GUI lifetime.
 type discovery struct {
 	core *App
 
 	mu    sync.Mutex
-	peers map[string]*Peer // keyed by machine id
+	peers map[string]*Peer  // keyed by machine id
+	seen  map[string]time.Time // last beacon heard per id (liveness)
 
 	reg    *zeroconf.Server
 	cancel context.CancelFunc
 
-	// listenConn is the UDP socket that receives pairing commands.
+	// beaconConn sends broadcasts; listenConn receives beacons and
+	// pairing commands on the same port.
 	listenConn *net.UDPConn
 	started    sync.Once
-	// active is true once start() ran — mDNS sockets are only touched
-	// after that (tests that never start discovery must not block on
-	// multicast).
-	active atomic.Bool
-	stop    chan struct{}
+	active     atomic.Bool
+	stop       chan struct{}
 }
 
 func newDiscovery(core *App) *discovery {
-	return &discovery{core: core, peers: map[string]*Peer{}, stop: make(chan struct{})}
+	return &discovery{
+		core:  core,
+		peers: map[string]*Peer{},
+		seen:  map[string]time.Time{},
+		stop:  make(chan struct{}),
+	}
 }
 
-// start launches advertise + browse + the pairing listener. Safe to call
-// once (a later mode change just re-advertises).
+// start launches beaconing, the receiver, and (best-effort) mDNS.
+// Safe to call once; a later mode change just re-advertises.
 func (d *discovery) start() {
 	d.started.Do(func() {
 		d.active.Store(true)
-		go d.listenPairing()
-		go d.browse()
+		go d.beaconLoop()
+		go d.listen()
+		go d.browse() // mDNS: best-effort second channel
 		d.republish()
 	})
 }
 
-// republish (re)advertises this machine under the *current* mode. Called
-// at startup and whenever the role selection changes, so a machine that
-// switches server ↔ client is always discoverable under the right role.
+// ---------------------------------------------------------------------------
+// Broadcast channel
+// ---------------------------------------------------------------------------
+
+// broadcastAddr returns the destination(s) for beacons: the limited
+// broadcast plus this machine's subnet broadcast (some routers only
+// forward the subnet-directed form).
+func broadcastAddrs() []*net.UDPAddr {
+	out := []*net.UDPAddr{{IP: net.IPv4bcast, Port: discoveryPort}}
+	// Subnet-directed broadcast per interface, derived from the address
+	// with a /24 mask (the overwhelmingly common home/office case).
+	ifs, _ := net.Interfaces()
+	for _, ifc := range ifs {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipn.IP.To4()
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			bcast := net.IPv4(ip[0], ip[1], ip[2], 255)
+			out = append(out, &net.UDPAddr{IP: bcast, Port: discoveryPort})
+		}
+	}
+	return out
+}
+
+// beaconLoop broadcasts this machine's presence every beaconInterval.
+func (d *discovery) beaconLoop() {
+	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4bcast, Port: discoveryPort})
+	if err != nil {
+		return // no network — discovery is best-effort
+	}
+	defer conn.Close()
+	// Sending to a broadcast address needs SO_BROADCAST; net.DialUDP
+	// sets it for the limited broadcast, but ensure it for the
+	// subnet-directed forms too via the socket option on the raw fd.
+	if raw, err := conn.SyscallConn(); err == nil {
+		_ = raw.Control(func(fd uintptr) {
+			_ = setBroadcast(fd)
+		})
+	}
+
+	ticker := time.NewTicker(beaconInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-ticker.C:
+			s := d.core.GetSettings()
+			payload, _ := json.Marshal(beaconPayload{
+				ID:   d.core.GetMachineId(),
+				Name: hostnameOr("kvmshare"),
+				Role: string(s.Mode),
+				Port: d.core.serverPort(),
+			})
+			for _, dst := range broadcastAddrs() {
+				_, _ = conn.WriteToUDP(payload, dst)
+			}
+		}
+	}
+}
+
+// listen receives beacons (→ peer list) and pairing commands on the
+// same UDP port.
+func (d *discovery) listen() {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: discoveryPort})
+	if err != nil {
+		return // port busy — discovery is best-effort
+	}
+	d.mu.Lock()
+	d.listenConn = conn
+	d.mu.Unlock()
+
+	buf := make([]byte, 2048)
+	for {
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		d.handleDatagram(buf[:n], from)
+	}
+}
+
+// handleDatagram classifies one datagram: a pairing command has a
+// `cmd` field, a beacon does not — a pairing request also carries `id`,
+// so the beacon shape (id + role + port) alone cannot tell them apart
+// (this very ambiguity used to swallow "connect here" requests as
+// beacons).
+func (d *discovery) handleDatagram(data []byte, from *net.UDPAddr) {
+	var probe struct {
+		Cmd string `json:"cmd"`
+	}
+	if json.Unmarshal(data, &probe) == nil && probe.Cmd != "" {
+		d.handlePairing(data, from)
+		return
+	}
+	var bp beaconPayload
+	if json.Unmarshal(data, &bp) == nil && bp.ID != "" {
+		d.upsertBeacon(bp, from)
+	}
+}
+
+// upsertBeacon records a peer from a broadcast beacon and stamps its
+// liveness.
+func (d *discovery) upsertBeacon(bp beaconPayload, from *net.UDPAddr) {
+	if bp.ID == d.core.GetMachineId() {
+		return // our own echo
+	}
+	addr := from.IP.String()
+	d.mu.Lock()
+	d.peers[bp.ID] = &Peer{
+		ID:     bp.ID,
+		Name:   bp.Name,
+		Role:   bp.Role,
+		Addr:   addr,
+		Port:   bp.Port,
+		Source: "broadcast",
+	}
+	d.seen[bp.ID] = time.Now()
+	d.mu.Unlock()
+}
+
+// expire drops broadcast peers that went silent (their beacons stopped).
+// mDNS peers are handled by the library's own TTL; here we only age the
+// broadcast channel.
+func (d *discovery) expire() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cutoff := time.Now().Add(-peerTTL)
+	for id, p := range d.peers {
+		if p.Source != "broadcast" {
+			continue
+		}
+		if last, ok := d.seen[id]; ok && last.Before(cutoff) {
+			delete(d.peers, id)
+			delete(d.seen, id)
+		}
+	}
+}
+
+// list returns the current peers for the frontend.
+func (d *discovery) list() []Peer {
+	d.expire()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]Peer, 0, len(d.peers))
+	for _, p := range d.peers {
+		out = append(out, *p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// mDNS channel (secondary, best-effort)
+// ---------------------------------------------------------------------------
+
+// republish (re)advertises this machine over mDNS under the *current*
+// mode. Called at startup and on role changes.
 func (d *discovery) republish() {
 	if !d.active.Load() {
 		return
@@ -98,37 +317,30 @@ func (d *discovery) republish() {
 		d.reg = nil
 	}
 	s := d.core.GetSettings()
-	role := string(s.Mode)
 	port := d.core.serverPort()
-	host := hostnameOr("kvmshare")
-
-	// Keep the machine id stable across re-publishes.
 	id := d.core.GetMachineId()
 
 	reg, err := zeroconf.Register(
-		"kvmshare-"+id, // unique instance name
+		"kvmshare-"+id,
 		discoveryService,
 		"local.",
 		port,
 		[]string{
 			"id=" + id,
-			"name=" + host,
-			"role=" + role,
+			"name=" + hostnameOr("kvmshare"),
+			"role=" + string(s.Mode),
 			"port=" + itoa(port),
 		},
 		nil,
 	)
 	if err != nil {
-		// No multicast interface — discovery is best-effort; the GUI
-		// still works via manual addresses.
 		d.reg = nil
 		return
 	}
 	d.reg = reg
 }
 
-// browse runs until `stop`; it maintains the peer map. Peers that stop
-// announcing are dropped after `peerTTL` of silence.
+// browse runs until `stop`, maintaining the peer map from mDNS.
 func (d *discovery) browse() {
 	ctx, cancel := context.WithCancel(context.Background())
 	d.mu.Lock()
@@ -144,8 +356,6 @@ func (d *discovery) browse() {
 		_ = resolver.Browse(ctx, discoveryService, "local.", entries)
 	}()
 
-	ticker := time.NewTicker(peerTTL)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-d.stop:
@@ -155,15 +365,14 @@ func (d *discovery) browse() {
 			if !ok {
 				continue
 			}
-			d.upsert(e)
-		case <-ticker.C:
-			d.expire()
+			d.upsertMDNS(e)
 		}
 	}
 }
 
-// upsert records one mDNS announcement.
-func (d *discovery) upsert(e *zeroconf.ServiceEntry) {
+// upsertMDNS records one mDNS announcement (does not touch broadcast
+// liveness — broadcast and mDNS have independent lifetimes).
+func (d *discovery) upsertMDNS(e *zeroconf.ServiceEntry) {
 	var id, name, role string
 	var port = e.Port
 	for _, txt := range e.Text {
@@ -184,7 +393,6 @@ func (d *discovery) upsert(e *zeroconf.ServiceEntry) {
 			}
 		}
 	}
-	// Ignore our own announcement (mDNS echo) and unparsed entries.
 	if id == "" || id == d.core.GetMachineId() {
 		return
 	}
@@ -195,31 +403,14 @@ func (d *discovery) upsert(e *zeroconf.ServiceEntry) {
 		addr = e.AddrIPv6[0].String()
 	}
 	d.mu.Lock()
+	// mDNS wins on fields it knows, but must not resurrect a peer the
+	// broadcast channel has declared dead — the peer map is shared.
+	if existing, ok := d.peers[id]; ok && existing.Source == "broadcast" && time.Since(d.seen[id]) > peerTTL {
+		d.mu.Unlock()
+		return
+	}
 	d.peers[id] = &Peer{ID: id, Name: name, Role: role, Addr: addr, Port: port, Source: "discovery"}
 	d.mu.Unlock()
-}
-
-// expire drops peers not heard from within peerTTL.
-func (d *discovery) expire() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	// The zeroconf library renews entries it is actively watching; we
-	// track liveness via the service cache instead — entries that stop
-	// announcing are removed by the library itself on TTL expiry, so
-	// this map needs no age-based sweep. Keep the hook for clarity.
-	_ = d.peers
-}
-
-// list returns the current peers, newest first, for the frontend.
-func (d *discovery) list() []Peer {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	out := make([]Peer, 0, len(d.peers))
-	for _, p := range d.peers {
-		out = append(out, *p)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }
 
 // DiscoverPeers exposes the live peer list to the frontend. Always
@@ -231,40 +422,16 @@ func (a *App) DiscoverPeers() []Peer {
 	return a.disc.list()
 }
 
-// listenPairing receives `{"cmd":"connect",...}` datagrams. A server
-// operator clicks "connect" on a discovered client in their GUI; that
-// machine's GUI, if it trusts the server (or the user enabled pairing),
-// starts its client pointed at that server — no mouse-plugging or IP
-// typing on the client machine.
-func (d *discovery) listenPairing() {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: discoveryPort})
-	if err != nil {
-		// Port busy (another GUI instance) — pairing is best-effort.
-		return
-	}
-	d.mu.Lock()
-	d.listenConn = conn
-	d.mu.Unlock()
-	buf := make([]byte, 1024)
-	for {
-		n, from, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			if d.core != nil {
-				return
-			}
-			continue
-		}
-		d.handlePairing(buf[:n], from)
-	}
-}
+// ---------------------------------------------------------------------------
+// Pairing commands
+// ---------------------------------------------------------------------------
 
 // A pairing request from a server.
 type pairRequest struct {
-	Cmd    string `json:"cmd"`    // "connect"
-	ID     string `json:"id"`     // server machine id
-	Name   string `json:"name"`   // server machine name
-	Addr   string `json:"addr"`   // server address host:port
-	Source string `json:"source"` // how it reached us
+	Cmd  string `json:"cmd"`  // "connect"
+	ID   string `json:"id"`   // server machine id
+	Name string `json:"name"` // server machine name
+	Addr string `json:"addr"` // server address host:port
 }
 
 func (d *discovery) handlePairing(data []byte, from *net.UDPAddr) {
@@ -272,55 +439,44 @@ func (d *discovery) handlePairing(data []byte, from *net.UDPAddr) {
 	if json.Unmarshal(data, &req) != nil || req.Cmd != "connect" || req.ID == "" {
 		return
 	}
-	req.Source = from.IP.String()
+	// A datagram could have been forged; the sender's address is the
+	// one we trust for routing (the payload addr is a hint only).
+	req.Addr = net.JoinHostPort(from.IP.String(), itoa(reqPort(req.Addr)))
 
-	// Security: only honor pairing from a server we trust, or when the
-	// user enabled "accept pairing requests". A stranger's datagram is
-	// dropped silently (it could be anyone on the LAN).
-	trusted := d.core.settingsTrustsServer(req.ID)
-	accept := d.core.settingsPairingEnabled()
-	if !trusted && !accept {
+	// Trust on first use: honor the request when the server is trusted
+	// OR pairing is enabled. When honored, remember the server's id so
+	// the next request is already trusted (and auto-connect sees it).
+	if !idTrusted(d.core.GetSettings().TrustedServers, req.ID) && !d.core.settingsPairingEnabled() {
 		return
 	}
-	// Trusted (or allowed): connect to the server. If a client is
-	// already running it reconnects on its own; starting is idempotent.
-	addr := req.Addr
-	if addr == "" && req.Source != "" {
-		addr = net.JoinHostPort(req.Source, itoa(discoveryPort))
+	if !idTrusted(d.core.GetSettings().TrustedServers, req.ID) {
+		_ = d.core.TrustServer(req.ID)
 	}
-	if addr == "" {
-		return
-	}
-	d.core.ConnectToServer(addr)
+	_ = d.core.ConnectToServer(req.Addr)
 }
 
-// settingsTrustsServer reports whether the given server id is in the
-// GUI's trusted-servers list.
-func (a *App) settingsTrustsServer(id string) bool {
-	for _, t := range a.GetSettings().TrustedServers {
-		if t == id {
-			return true
+// reqPort extracts the port from an addr hint (host:port), defaulting
+// to discoveryPort (the sender of a pairing command is a GUI, which
+// listens there — the KVM port is only for actual sessions).
+func reqPort(addr string) int {
+	if i := strings.LastIndex(addr, ":"); i > 0 {
+		if p, err := strconv.Atoi(addr[i+1:]); err == nil && p > 0 {
+			return p
 		}
 	}
-	return false
+	return discoveryPort
 }
 
-// settingsPairingEnabled reports the pairing toggle (client accepts
-// connection requests from any local server).
-func (a *App) settingsPairingEnabled() bool {
-	return a.GetSettings().AcceptPairing
-}
-
-// SendConnectRequest asks a discovered client (identified by its mDNS
-// id/address) to connect to this machine's server. Used from the server
-// page: pick a nearby machine, tell it to connect here.
+// SendConnectRequest asks a discovered client (identified by its id) to
+// connect to this machine's server. Used from the server's Home page:
+// pick a nearby machine, tell it to connect here.
 func (a *App) SendConnectRequest(peerID string) error {
 	if a.disc == nil {
 		return fmt.Errorf("discovery not started")
 	}
 	var target *Peer
 	for _, p := range a.disc.list() {
-		if p.ID == peerID {
+		if p.ID == peerID || shortID(p.ID) == peerID {
 			target = &p
 			break
 		}
@@ -343,6 +499,12 @@ func (a *App) SendConnectRequest(peerID string) error {
 	data, _ := json.Marshal(req)
 	_, err = conn.Write(data)
 	return err
+}
+
+// settingsPairingEnabled reports the pairing toggle (client accepts
+// connection requests from any local server on first use).
+func (a *App) settingsPairingEnabled() bool {
+	return a.GetSettings().AcceptPairing
 }
 
 // primaryLANAddr returns this machine's first private IPv4 address (used
@@ -383,6 +545,3 @@ func atoi(s string) (int, bool) {
 	n, err := strconv.Atoi(s)
 	return n, err == nil
 }
-
-// peerTTL bounds how long a vanished peer lingers in the map.
-const peerTTL = 15 * time.Second

@@ -4,7 +4,7 @@ import { api, type ConnectedClient, type Peer, type Settings } from "@/lib/bridg
 import { DEFAULT_PORT } from "@/lib/constants";
 import { Button } from "@/components/ui/button";
 import { Section } from "@/components/Section";
-import { cn } from "@/lib/utils";
+import { cn, shortID } from "@/lib/utils";
 
 // The live half of the dashboard. A server shows who is connected and
 // lets the operator control those machines; a client shows its REAL
@@ -92,7 +92,7 @@ export default function LiveOverview() {
                   <div className="min-w-0">
                     <div className="text-sm font-medium">{c.name}</div>
                     <div className="font-mono text-[11px] text-muted-foreground/60">
-                      {c.addr} · id {c.id.slice(0, 8)}…
+                      {c.addr} · id {shortID(c.id)}
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
@@ -133,7 +133,7 @@ export default function LiveOverview() {
                 <div className="min-w-0">
                   <div className="text-sm font-medium">{p.name}</div>
                   <div className="font-mono text-[11px] text-muted-foreground/60">
-                    {p.addr}:{p.port || DEFAULT_PORT} · id {p.id.slice(0, 8)}…
+                    {p.addr}:{p.port || DEFAULT_PORT} · id {shortID(p.id)}
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
