@@ -96,6 +96,39 @@ export interface ClientState {
   server: string;
 }
 
+export interface LiveSnapshot {
+  mode: Mode;
+  running: { server: boolean; client: boolean };
+  clientState: ClientState;
+  peers: Peer[];
+  clients: ConnectedClient[];
+}
+
+/** The Wails event object delivered to `Events.On` callbacks. */
+interface WailsEvent<T> {
+  name: string;
+  data: T;
+}
+
+const stateEventName = "kvmshare:state";
+
+// Subscribe to the backend's live-state stream. The backend emits a
+// `kvmshare:state` snapshot only when something actually changed, so the
+// page renders real transitions without polling the bridge. Returns an
+// unsubscribe function.
+export function onState(cb: (s: LiveSnapshot) => void): () => void {
+  let disposed = false;
+  void runtime().then(() => {
+    if (disposed) return;
+    const ev = window.wails?.Events;
+    if (!ev?.On) return;
+    ev.On(stateEventName, (e: WailsEvent<LiveSnapshot>) => cb(e.data));
+  });
+  return () => {
+    disposed = true;
+  };
+}
+
 interface GoApp {
   GetSettings(): Promise<Settings>;
   SetSettings(s: Settings): Promise<void>;
@@ -133,10 +166,15 @@ interface WailsCall {
   ByName(method: string, ...args: unknown[]): Promise<unknown>;
 }
 
+interface WailsEvents {
+  On<T>(name: string, cb: (e: WailsEvent<T>) => void): void;
+  Off(name: string): void;
+}
+
 declare global {
   interface Window {
     /** Wails v3 runtime, injected into the page at startup. */
-    wails?: { Call: WailsCall };
+    wails?: { Call: WailsCall; Events: WailsEvents };
   }
 }
 

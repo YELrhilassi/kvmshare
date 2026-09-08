@@ -27,6 +27,8 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
 // Mode is what this machine does in the KVM.
@@ -102,6 +104,14 @@ type App struct {
 	notify *notify
 	// Network discovery (mDNS advertise + browse + pairing listener).
 	disc *discovery
+
+	// Live-state events: the Wails event manager (attached once the
+	// application exists), the last snapshot JSON emitted (dedupe), and
+	// the loop's once-guard.
+	events    *application.EventManager
+	stateMu   sync.Mutex
+	lastState string
+	stateOnce sync.Once
 }
 
 // NewApp locates every file the GUI needs.

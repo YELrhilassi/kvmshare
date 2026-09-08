@@ -1,67 +1,20 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useApp } from "@/app/AppProvider";
-import { api, type ConnectedClient, type Peer, type Settings } from "@/lib/bridge";
+import { api } from "@/lib/bridge";
 import { DEFAULT_PORT } from "@/lib/constants";
 import { Button } from "@/components/ui/button";
 import { Section } from "@/components/Section";
-import { cn, shortID } from "@/lib/utils";
+import { shortID } from "@/lib/utils";
 
-// The live half of the dashboard. A server shows who is connected and
-// lets the operator control those machines; a client shows its REAL
-// connection state (from client.state) and which servers are nearby.
-// Nothing here is configuration — that lives on the config pages.
-
-function ConnectionLine({
-  status,
-  server,
-}: {
-  status: "connected" | "connecting" | "disconnected";
-  server: string;
-}) {
-  const label =
-    status === "connected" ? "Connected" : status === "connecting" ? "Connecting…" : "Not connected";
-  return (
-    <div className="flex items-center gap-3 py-3">
-      <span
-        className={cn(
-          "h-2 w-2 rounded-full",
-          status === "connected" ? "bg-emerald-500" : status === "connecting" ? "bg-amber-500" : "bg-muted-foreground/40",
-        )}
-      />
-      <div className="min-w-0">
-        <div className="text-sm font-medium">{label}</div>
-        {server && <div className="font-mono text-[11px] text-muted-foreground/60">to {server}</div>}
-      </div>
-    </div>
-  );
-}
+// The live half of the dashboard, fed entirely by the backend's event
+// stream (no polling). A server sees who is connected and can control
+// those machines; a client sees which servers are nearby. The single
+// status + start/stop control lives in ShareStatus — nothing here
+// repeats it.
 
 export default function LiveOverview() {
-  const { mode, clientState } = useApp();
-  const [clients, setClients] = useState<ConnectedClient[]>([]);
-  const [peers, setPeers] = useState<Peer[]>([]);
-  const [settings, setSettings] = useState<Settings | null>(null);
+  const { mode, clients, peers } = useApp();
   const [err, setErr] = useState("");
-
-  useEffect(() => {
-    const tick = () => {
-      void api()
-        .ListClients()
-        .then(setClients)
-        .catch(() => {});
-      void api()
-        .DiscoverPeers()
-        .then(setPeers)
-        .catch(() => {});
-      void api()
-        .GetSettings()
-        .then(setSettings)
-        .catch(() => {});
-    };
-    void tick();
-    const id = setInterval(tick, 2000);
-    return () => clearInterval(id);
-  }, []);
 
   const act = async (fn: () => Promise<unknown>) => {
     setErr("");
@@ -78,7 +31,7 @@ export default function LiveOverview() {
 
   return (
     <div className="grid gap-x-16 gap-y-12 lg:grid-cols-2">
-      {isServer ? (
+      {isServer && (
         <Section title="Connected machines">
           {clients.length === 0 ? (
             <p className="text-sm text-muted-foreground">
@@ -108,15 +61,6 @@ export default function LiveOverview() {
             </div>
           )}
           {err && <p className="mt-2 text-xs text-destructive">{err}</p>}
-        </Section>
-      ) : (
-        <Section title="Connection">
-          <ConnectionLine status={clientState.status} server={clientState.server || settings?.clientAddr || ""} />
-          <p className="text-sm text-muted-foreground">
-            {clientState.status === "connected"
-              ? "This machine is being controlled from the server."
-              : "Start the client from here when a server is ready."}
-          </p>
         </Section>
       )}
 

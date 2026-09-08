@@ -51,10 +51,14 @@ const discoveryService = "_kvmshare._tcp"
 // itself: discovery must work whether or not a role is currently running.
 const discoveryPort = defaultPort + 1
 
-// How often a beacon is broadcast, and how long a peer may go silent
-// before it is dropped from the list.
+// How often a beacon is broadcast, how often the subnet is probed over
+// unicast, and how long a peer may go silent before it is dropped.
+// peerTTL comfortably exceeds the probe interval: on networks where
+// broadcast/multicast is filtered, the unicast probe reply is the only
+// signal keeping the peer alive.
 const beaconInterval = 2 * time.Second
-const peerTTL = 6 * time.Second
+const probeInterval = 10 * time.Second
+const peerTTL = 15 * time.Second
 
 // A machine seen on the local network.
 type Peer struct {
@@ -63,7 +67,7 @@ type Peer struct {
 	Role   string `json:"role"` // "server" | "client"
 	Addr   string `json:"addr"` // IP address (without port)
 	Port   int    `json:"port"`
-	Source string `json:"source"` // "broadcast" | "discovery" (mDNS)
+	Source string `json:"source"` // "broadcast" | "probe" | "discovery" (mDNS)
 }
 
 // shortID is the human-facing form of a machine id: its first 8 chars.
@@ -127,14 +131,16 @@ func newDiscovery(core *App) *discovery {
 	}
 }
 
-// start launches beaconing, the receiver, and (best-effort) mDNS.
-// Safe to call once; a later mode change just re-advertises.
+// start launches beaconing, the receiver, the unicast subnet probe, and
+// (best-effort) mDNS. Safe to call once; a later mode change just
+// re-advertises.
 func (d *discovery) start() {
 	d.started.Do(func() {
 		d.active.Store(true)
 		go d.beaconLoop()
 		go d.listen()
-		go d.browse() // mDNS: best-effort second channel
+		go d.probeLoop() // unicast fallback where broadcast/multicast is filtered
+		go d.browse()    // mDNS: best-effort second channel
 		d.republish()
 	})
 }
@@ -174,14 +180,18 @@ func broadcastAddrs() []*net.UDPAddr {
 
 // beaconLoop broadcasts this machine's presence every beaconInterval.
 func (d *discovery) beaconLoop() {
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4bcast, Port: discoveryPort})
+	// An UNCONNECTED socket: each beacon goes to every broadcast
+	// destination (limited + subnet-directed). A dialed (connected)
+	// socket can only ever reach its single dialed address, and
+	// WriteToUDP on it fails with "use of WriteTo with pre-connected
+	// connection" — which used to silently kill every beacon, leaving
+	// discovery empty on networks where mDNS multicast is filtered.
+	conn, err := net.ListenUDP("udp4", nil)
 	if err != nil {
 		return // no network — discovery is best-effort
 	}
 	defer conn.Close()
-	// Sending to a broadcast address needs SO_BROADCAST; net.DialUDP
-	// sets it for the limited broadcast, but ensure it for the
-	// subnet-directed forms too via the socket option on the raw fd.
+	// Sending to broadcast addresses needs SO_BROADCAST.
 	if raw, err := conn.SyscallConn(); err == nil {
 		_ = raw.Control(func(fd uintptr) {
 			_ = setBroadcast(fd)
@@ -230,23 +240,137 @@ func (d *discovery) listen() {
 	}
 }
 
-// handleDatagram classifies one datagram: a pairing command has a
-// `cmd` field, a beacon does not — a pairing request also carries `id`,
-// so the beacon shape (id + role + port) alone cannot tell them apart
-// (this very ambiguity used to swallow "connect here" requests as
-// beacons).
+// handleDatagram classifies one datagram by its `cmd` field — pairing
+// requests ("connect") and subnet probes ("probe") carry one, beacons
+// do not. A pairing request also carries `id`, so the beacon shape
+// (id + role + port) alone cannot tell them apart (this very ambiguity
+// used to swallow "connect here" requests as beacons).
 func (d *discovery) handleDatagram(data []byte, from *net.UDPAddr) {
 	var probe struct {
 		Cmd string `json:"cmd"`
 	}
-	if json.Unmarshal(data, &probe) == nil && probe.Cmd != "" {
-		d.handlePairing(data, from)
-		return
+	if json.Unmarshal(data, &probe) == nil {
+		switch probe.Cmd {
+		case "connect":
+			d.handlePairing(data, from)
+			return
+		case "probe":
+			d.replyProbe(from)
+			return
+		}
 	}
 	var bp beaconPayload
 	if json.Unmarshal(data, &bp) == nil && bp.ID != "" {
 		d.upsertBeacon(bp, from)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Unicast probe channel (fallback for filtered broadcast/multicast)
+// ---------------------------------------------------------------------------
+
+// probeLoop sends a "who is kvmshare here?" datagram to every host on
+// the local subnets once per probeInterval. Machines reply with a
+// regular beacon over unicast, which the listener records — so discovery
+// works even on networks (AP client isolation, smart switches) that
+// silently drop both broadcast and multicast. Costs a few tiny UDP
+// packets per subnet per interval; hosts that never run kvmshare stay
+// silent and cost nothing.
+func (d *discovery) probeLoop() {
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-ticker.C:
+			d.probeOnce()
+		}
+	}
+}
+
+// probeOnce pings every candidate host from the shared listener socket,
+// so replies arrive on the same socket the listener already reads.
+func (d *discovery) probeOnce() {
+	d.mu.Lock()
+	conn := d.listenConn
+	d.mu.Unlock()
+	if conn == nil {
+		return // listener not up yet — try on the next interval
+	}
+	payload, _ := json.Marshal(struct {
+		Cmd string `json:"cmd"`
+		ID  string `json:"id"`
+	}{Cmd: "probe", ID: d.core.GetMachineId()})
+	for _, dst := range probeTargets() {
+		_, _ = conn.WriteToUDP(payload, dst)
+	}
+}
+
+// probeTargets lists every candidate host on this machine's /24 subnets
+// (all hosts minus ourselves and the broadcast addresses). Only /24
+// subnets are probed — the sweep stays at 254 packets per interval, and
+// anything larger is left to the broadcast/mDNS channels (and manual
+// addresses). The limited broadcast and each subnet's directed
+// broadcast are covered by the beacon channel instead.
+func probeTargets() []*net.UDPAddr {
+	var out []*net.UDPAddr
+	seen := map[string]bool{}
+	ifs, _ := net.Interfaces()
+	for _, ifc := range ifs {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipn.IP.To4()
+			if ip == nil {
+				continue
+			}
+			ones, bits := ipn.Mask.Size()
+			if bits != 32 || ones != 24 {
+				continue
+			}
+			for i := 1; i < 255; i++ { // skip network (.0) and broadcast (.255)
+				cand := net.IPv4(ip[0], ip[1], ip[2], byte(i))
+				if cand.Equal(ip) {
+					continue // ourselves
+				}
+				key := cand.String()
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				out = append(out, &net.UDPAddr{IP: cand, Port: discoveryPort})
+			}
+		}
+	}
+	return out
+}
+
+// replyProbe answers a "who is kvmshare here?" probe with a normal
+// beacon, unicast straight back to the prober.
+func (d *discovery) replyProbe(to *net.UDPAddr) {
+	s := d.core.GetSettings()
+	payload, _ := json.Marshal(beaconPayload{
+		ID:   d.core.GetMachineId(),
+		Name: hostnameOr("kvmshare"),
+		Role: string(s.Mode),
+		Port: d.core.serverPort(),
+	})
+	conn, err := net.DialUDP("udp4", nil, to)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_, _ = conn.Write(payload)
 }
 
 // upsertBeacon records a peer from a broadcast beacon and stamps its
@@ -269,15 +393,16 @@ func (d *discovery) upsertBeacon(bp beaconPayload, from *net.UDPAddr) {
 	d.mu.Unlock()
 }
 
-// expire drops broadcast peers that went silent (their beacons stopped).
-// mDNS peers are handled by the library's own TTL; here we only age the
-// broadcast channel.
+// expire drops peers that went silent (their beacons or probe replies
+// stopped). mDNS peers are handled by the library's own TTL and are
+// left alone; broadcast and probe peers are refreshed by our own
+// packets and aged here.
 func (d *discovery) expire() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	cutoff := time.Now().Add(-peerTTL)
 	for id, p := range d.peers {
-		if p.Source != "broadcast" {
+		if p.Source == "discovery" {
 			continue
 		}
 		if last, ok := d.seen[id]; ok && last.Before(cutoff) {
@@ -404,12 +529,14 @@ func (d *discovery) upsertMDNS(e *zeroconf.ServiceEntry) {
 	}
 	d.mu.Lock()
 	// mDNS wins on fields it knows, but must not resurrect a peer the
-	// broadcast channel has declared dead — the peer map is shared.
-	if existing, ok := d.peers[id]; ok && existing.Source == "broadcast" && time.Since(d.seen[id]) > peerTTL {
+	// broadcast/probe channels have declared dead — the peer map is
+	// shared.
+	if existing, ok := d.peers[id]; ok && existing.Source != "discovery" && time.Since(d.seen[id]) > peerTTL {
 		d.mu.Unlock()
 		return
 	}
 	d.peers[id] = &Peer{ID: id, Name: name, Role: role, Addr: addr, Port: port, Source: "discovery"}
+	d.seen[id] = time.Now()
 	d.mu.Unlock()
 }
 
