@@ -102,25 +102,42 @@ func (a *App) TrustServer(id string) error {
 	return nil
 }
 
+// autoConnectBlocked reports whether auto-connect must stay quiet right
+// now. It is checked at the top of each tick AND again immediately
+// before connecting, because the decision goes stale fast: the user can
+// switch modes or start a role while the peer scan runs. In particular
+// a RUNNING SERVER blocks auto-connect: connecting as a client would
+// stop it (one role per machine), so "switch to server, click share"
+// could otherwise end with the fresh server killed and the machine
+// reconnecting as a client a moment later — the user's explicit choice
+// must always win over convenience.
+func (a *App) autoConnectBlocked() bool {
+	s := a.GetSettings()
+	if s.Mode != ModeClient || !s.AutoConnect {
+		return true
+	}
+	// A role is running locally — a client (already connected) or a
+	// server (explicitly shared). Auto-connecting over either would
+	// fight the user.
+	return a.ClientRunning() || a.ServerRunning()
+}
+
 // AutoConnectLoop watches discovery: when auto-connect is on, a client
 // that is not running connects to a trusted server (or the last used
 // server) as soon as it appears. Cheap: it only acts on a *transition*
-// (server newly seen), so it never fights the user's manual start/stop.
+// (server newly seen), and it never fights the user — see
+// autoConnectBlocked.
 func (a *App) AutoConnectLoop() {
 	go func() {
 		var lastSeen map[string]bool // peer id -> present
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			s := a.GetSettings()
-			if s.Mode != ModeClient || !s.AutoConnect {
+			if a.autoConnectBlocked() {
 				lastSeen = nil
 				continue
 			}
-			if a.ClientRunning() {
-				lastSeen = nil // already connected — re-arm on next gap
-				continue
-			}
+			s := a.GetSettings()
 			peers := a.DiscoverPeers()
 			now := map[string]bool{}
 			for _, p := range peers {
@@ -132,6 +149,11 @@ func (a *App) AutoConnectLoop() {
 					continue // seen before; don't re-trigger
 				}
 				if idTrusted(s.TrustedServers, p.ID) || a.peerMatchesClientAddr(p) {
+					// The scan takes time; re-validate so a mode switch
+					// or an explicit start that happened meanwhile wins.
+					if a.autoConnectBlocked() {
+						break
+					}
 					addr := fmt.Sprintf("%s:%d", p.Addr, portOrDefault(p.Port))
 					_ = a.ConnectToServer(addr)
 					break

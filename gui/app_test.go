@@ -318,6 +318,65 @@ func TestSetSettingsWithDiscoveryDoesNotDeadlock(t *testing.T) {
 	}
 }
 
+// Auto-connect must never act over a running role: connecting as a
+// client stops the local server (one role per machine), so "switch to
+// server, click share" used to end with the fresh server killed and
+// the machine reconnecting as a client a moment later. A running
+// server (or client) blocks auto-connect; stopping it re-allows it.
+func TestAutoConnectBlockedByRunningRole(t *testing.T) {
+	a, _ := newTestApp(t)
+	s := a.GetSettings()
+	s.Mode = ModeClient
+	s.AutoConnect = true
+	s.ClientAddr = "192.168.1.86:24800"
+	if err := a.SetSettings(s); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing running locally → auto-connect is allowed.
+	if a.autoConnectBlocked() {
+		t.Fatal("auto-connect should be allowed when nothing runs locally")
+	}
+	// A running client → blocked (already connected).
+	if _, err := a.ClientStart(); err != nil {
+		t.Fatal(err)
+	}
+	if !a.autoConnectBlocked() {
+		t.Fatal("auto-connect must not run over a running client")
+	}
+	if err := a.ClientStop(); err != nil {
+		t.Fatal(err)
+	}
+	if a.autoConnectBlocked() {
+		t.Fatal("auto-connect should be allowed again after the client stops")
+	}
+
+	// A running server (explicitly shared) → blocked: auto-connecting
+	// would stop the server and reconnect this machine as a client.
+	if _, err := a.ServerStart(); err != nil {
+		t.Fatal(err)
+	}
+	if !a.autoConnectBlocked() {
+		t.Fatal("auto-connect must not run over a running server")
+	}
+	if err := a.ServerStop(); err != nil {
+		t.Fatal(err)
+	}
+	if a.autoConnectBlocked() {
+		t.Fatal("auto-connect should be allowed again after the server stops")
+	}
+
+	// Auto-connect only applies in client mode with the flag on.
+	s2 := a.GetSettings()
+	s2.Mode = ModeServer
+	if err := a.SetSettings(s2); err != nil {
+		t.Fatal(err)
+	}
+	if !a.autoConnectBlocked() {
+		t.Fatal("auto-connect must never run in server mode")
+	}
+}
+
 // The client's real connection state comes from client.state (written by
 // the Rust client). Missing file means "disconnected".
 func TestClientStatusReadsStateFile(t *testing.T) {
