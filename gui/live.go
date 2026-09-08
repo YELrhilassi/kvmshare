@@ -37,8 +37,10 @@ type runningSnapshot struct {
 // LiveSnapshot is the whole live picture the Home dashboard renders.
 // A single JSON blob means the page can never show torn state (e.g.
 // "connected" from one source while "not running" from another).
+// ClientName lets the client status say "connected to pc, as hp".
 type LiveSnapshot struct {
 	Mode        Mode              `json:"mode"`
+	ClientName  string            `json:"clientName"`
 	Running     runningSnapshot   `json:"running"`
 	ClientState ClientState       `json:"clientState"`
 	Peers       []Peer            `json:"peers"`
@@ -52,12 +54,14 @@ type LiveSnapshot struct {
 func (a *App) snapshot() LiveSnapshot {
 	a.mu.Lock()
 	mode := a.settings.Mode
+	clientName := a.settings.ClientName
 	server := a.serverProc.running() || a.roleActive(roleServer)
 	client := a.clientProc.running() || a.roleActive(roleClient)
 	a.mu.Unlock()
 
 	return LiveSnapshot{
 		Mode:        mode,
+		ClientName:  clientName,
 		Running:     runningSnapshot{Server: server, Client: client},
 		ClientState: a.ClientStatus(),
 		Peers:       a.DiscoverPeers(),

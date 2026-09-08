@@ -8,6 +8,8 @@ export interface RunningStatus {
 
 interface AppContextValue {
   mode: Mode;
+  /** The name this machine presents to servers ("as hp"). */
+  clientName: string;
   /** Persist a role switch and update the store. */
   setMode: (m: Mode) => Promise<void>;
   running: RunningStatus;
@@ -29,6 +31,7 @@ const AppContext = createContext<AppContextValue | null>(null);
 // feedback after a click; steady state is pure events.
 export function AppProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<Mode>("server");
+  const [clientName, setClientName] = useState("");
   const [running, setRunning] = useState<RunningStatus>({ server: false, client: false });
   const [clientState, setClientState] = useState<ClientState>({ status: "disconnected", server: "" });
   const [clients, setClients] = useState<ConnectedClient[]>([]);
@@ -60,6 +63,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const off = onState((s) => {
       if (!alive) return;
       setModeState(s.mode);
+      setClientName(s.clientName);
       setRunning(s.running);
       setClientState(s.clientState);
       setClients(s.clients);
@@ -86,8 +90,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ mode, setMode, running, clientState, clients, peers, refresh }),
-    [mode, setMode, running, clientState, clients, peers, refresh],
+    () => ({ mode, clientName, setMode, running, clientState, clients, peers, refresh }),
+    [mode, clientName, setMode, running, clientState, clients, peers, refresh],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

@@ -98,6 +98,7 @@ export interface ClientState {
 
 export interface LiveSnapshot {
   mode: Mode;
+  clientName: string;
   running: { server: boolean; client: boolean };
   clientState: ClientState;
   peers: Peer[];
@@ -171,11 +172,26 @@ interface WailsEvents {
   Off(name: string): void;
 }
 
+interface WailsClipboard {
+  SetText(text: string): Promise<void>;
+}
+
 declare global {
   interface Window {
     /** Wails v3 runtime, injected into the page at startup. */
-    wails?: { Call: WailsCall; Events: WailsEvents };
+    wails?: { Call: WailsCall; Events: WailsEvents; Clipboard: WailsClipboard };
   }
+}
+
+// Copy text to the system clipboard — via the Wails runtime when
+// present, with a DOM fallback for browser development.
+export async function copyText(text: string): Promise<void> {
+  const clip = window.wails?.Clipboard;
+  if (clip?.SetText) {
+    await clip.SetText(text);
+    return;
+  }
+  await navigator.clipboard.writeText(text);
 }
 
 // The full runtime is served by the app at /wails/runtime.js; pages are
