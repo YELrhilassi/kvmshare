@@ -211,11 +211,15 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
 
     let cc = calls(&client_calls);
     assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
-    // Entry point is hp's right edge inset 48 px past the seam
-    // (1871, 540); the server also sends an absolute move for the entry
-    // position. (The inset stops the seam-jitter bounce: an entry exactly
-    // on the wall makes the first beacon a park, which re-crosses.)
-    assert!(cc.iter().any(|c| c == "move 1871,540"), "client should move to entry point, got {cc:?}");
+    // Entry point is hp's right edge inset past the seam
+    // (1919 - ENTRY_INSET, 540); the server also sends an absolute move
+    // for the entry position. (The inset stops the seam-jitter bounce: an
+    // entry exactly on the wall makes the first beacon a park, which
+    // re-crosses.)
+    assert!(
+        cc.iter().any(|c| c == "move 1895,540"),
+        "client should move to entry point, got {cc:?}"
+    );
 
     let ec = calls(&h.engine_calls);
     assert!(ec.iter().any(|c| c == "cursor false"), "server should hide its cursor, got {ec:?}");
@@ -251,7 +255,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     assert_eq!(rel_x, -100, "motion must deliver the full -100 px command, got {cc:?}");
     assert_eq!(rel_y, 0, "no motion outside the command axis, got {cc:?}");
     assert!(
-        cc.iter().all(|c| !c.starts_with("move ") || c == "move 1871,540"),
+        cc.iter().all(|c| !c.starts_with("move ") || c == "move 1895,540"),
         "only the entry move may be absolute, got {cc:?}"
     );
 
@@ -268,7 +272,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     // The client's real cursor must be pinned on the shared edge (its
     // right edge) for a crossing; first push moves it there, then the
     // next outward push (a frame later, as in real use) crosses. The
-    // entry point sits 48 px inside hp, so the roam must cover that
+    // entry point sits inset inside hp, so the roam must cover that
     // ground before the cursor can park on the wall.
     feed(&h, Message::MouseMoveRel { dx: 250, dy: 0 }); // roam back to the right wall
     feed(&h, Message::MouseMoveRel { dx: 10, dy: 0 }); // keep pushing: cross home
@@ -335,8 +339,8 @@ fn client_reconnect_is_not_deafened_by_stale_udp_sequences() {
     assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
     assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
 
-    // Cross back: push the real cursor across the 48 px entry inset to
-    // the shared edge; its (fresh) beacons arm it and the outward push
+    // Cross back: push the real cursor across the entry inset to the
+    // shared edge; its (fresh) beacons arm it and the outward push
     // fires the crossing.
     feed(&h, Message::MouseMoveRel { dx: 100, dy: 0 });
 
@@ -407,7 +411,7 @@ fn crossing_after_idle_is_not_dropped_by_the_beacon_watchdog() {
     // Now it beacons normally and must stay alive: a wedge drop would
     // restore the local cursor.
     for _ in 0..10 {
-        udp_sock.send(&udp::pack(id, 1, &Message::CursorPos { x: 1871, y: 540 })).unwrap();
+        udp_sock.send(&udp::pack(id, 1, &Message::CursorPos { x: 1895, y: 540 })).unwrap();
         thread::sleep(Duration::from_millis(100));
     }
     assert!(
@@ -603,4 +607,82 @@ fn config_hot_reload_returns_cursor_home_and_broadcasts() {
 
     // hp was dropped from the layout, so it must be unregistered.
     assert_eq!(h.server.client_count(), 0, "stale client should be dropped after reload");
+}
+
+#[test]
+fn duplicate_connection_replaces_stale_one_without_losing_the_live_client() {
+    // The shape of a reconnect race: a machine reconnects before the
+    // server noticed the old socket's death (or a second instance
+    // bypassed the role lock). Both connections carry the same name, so
+    // both get the same screen id. The fresh connection must become the
+    // registered one, and the stale connection's eventual teardown must
+    // NOT unregister the live client — otherwise the server forgets a
+    // connected machine: the GUI flips it to "nearby", crossing stops
+    // routing, while the client keeps its (working) session.
+    let h = start_server();
+
+    // First connection (the one that will turn stale). It must survive
+    // long enough to be replaced, so the client object stays alive on a
+    // thread; a channel lets the test close it (drop) at the right
+    // moment. Its session is never run — the server-side reader only
+    // needs the TCP connection to exist, then to see it close.
+    let (client1, _inj1, _calls1, _out1) = connect_client(h.port);
+    let (close1_tx, close1_rx) = mpsc::channel::<()>();
+    let handle1 = thread::spawn(move || {
+        let _ = close1_rx.recv(); // wait for the signal, then drop (close TCP)
+        drop(client1);
+    });
+    h.wait_for_clients(1);
+
+    // Second connection, same machine name → same screen id. The fresh
+    // one replaces the stale registration (the map holds exactly one).
+    let (client2, injector2, client_calls2, out_rx2) = connect_client(h.port);
+    let handle2 = thread::spawn(move || client2.run(Box::new(injector2), Box::new(NoClipboard), &out_rx2).unwrap());
+    h.wait_for_clients(1);
+    assert_eq!(h.server.client_count(), 1, "duplicate connection must replace, not stack");
+
+    // Kill the STALE connection: its TCP closes, and its server-side
+    // reader runs teardown — which must be a no-op for the live
+    // registration (the identity check). Without the fix, this teardown
+    // unregisters the live client and the server forgets it: the GUI
+    // would flip it to "nearby" and crossings would stop routing.
+    close1_tx.send(()).unwrap();
+    let _ = handle1.join();
+    thread::sleep(Duration::from_millis(100)); // let the reader's EOF land
+    assert_eq!(
+        h.server.client_count(),
+        1,
+        "stale connection's teardown must not evict the live replacement"
+    );
+
+    // The live (replacement) client must still be serviced: a crossing
+    // reaches it and it reports home again.
+    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+    let cc = calls(&client_calls2);
+    assert!(cc.contains(&"enter".to_string()), "live client should still receive crossings, got {cc:?}");
+    assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
+
+    // Cross back, then end the live session via the server's disconnect
+    // control (the client ends its session; the reader then finishes).
+    feed(&h, Message::MouseMoveRel { dx: 100, dy: 0 });
+    let mut cc = calls(&client_calls2);
+    for _ in 0..50 {
+        if cc.contains(&"leave".to_string()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+        cc = calls(&client_calls2);
+    }
+    assert!(cc.contains(&"leave".to_string()), "live client should cross back, got {cc:?}");
+
+    h.control_tx.send(Control::ClientCommand { name: "hp".into(), command: kvmshare_protocol::id::control::DISCONNECT }).unwrap();
+    let _ = handle2.join();
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 0);
 }

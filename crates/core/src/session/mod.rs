@@ -114,6 +114,16 @@ pub struct Session {
     /// removed) — so a Layout-page edit is authoritative, and a dynamic
     /// client never flaps on an unrelated reload.
     dynamic: Vec<Screen>,
+    /// The ids of client screens whose client is **connected right now**
+    /// (see [`Session::on_client_connected`]). A crossing may only enter
+    /// a screen with a live client: crossing into an empty slot would
+    /// arm the engine's isolation and hide the local cursor with nothing
+    /// on the other side to return control to — the machine would sit
+    /// input-locked until the escape key, and every beacon watchdog
+    /// would trip on a stream that cannot exist. A configured screen
+    /// with its client offline is therefore a dead edge, exactly like a
+    /// desktop edge with no neighbor.
+    connected: std::collections::HashSet<u8>,
 }
 
 impl Session {
@@ -134,6 +144,7 @@ impl Session {
             gain: 1.0,
             gain_rem: (0.0, 0.0),
             dynamic: Vec::new(),
+            connected: std::collections::HashSet::new(),
         }
     }
 
@@ -265,14 +276,32 @@ impl Session {
         }
     }
 
-    /// A client with the given id disconnected while active: drop back to
-    /// the local screen.
+    /// A client with the given id finished its handshake and is now a
+    /// live peer: crossings may enter its screen. Called once per
+    /// connection, after the client is registered server-side, so a
+    /// crossing can never race ahead of the registration (its `Enter`
+    /// would be dropped and the cursor stranded on a dead screen).
+    pub fn on_client_connected(&mut self, id: u8) {
+        self.connected.insert(id);
+    }
+
+    /// A client with the given id disconnected: drop back to the local
+    /// screen if the cursor was on it, and make its screen a dead edge
+    /// again (no crossing may enter a screen whose client is gone).
     pub fn on_client_disconnected(&mut self, id: u8) -> Action {
+        self.connected.remove(&id);
         if self.cursor.mode == Mode::Remote(id) {
             self.force_local()
         } else {
             Action::Nothing
         }
+    }
+
+    /// May the cursor enter screen `id`? The local screen always; a
+    /// remote screen only while its client is connected (see the
+    /// [`Session::connected`] docs).
+    fn reachable(&self, id: u8) -> bool {
+        id == 0 || self.connected.contains(&id)
     }
 
     #[cfg(test)]

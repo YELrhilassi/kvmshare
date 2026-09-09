@@ -4,20 +4,25 @@
 //! same [`Engine`]/[`Injector`] contracts, the same canonical HID key
 //! model, the same message flow:
 //!
-//! * [`capture::InputCapture`] — a hidden message-only window registered
-//!   for **Raw Input** (`RIDEV_INPUTSINK`), forwarding hardware mouse
-//!   deltas, buttons, wheel and key transitions as protocol [`Message`]s
-//!   on a background thread.
+//! * [`capture`] — a hidden message-only window plus **low-level hooks**
+//!   (`WH_MOUSE_LL` / `WH_KEYBOARD_LL`) on the capture thread,
+//!   forwarding mouse deltas, buttons, wheel and key transitions as
+//!   protocol [`Message`]s. The same hooks provide the server's
+//!   isolation: while the cursor is on a client they swallow every
+//!   event (the local desktop is inert) while still capturing — the
+//!   one mechanism that does both, because the hook procedures see
+//!   every event even when they swallow it.
 //! * [`engine::Win32Engine`] — the server's control of its own screen:
-//!   `SetCursorPos` warp, `ShowCursor` hide/show, clipboard.
+//!   `SetCursorPos` warp, `ShowCursor` hide/show. Isolation is a plain
+//!   atomic flag shared with the capture (see its module docs).
 //! * [`injector::Win32Injector`] — the client's control of its own
 //!   screen: `SetCursorPos` moves, `SendInput` injection of
 //!   buttons/keys/wheel (scan-code mode — layout independent), clipboard.
 //!
 //! The engine and injector use *programmatic* cursor warps only, which
-//! never generate raw input — so the server's park/warp can't feed
-//! phantom motion into the session, exactly like the X11 raw-event
-//! design.
+//! never generate hook events or raw input — so the server's park/warp
+//! can't feed phantom motion into the session, exactly like the X11
+//! raw-event design.
 
 mod buttons;
 mod capture;
@@ -67,11 +72,51 @@ pub fn secure_desktop_active() -> bool {
     isolation::secure_desktop_active()
 }
 
+/// Whether this process is on the interactive window station (the
+/// real user desktop). A server or client started from a background
+/// context — an SSH session, a scheduled task, a service — runs on a
+/// non-interactive window station whose "display" is a virtual
+/// 1024x768 surface with no user behind it. Geometry reported there is
+/// meaningless (worse: persisting it as a config "correction" would
+/// clobber the real display size), and raw input / injection cannot
+/// reach a real desktop anyway.
+fn on_interactive_window_station() -> bool {
+    use windows_sys::Win32::System::StationsAndDesktops as sd;
+    use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+    // SAFETY: GetProcessWindowStation returns the process's own window
+    // station handle (never invalid); GetUserObjectInformationW writes
+    // one USEROBJECTFLAGS into `flags`, which outlives the call.
+    unsafe {
+        let h = sd::GetProcessWindowStation();
+        if h.is_null() {
+            return false;
+        }
+        let mut flags: sd::USEROBJECTFLAGS = std::mem::zeroed();
+        let mut needed: u32 = 0;
+        let ok = sd::GetUserObjectInformationW(
+            h,
+            sd::UOI_FLAGS,
+            &mut flags as *mut sd::USEROBJECTFLAGS as *mut core::ffi::c_void,
+            std::mem::size_of::<sd::USEROBJECTFLAGS>() as u32,
+            &mut needed,
+        );
+        ok != 0 && flags.dwFlags & wm::WSF_VISIBLE as u32 != 0
+    }
+}
+
 /// The primary display's real geometry (physical pixels + DPI scale),
 /// used to build machine-accurate default layouts on first run. This
 /// process is per-monitor DPI aware (see [`set_dpi_aware`]), so the
 /// metrics are physical — same space [`injector`] reports.
+///
+/// Returns `None` when no real desktop is reachable: a non-interactive
+/// session (SSH, scheduled task, service) has no user display, and
+/// reporting its virtual geometry would let the server persist a bogus
+/// "correction" over the user's real config.
 pub fn primary_display() -> Option<kvmshare_protocol::message::ScreenInfo> {
+    if !on_interactive_window_station() {
+        return None;
+    }
     Some(injector::system_screen_info())
 }
 
@@ -123,8 +168,8 @@ impl Server {
         // in milliseconds, and Windows' coarse default timer would turn
         // them into ~15 ms clumps (see [`timer`]).
         timer::HighResTimer::engage_forever();
-        let (input, capture_tick) = capture::start()?;
-        let engine = Box::new(engine::Win32Engine::new());
+        let (input, capture_tick, isolate) = capture::start()?;
+        let engine = Box::new(engine::Win32Engine::new(isolate));
         let clipboard: Box<dyn kvmshare_core::client::Clipboard> = Box::new(clipboard::Clipboard::new());
         let liveness = Arc::new(Liveness { capture_tick_ms: capture_tick, ..Default::default() });
         Ok(Self { input, engine, clipboard, liveness })

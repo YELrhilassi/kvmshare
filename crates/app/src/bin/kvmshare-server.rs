@@ -207,11 +207,22 @@ fn persist_clients(state_dir: &PathBuf, clients: &std::collections::HashMap<Stri
 /// Correct a screen's configured size to the size a client just reported
 /// (logical pixels = physical ÷ scale).
 ///
-/// Only touches `width`/`height` of the matching screen — and only when
-/// the entry still carries the 1080p default (a size the user typed in
-/// is respected). Positions, names and the network section are never
-/// touched, so the user's layout decisions are preserved; the hot-reload
-/// watcher picks the corrected sizes up live.
+/// The reported size is ground truth: the client injects into and
+/// beacons from its own physical display, and the crossing math is only
+/// right when the layout matches it. The live session already adopts
+/// the report unconditionally on connect and on every resolution change
+/// (`Session::update_screen_info`); this keeps the persisted file in
+/// step so the GUI's Layout page shows reality and the next start agrees
+/// from the first second. A size that came from a *previous* client
+/// report — a phantom from an older, broken build (a root window
+/// stretched over a disconnected monitor, e.g. 3840×1080) — is exactly
+/// what must be corrected, so there is no "user-typed" exception: the
+/// live layout would override it anyway on the next connect.
+///
+/// Only touches `width`/`height` of the matching screen. Positions,
+/// names and the network section are never touched, so the user's
+/// layout decisions are preserved; the hot-reload watcher picks the
+/// corrected sizes up live.
 fn auto_config_screen_size(config_path: &PathBuf, name: &str, info: &ScreenInfo) -> Result<(), String> {
     let mut cfg = match Config::load(config_path) {
         Ok(c) => c,
@@ -220,19 +231,14 @@ fn auto_config_screen_size(config_path: &PathBuf, name: &str, info: &ScreenInfo)
     let Some(screen) = cfg.screens.iter_mut().find(|s| s.name == name) else {
         return Ok(()); // not a configured screen — nothing to correct
     };
-    let is_default = screen.width == kvmshare_app::DEFAULT_SCREEN_W
-        && screen.height == kvmshare_app::DEFAULT_SCREEN_H;
-    if !is_default {
-        return Ok(()); // user set a size; keep it
-    }
     // Layout coordinates are the same space the client injects into and
     // beacons from (physical pixels on Windows, root pixels on X11 — the
     // reported scale is informational), so the reported size is used
     // as-is.
     let w = info.width.max(1);
     let h = info.height.max(1);
-    if w < 1 || h < 1 || (w == screen.width && h == screen.height) {
-        return Ok(());
+    if (w == screen.width && h == screen.height) {
+        return Ok(()); // already correct
     }
     screen.width = w;
     screen.height = h;

@@ -214,11 +214,31 @@ func (a *App) stopRoleLocked(role string) error {
 	if a.roleActive(role) {
 		return fmt.Errorf("could not stop the running %s (pid %d): it is still holding its lock", role, a.pidFromLock(role))
 	}
-	// The client's state file must not outlive the process: a stale
-	// "connected" file would make the Home page claim a connection that
-	// does not exist. The next start writes it fresh again.
+	// The role's live-state files must not outlive the process:
+	//
+	//   - client: a stale "connected" file would make the Home page
+	//     claim a connection that does not exist. The next start writes
+	//     it fresh again.
+	//   - server: `clients.json` is written by the server's event sink,
+	//     which dies with the server process — a stale list would show
+	//     the GUI's "connected to you" badge for machines that are no
+	//     longer connected (ghost clients). A fresh server re-persists
+	//     the real list on its first lifecycle event, so removing here
+	//     is safe and makes the stopped state truthful immediately.
 	if role == roleClient {
 		_ = os.Remove(filepath.Join(a.stateDir, "client.state"))
+	} else {
+		// A stopped server must leave no trace of its session behind:
+		// the connected-client list (written by the server's event sink,
+		// which dies with the process — a stale list would show ghost
+		// "connected to you" badges) and any queued client commands (the
+		// server reads `server.cmd` after truncating it, so commands a
+		// stopped server never consumed would replay against a fresh
+		// client on the next start — disconnecting a machine nobody asked
+		// to disconnect). A fresh server re-persists the real list and
+		// sees an empty command file.
+		_ = os.Remove(filepath.Join(a.stateDir, "clients.json"))
+		_ = os.Remove(filepath.Join(a.stateDir, "server.cmd"))
 	}
 	return nil
 }

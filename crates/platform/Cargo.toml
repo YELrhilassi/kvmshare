@@ -11,7 +11,7 @@ kvmshare-protocol = { workspace = true }
 kvmshare-log = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", features = ["allow-unsafe-code", "xinput", "xfixes", "xtest"] }
+x11rb = { version = "0.13", features = ["randr", "allow-unsafe-code", "xinput", "xfixes", "xtest"] }
 arboard = "3.4"
 evdev = "0.13"
 libc = "0.2"

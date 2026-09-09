@@ -73,8 +73,12 @@ pub const EDGE_PUSH_FALLBACK: Duration = Duration::from_millis(150);
 /// [`ENTRY_INSET`] px away from the seam, so a resting or jittering
 /// cursor can never bounce while a real push-through still works. It
 /// also stops the reverse bounce — coming home to a cursor sitting
-/// exactly on the wall.
-pub const ENTRY_INSET: i32 = 48;
+/// exactly on the wall. Sized just past the wall band plus comfortable
+/// slack: large enough that a resting or jittering cursor can never
+/// bounce, small enough that entry feels like landing on the seam (a
+/// 48 px inset read as "the cursor landed further from the edge than
+/// where I crossed").
+pub const ENTRY_INSET: i32 = 24;
 
 /// How old a client cursor-position beacon may be and still be treated
 /// as the real cursor's location. Beacons arrive every few ms while the

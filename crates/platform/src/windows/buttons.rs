@@ -84,26 +84,26 @@ pub fn wheel_data(dx: i32, dy: i32) -> u32 {
     (delta * wm::WHEEL_DELTA as i32) as u32
 }
 
-/// Raw-input button flags → (canonical button, pressed) events.
-/// A single raw event may contain several transitions; each is reported
-/// separately. `RI_MOUSE_WHEEL`/`RI_MOUSE_HWHEEL` are handled by the
-/// caller (they carry data, not a button state).
-pub fn from_raw_flags(flags: u16) -> Vec<(u8, bool)> {
-    let mut out = Vec::with_capacity(2);
-    let mut push = |down: u16, up: u16, canon: u8| {
-        if flags & down != 0 {
-            out.push((canon, true));
+/// Low-level-hook button messages (`wParam`) → (canonical button,
+/// pressed). Extra buttons carry their identity in the high word of
+/// `mouse_data` (`XBUTTON1` / `XBUTTON2`). Wheel messages are handled by
+/// the caller (they carry data, not a button state).
+pub fn from_wparam(msg: u32, mouse_data: u32) -> Option<(u8, bool)> {
+    match msg {
+        wm::WM_LBUTTONDOWN => Some((buttons::LEFT, true)),
+        wm::WM_LBUTTONUP => Some((buttons::LEFT, false)),
+        wm::WM_RBUTTONDOWN => Some((buttons::RIGHT, true)),
+        wm::WM_RBUTTONUP => Some((buttons::RIGHT, false)),
+        wm::WM_MBUTTONDOWN => Some((buttons::MIDDLE, true)),
+        wm::WM_MBUTTONUP => Some((buttons::MIDDLE, false)),
+        wm::WM_XBUTTONDOWN | wm::WM_XBUTTONUP => {
+            let pressed = msg == wm::WM_XBUTTONDOWN;
+            let which = (mouse_data >> 16) & 0xFFFF;
+            let button = if which == wm::XBUTTON1 as u32 { buttons::EXTRA_1 } else { buttons::EXTRA_2 };
+            Some((button, pressed))
         }
-        if flags & up != 0 {
-            out.push((canon, false));
-        }
-    };
-    push(wm::RI_MOUSE_LEFT_BUTTON_DOWN as u16, wm::RI_MOUSE_LEFT_BUTTON_UP as u16, buttons::LEFT);
-    push(wm::RI_MOUSE_RIGHT_BUTTON_DOWN as u16, wm::RI_MOUSE_RIGHT_BUTTON_UP as u16, buttons::RIGHT);
-    push(wm::RI_MOUSE_MIDDLE_BUTTON_DOWN as u16, wm::RI_MOUSE_MIDDLE_BUTTON_UP as u16, buttons::MIDDLE);
-    push(wm::RI_MOUSE_BUTTON_4_DOWN as u16, wm::RI_MOUSE_BUTTON_4_UP as u16, buttons::EXTRA_1);
-    push(wm::RI_MOUSE_BUTTON_5_DOWN as u16, wm::RI_MOUSE_BUTTON_5_UP as u16, buttons::EXTRA_2);
-    out
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -213,12 +213,17 @@ impl Session {
     /// clamped).
     fn switch_out(&mut self, dir: Direction) -> Vec<Action> {
         match self.layout.neighbor(0, dir, self.cursor.x, self.cursor.y) {
-            Some((id, x, y)) => {
+            // Only a screen with a live client is a destination — a
+            // configured-but-offline client is a dead edge (see the
+            // [`Session::connected`] docs): crossing into it would arm
+            // the engine's isolation with nothing on the other side to
+            // return control to.
+            Some((id, x, y)) if self.reachable(id) => {
                 let (x, y) = self.inset_entry(id, dir, x, y);
                 self.enter_screen(id, x, y);
                 vec![Action::SwitchTo { to: id, x, y }]
             }
-            None => vec![], // dead edge: stay
+            _ => vec![], // dead edge: stay
         }
     }
 
@@ -376,7 +381,9 @@ impl Session {
     /// past the seam — see [`ENTRY_INSET`]).
     fn cross_from_remote(&mut self, id: u8, dir: Direction) -> Vec<Action> {
         match self.layout.neighbor(id, dir, self.cursor.x, self.cursor.y) {
-            Some((next, x, y)) => {
+            // Home is always reachable; another client only while it is
+            // connected (see the [`Session::connected`] docs).
+            Some((next, x, y)) if self.reachable(next) => {
                 let (x, y) = self.inset_entry(next, dir, x, y);
                 self.enter_screen(next, x, y);
                 if next == 0 {
@@ -385,7 +392,7 @@ impl Session {
                     vec![Action::SwitchTo { to: next, x, y }]
                 }
             }
-            None => vec![], // outer edge of the desktop: stay
+            _ => vec![], // outer edge of the desktop: stay
         }
     }
 

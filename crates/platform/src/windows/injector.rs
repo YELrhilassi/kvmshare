@@ -1,6 +1,9 @@
 //! The client's control over its own screen: move the cursor, inject
-//! buttons/keys/wheel, hide the local cursor while being controlled,
-//! read/write the clipboard. Implements [`Injector`] from the core crate.
+//! buttons/keys/wheel, read/write the clipboard. Implements [`Injector`]
+//! from the core crate. The local cursor stays **visible** while being
+//! controlled: it *is* the shared cursor (the server hides its own
+//! while the cursor is away, so hiding the client's too would leave no
+//! visible cursor anywhere).
 //!
 //! **Motion is absolute.** The motion stream carries deltas and this
 //! injector accumulates them and places the cursor exactly with
@@ -38,9 +41,6 @@ use super::isolation::NativeIsolation;
 
 /// The client-side injector over the local Windows desktop.
 pub struct Win32Injector {
-    /// True while we are hiding the local cursor (between `enter` and
-    /// `leave`). Lets `leave` only show the cursor if we hid it.
-    cursor_hidden: bool,
     /// The absolute cursor position this injector is steering. Motion is
     /// **absolute**: every `move_rel` delta accumulates here and the
     /// cursor is placed exactly, so Windows' pointer acceleration never
@@ -64,7 +64,6 @@ pub struct Win32Injector {
 impl Win32Injector {
     pub fn new() -> Self {
         Self {
-            cursor_hidden: false,
             pos: (0, 0),
             keys_down: HashSet::new(),
             buttons_down: HashSet::new(),
@@ -72,20 +71,11 @@ impl Win32Injector {
         }
     }
 
-    /// Restore the machine to its users: undo the hardware silence and
-    /// show the cursor again. Runs on whatever thread is dropping the
-    /// injector — which is the session thread that hid the cursor — so
-    /// the `ShowCursor` count balances exactly. Idempotent; safe to call
-    /// when the machine was never isolated.
+    /// Restore the machine to its users: undo the hardware silence.
+    /// Runs on whatever thread is dropping the injector. Idempotent;
+    /// safe to call when the machine was never isolated.
     fn restore_machine(&mut self) {
         self.isolation.set_isolating(false);
-        if self.cursor_hidden {
-            // SAFETY: balances the ShowCursor(0) in `enter`.
-            unsafe {
-                wm::ShowCursor(1);
-            }
-            self.cursor_hidden = false;
-        }
     }
 
     /// Inject one event. A rejected event (`SendInput` returns 0) is
@@ -308,31 +298,18 @@ impl Injector for Win32Injector {
     }
 
     fn enter(&mut self) {
-        // Hide our own cursor so the server's stream is the only visible
-        // one — the classic KVM "leftover cursor" fix, same as X11.
         // This machine is now driven remotely: its own hardware must not
         // fight the injected stream (see [`isolation`] for the why).
+        // The local cursor stays visible — it *is* the shared cursor;
+        // the server hides its own while away (the "leftover cursor"
+        // fix), so hiding ours too would leave no cursor anywhere.
         self.isolation.set_isolating(true);
-        if !self.cursor_hidden {
-            // SAFETY: ShowCursor(0) decrements the display count.
-            unsafe {
-                wm::ShowCursor(0);
-            }
-            self.cursor_hidden = true;
-        }
     }
 
     fn leave(&mut self) {
         // Control is home again: restore this machine's own hardware
         // first, so nothing native is swallowed while we clean up.
         self.isolation.set_isolating(false);
-        if self.cursor_hidden {
-            // SAFETY: balances the hide above.
-            unsafe {
-                wm::ShowCursor(1);
-            }
-            self.cursor_hidden = false;
-        }
         // Control left this machine: release every key and button we
         // injected and never saw released — the user may have crossed
         // back mid-hold, so the matching ups will never arrive. Without
@@ -360,9 +337,8 @@ pub struct Win32Clipboard {
 }
 
 /// A session ended without `leave` (disconnect, sleep resume, wedge):
-/// the machine must never be left input-dead or cursor-invisible. Runs
-/// on the session thread that hid the cursor, so the `ShowCursor` count
-/// balances exactly. The isolation gate is a process static, so this
+/// the machine must never be left input-dead. Runs on whatever thread
+/// drops the injector. The isolation gate is a process static, so this
 /// also covers injectors that never entered.
 impl Drop for Win32Injector {
     fn drop(&mut self) {

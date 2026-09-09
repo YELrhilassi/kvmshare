@@ -119,6 +119,14 @@ fn run() -> Result<(), String> {
                         continue;
                     }
                     Ok(SessionEnd::LinkClosed) => {
+                        // The state file must never keep claiming a
+                        // connection that no longer exists: write
+                        // "disconnected" before the retry delay, so the
+                        // GUI's Home page stops showing "in control" the
+                        // moment the link drops (it flips to "connecting"
+                        // when the loop's next attempt starts).
+                        write_client_state(&state_dir, "disconnected", &addr);
+                        log_info!("link closed — reconnecting in {RETRY_DELAY:?}");
                         thread::sleep(RETRY_DELAY);
                         continue;
                     }

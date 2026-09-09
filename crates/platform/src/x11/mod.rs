@@ -18,17 +18,23 @@
 //!   clipboard + pointer-position queries on its own connection; cursor
 //!   warp/hide/grab delegated to the capture thread via commands.
 //! * [`injector::X11Injector`] — the client's control of its own screen:
-//!   move the cursor, inject buttons/keys/wheel (XTest), hide the local
-//!   cursor while being controlled, read/write the clipboard.
+//!   move the cursor, inject buttons/keys/wheel (XTest), read/write the
+//!   clipboard.
+//! * [`geometry`] — the **visible desktop** (union of active outputs):
+//!   the root window can be larger than the desktop the user sees, and
+//!   every coordinate that crosses the platform boundary is translated
+//!   between visible-local and root pixels through it.
 
 mod buttons;
 pub mod capture;
 pub mod engine;
+pub(crate) mod geometry;
 pub mod injector;
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
+use geometry::visible_desktop;
 use kvmshare_core::client::{Clipboard, Injector};
 use kvmshare_core::server::{Engine, Liveness};
 use kvmshare_protocol::message::Message;
@@ -80,15 +86,17 @@ pub fn client_injector(
 /// The primary display's real geometry (physical pixels), read with a
 /// short-lived X connection of its own so it can be queried before the
 /// capture/engine connections exist (the server builds its default
-/// layout from this before starting the platform). Best-effort: `None`
-/// when no display is reachable.
+/// layout from this before starting the platform). The **visible**
+/// desktop (active outputs), not the root window — a disconnected
+/// monitor must not stretch the layout into invisible space. Best-
+/// effort: `None` when no display is reachable.
 pub fn primary_display() -> Option<kvmshare_protocol::message::ScreenInfo> {
     use x11rb::connection::Connection;
     let (conn, _) = x11rb::rust_connection::RustConnection::connect(None).ok()?;
     let root = conn.setup().roots.first()?;
-    Some(kvmshare_protocol::message::ScreenInfo {
-        width: root.width_in_pixels as u32,
-        height: root.height_in_pixels as u32,
-        scale: 1.0,
-    })
+    let (w, h) = match visible_desktop(&conn, 0) {
+        Some(v) => v.size,
+        None => (root.width_in_pixels as u32, root.height_in_pixels as u32),
+    };
+    Some(kvmshare_protocol::message::ScreenInfo { width: w, height: h, scale: 1.0 })
 }

@@ -116,14 +116,38 @@ impl ClientCtx {
     /// when the control channel dies (EOF, error, or silence timeout).
     /// Dropping the last `Sender` of the outbound queue ends the writer
     /// thread, and the socket with it.
-    pub fn teardown(&self, id: u8, name: &str) {
-        log_info!("client {name} disconnected");
+    ///
+    /// Identity-safe: only the client that is *still registered* under
+    /// its id is torn down. A newer connection that took over the same
+    /// id (same name — the machine reconnected before the old socket's
+    /// death was noticed, or a second instance bypassed the role lock)
+    /// must never be unregistered by the old connection's reader. The
+    /// old reader simply finishes and drops its Arc; the fresh
+    /// registration is untouched.
+    pub fn teardown(&self, client: &Arc<Client>) {
+        let id = client.id;
+        let registered = {
+            let clients = self.clients.lock().unwrap();
+            match clients.get(&id) {
+                Some(c) if Arc::ptr_eq(c, client) => true,
+                _ => false,
+            }
+        };
+        if !registered {
+            // Superseded by a newer connection with the same id — this
+            // reader is the stale one. Its outbound sender is no longer
+            // in the map, so dropping this Arc ends the old writer and
+            // socket; nothing else must be touched.
+            log_debug!("client {}: stale connection superseded — skipping teardown", client.name);
+            return;
+        }
+        log_info!("client {} disconnected", client.name);
         self.clients.lock().unwrap().remove(&id);
         self.addrs.lock().unwrap().remove(&id);
         self.seqs.lock().unwrap().remove(&id);
         self.last_heard.lock().unwrap().remove(&id);
         if let Some(tx) = &self.events {
-            let _ = tx.send(ServerEvent::ClientDisconnected { name: name.to_owned() });
+            let _ = tx.send(ServerEvent::ClientDisconnected { name: client.name.clone() });
         }
 
         {
@@ -173,7 +197,31 @@ impl Client {
             since_ms: crate::time::now_ms(),
             out: out_tx,
         });
-        ctx.clients.lock().unwrap().insert(id, client.clone());
+        // A client with this id is already registered (same name): the
+        // machine reconnected before the old socket's death was noticed,
+        // or a second instance started with a different state dir
+        // bypassed the role lock. The fresh connection is authoritative
+        // — replace the map entry and end the stale one cleanly. Its
+        // reader will finish on the old socket's EOF and its teardown is
+        // identity-checked (see [`ClientCtx::teardown`]), so it can
+        // never unregister this new client. The Leave/Control pair tells
+        // the old peer to end its session; if the old socket is already
+        // dead, the writer drops it on the next send.
+        {
+            let mut clients = ctx.clients.lock().unwrap();
+            if let Some(old) = clients.insert(id, client.clone()) {
+                log_info!("client {}: replacing stale connection with the same id", old.name);
+                let _ = old.out.send(route(Message::Leave { screen_id: id }));
+                let _ = old.out.send(route(Message::Control {
+                    command: kvmshare_protocol::id::control::DISCONNECT,
+                }));
+            }
+        }
+        // The client is now fully registered: crossings may enter its
+        // screen. Marking it here — after the map insert — guarantees a
+        // crossing can never fire into a screen whose `Enter` would be
+        // dropped (the client must exist before the cursor can go there).
+        ctx.session.lock().unwrap().on_client_connected(id);
         // Stable marker for the GUI's notification watcher (kept in sync
         // with the "disconnected" line in `teardown`): "client X connected".
         log_info!("client {} connected", client.name);
@@ -342,7 +390,7 @@ fn service_client(client: Arc<Client>, mut reader: Transport, ctx: Arc<ClientCtx
             };
             handle_client_message(&client, msg, &ctx);
         }
-        ctx.teardown(client.id, &client.name);
+        ctx.teardown(&client);
     });
 }
 

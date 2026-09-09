@@ -46,10 +46,17 @@ pub trait Injector: Send {
     /// Press/release/repeat a key, addressed by its canonical USB HID
     /// usage id (the platform backend maps it to the local key identity).
     fn key(&mut self, kind: KeyKind, key: u32);
-    /// Control has entered this machine: hide the local cursor so the
-    /// server's stream is the only visible one.
+    /// Control has entered this machine. The local cursor stays
+    /// **visible**: it *is* the shared cursor now — the server hides its
+    /// own while the cursor is away, so hiding the client's too would
+    /// leave no visible cursor on either screen. Backends use this to
+    /// arm whatever the controlled state needs (e.g. Windows input
+    /// isolation silences this machine's own hardware so it cannot fight
+    /// the injected stream).
     fn enter(&mut self);
-    /// Control has left this machine: show the local cursor again.
+    /// Control has left this machine: release everything the controlled
+    /// state armed (Windows input isolation, and held keys/buttons are
+    /// released by the caller).
     fn leave(&mut self);
     /// Called by the motion thread once per steering tick while this
     /// machine is controlled. Backends with a remote-control watchdog

@@ -12,6 +12,7 @@ use kvmshare_protocol::message::Message;
 
 use crate::server::actions::apply_action;
 use crate::server::client::ClientCtx;
+use crate::session::Action;
 use crate::time::now_ms;
 use crate::udp;
 
@@ -49,12 +50,36 @@ fn check_active_beacon_staleness(ctx: &ClientCtx) {
     );
     // The reader thread's normal teardown path does the unregister +
     // return-home; triggering it from here (a forced disconnect) is the
-    // same idempotent cleanup.
-    let name = {
-        let clients = ctx.clients.lock().unwrap();
-        clients.get(&id).map(|c| c.name.clone()).unwrap_or_default()
-    };
-    ctx.teardown(id, &name);
+    // same idempotent cleanup. The client's own Arc is passed so
+    // teardown's identity check can confirm it is still the registered
+    // one (a stale beacon watchdog must never evict a newer connection
+    // that took over the id).
+    let client = { ctx.clients.lock().unwrap().get(&id).cloned() };
+    match client {
+        Some(client) => ctx.teardown(&client),
+        None => {
+            // The client is already gone (its teardown raced us, or a
+            // crossing latched an id whose client never registered).
+            // There is nothing to tear down, but the stale active latch
+            // must still be released — otherwise every idle wake of the
+            // receiver re-fires this branch forever, spamming the log,
+            // while the local machine stays isolated with no client to
+            // return to. Clear the latch and hand control home once.
+            log_warn!("client {id}: cursor stream silent with no connected client — forcing control home");
+            {
+                let mut act = ctx.active.lock().unwrap();
+                if *act == Some(id) {
+                    *act = None;
+                }
+            }
+            let action = ctx.session.lock().unwrap().on_client_disconnected(id);
+            if let Action::SwitchToLocal { .. } = action {
+                if let Ok(mut engine) = ctx.engine.lock() {
+                    let _ = apply_action(action, &ctx.active, &ctx.clients, &ctx.last_heard, &mut engine);
+                }
+            }
+        }
+    }
 }
 
 /// The UDP receiver: learns each client's address from its first

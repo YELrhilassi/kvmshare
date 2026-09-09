@@ -67,11 +67,19 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
                 );
                 std::process::exit(0);
             }
+            // `--server` / `--connect` are accepted as aliases for the
+            // positional address, so `kvmshare-client --server HOST`
+            // works like the documented `kvmshare-client HOST` (the
+            // GUI passes the position, but a human typing the flag
+            // name should not be told the argument is unknown).
+            "--server" | "--connect" if addr.is_none() => {
+                addr = Some(args.next().ok_or("--server needs an address")?);
+            }
             other if addr.is_none() => addr = Some(other.to_owned()),
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(ClientArgs { server_addr: addr.ok_or("missing server address")?, name, log_level, log_ctl })
+    Ok(ClientArgs { server_addr: addr.ok_or("missing server address (use `kvmshare-client HOST[:PORT]`)")?, name, log_level, log_ctl })
 }
 
 /// Normalize `host` or `host:port` to `host:port` (default port).

@@ -32,6 +32,7 @@ use kvmshare_core::motion::PendingMotion;
 use super::events::{is_escape, raw_xy, select_input_events, CaptureCommand, Held, REPEAT_DELAY, REPEAT_INTERVAL};
 use crate::evdev::EvdevReader;
 use crate::x11::buttons::{self, XButton};
+use crate::x11::geometry::{visible_desktop, VisibleDesktop};
 
 /// Minimum gap between forwarded position beacons. The real pointer
 /// position is sampled at device rate (up to 1000 Hz on a modern mouse);
@@ -72,6 +73,10 @@ const POLL_ERROR_PAUSE: Duration = Duration::from_millis(50);
 struct InputCapture {
     conn: RustConnection,
     root: xproto::Window,
+    /// The visible desktop (see [`crate::x11::geometry`]): the session
+    /// works in visible-local pixels, so position beacons are translated
+    /// out of root pixels here and warps are translated back in.
+    visible: VisibleDesktop,
     tx: Sender<Message>,
     cmd_rx: Receiver<CaptureCommand>,
     /// Read end of the command wake pipe: the engine writes a byte on
@@ -139,6 +144,13 @@ pub fn start(
     }
     conn.xfixes_query_version(5, 0).map_err(|e| format!("XFixes version: {e}"))?;
     log_info!("input capture started (XI2 raw events)");
+    // The visible desktop, with the whole root as the fallback. Computed
+    // once here on the capture connection and shared with the beacon
+    // thread, so both translate positions identically.
+    let visible = visible_desktop(&conn, screen_num).unwrap_or_else(|| {
+        let s = &conn.setup().roots[screen_num];
+        VisibleDesktop::whole_root(s.width_in_pixels as u32, s.height_in_pixels as u32)
+    });
 
     // The command wake pipe: nonblocking both ways, so an engine write
     // never stalls on a full pipe (the byte is a nudge — the command
@@ -162,6 +174,7 @@ pub fn start(
     let capture = InputCapture {
         conn,
         root,
+        visible,
         tx: tx.clone(),
         cmd_rx,
         wake_rx,
@@ -188,7 +201,7 @@ pub fn start(
     // for a beat. Polling is also strictly unnecessary while the pointer
     // is grabbed (beacons are suppressed then anyway), so the beacon
     // thread skips the round-trip entirely in that state.
-    spawn_beacon_thread(display.map(str::to_owned), grabbed, real_pos, tx);
+    spawn_beacon_thread(display.map(str::to_owned), visible, grabbed, real_pos, tx);
     Ok((rx, capture_tick, wake_tx))
 }
 
@@ -209,6 +222,7 @@ pub fn start(
 /// the grab releases) drops straight back to the fast cadence.
 pub fn spawn_beacon_thread(
     display: Option<String>,
+    visible: VisibleDesktop,
     grabbed: Arc<AtomicBool>,
     real_pos: Arc<Mutex<Option<(i32, i32)>>>,
     tx: Sender<Message>,
@@ -227,7 +241,9 @@ pub fn spawn_beacon_thread(
             if !grabbed.load(Ordering::Relaxed) {
                 if let Ok(cookie) = conn.query_pointer(root) {
                     if let Ok(reply) = cookie.reply() {
-                        let (x, y) = (reply.root_x as i32, reply.root_y as i32);
+                        // Root pixels -> visible-local: the session
+                        // works in visible pixels (see [`VisibleDesktop`]).
+                        let (x, y) = visible.from_root(reply.root_x as i32, reply.root_y as i32);
                         *real_pos.lock().unwrap() = Some((x, y));
                         if last != Some((x, y)) {
                             last = Some((x, y));
@@ -378,11 +394,14 @@ impl InputCapture {
                 // motion accrued since the last send first, then keep
                 // only the newest position for the coalesced beacon (see
                 // [`BEACON_PERIOD`]) — motion first, resync after, so the
-                // session applies deltas then re-anchors, in order.
+                // session applies deltas then re-anchors, in order. Root
+                // pixels -> visible-local, matching every other position
+                // this thread reports.
                 self.flush_motion();
                 let x = (e.root_x >> 16) as i32;
                 let y = (e.root_y >> 16) as i32;
                 if !self.grabbed.load(Ordering::Relaxed) {
+                    let (x, y) = self.visible.from_root(x, y);
                     self.beacon = Some((x, y));
                 }
             }
@@ -484,8 +503,11 @@ impl InputCapture {
     fn apply(&mut self, cmd: CaptureCommand) {
         match cmd {
             CaptureCommand::Warp(x, y) => {
+                // The session commands visible-local pixels; the warp is
+                // a root-pixel operation (see [`VisibleDesktop`]).
                 // src_win = NONE warps from the current position.
-                let _ = self.conn.warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16);
+                let (rx, ry) = self.visible.to_root(x, y);
+                let _ = self.conn.warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, rx as i16, ry as i16);
                 let _ = self.conn.flush();
             }
             CaptureCommand::CursorVisible(visible) => {
