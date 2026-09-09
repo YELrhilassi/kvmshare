@@ -28,8 +28,17 @@ type ConnectedClient struct {
 
 // ListClients returns the server's currently connected clients (read
 // from `clients.json`; empty when the server is not running or has none).
+//
+// The file is written by the server and never removed when the server
+// dies, so it outlives the process that produced it — reading it blind
+// made the GUI claim "connected to you" with no server running (the
+// same lie the client's stale state file used to tell, reconciled the
+// same way: a live server role lock is the gate for trusting the file).
 // Always returns a non-nil slice so the frontend can safely iterate it.
 func (a *App) ListClients() []ConnectedClient {
+	if !a.roleActive(roleServer) {
+		return []ConnectedClient{} // no server running: the file is a leftover
+	}
 	path := filepath.Join(a.stateDir, "clients.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {

@@ -133,11 +133,26 @@ fn run() -> Result<(), String> {
     // [`Control::ClientCommand`] messages on the main loop.
     spawn_server_cmd_watcher(state.join("server.cmd"), ctl_tx);
 
+    // The previous session's `clients.json` is a leftover the moment
+    // this (new) server starts: whatever it lists is not connected to
+    // *this* process. Clear it before the GUI can read it — the event
+    // sink rewrites it truthfully on the first connect/disconnect.
+    let _ = std::fs::remove_file(state.join("clients.json"));
+
     // Run forever, forwarding local input. The supervisor inside watches
     // the input path's health and, on a wedge while the cursor is on a
     // client, exits with a code the process manager restarts from — the
     // local machine is never left input-trapped.
-    server.run(input, engine, clipboard, liveness).map_err(|e| format!("server: {e}"))
+    let result = server.run(input, engine, clipboard, liveness);
+
+    // Clean exit (or fatal error): leave no connected-client list behind.
+    // A killed server's leftover file used to make the GUI claim
+    // connections that did not exist; the GUI now also reconciles the
+    // file against the server role lock, and this keeps it truthful for
+    // anything that reads it after a graceful stop.
+    let _ = std::fs::remove_file(state.join("clients.json"));
+
+    result.map_err(|e| format!("server: {e}"))
 }
 
 /// How often the config watcher polls the file for changes.
