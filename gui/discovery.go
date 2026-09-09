@@ -56,12 +56,15 @@ const discoveryPort = defaultPort + 1
 
 // How often a beacon is broadcast, how often the subnet is probed over
 // unicast, and how long a peer may go silent before it is dropped.
-// peerTTL comfortably exceeds the probe interval: on networks where
-// broadcast/multicast is filtered, the unicast probe reply is the only
-// signal keeping the peer alive.
+// peerTTL is several beacon periods times a margin for burst loss: on
+// Wi-Fi, broadcast frames are sent at the base rate and unacked, so a
+// short burst of interference used to expire a live peer (visible as
+// the peer list flapping between populated and empty). The unicast
+// probe channel stamps the same liveness map, so a peer that survives
+// on either channel never ages out.
 const beaconInterval = 2 * time.Second
 const probeInterval = 10 * time.Second
-const peerTTL = 15 * time.Second
+const peerTTL = 45 * time.Second
 
 // Pairing work runs on its own goroutine so the listener never blocks
 // on it. Depth covers a brief connect stall; overflow drops (senders
@@ -366,17 +369,41 @@ func (d *discovery) beaconLoop() {
 	}
 }
 
+// advertisedRole reports the role this machine should announce: what is
+// *actually running here*, not what the GUI's mode dropdown says. The
+// dropdown is an intention; the beacon is a fact. Advertising the
+// dropdown made a machine running a server but set to "client" (the
+// common case right after a role switch) broadcast "client, not
+// running" — every other machine then rendered it as an idle ghost.
+// Server wins the (unsupported, but defensive) both-running case.
+func (d *discovery) advertisedRole() (role string, running bool) {
+	switch {
+	case d.core.roleActive("server"):
+		return "server", true
+	case d.core.roleActive("client"):
+		return "client", true
+	default:
+		s := d.core.GetSettings()
+		return string(s.Mode), false
+	}
+}
+
+// beaconPayloadFor builds this machine's current announcement.
+func (d *discovery) beaconPayloadFor() beaconPayload {
+	role, running := d.advertisedRole()
+	return beaconPayload{
+		ID:      d.core.GetMachineId(),
+		Name:    d.core.displayName(),
+		Role:    role,
+		Port:    d.core.serverPort(),
+		Running: running,
+	}
+}
+
 // beaconTick sends one beacon round. Returns false when the socket is
 // no longer usable and the loop should rebuild it.
 func (d *discovery) beaconTick(conn *net.UDPConn) bool {
-	s := d.core.GetSettings()
-	payload, _ := json.Marshal(beaconPayload{
-		ID:      d.core.GetMachineId(),
-		Name:    d.core.displayName(),
-		Role:    string(s.Mode),
-		Port:    d.core.serverPort(),
-		Running: d.core.roleActive(string(s.Mode)),
-	})
+	payload, _ := json.Marshal(d.beaconPayloadFor())
 	dead := false
 	for _, dst := range d.broadcastAddrs() {
 		if _, err := conn.WriteToUDP(payload, dst); err != nil {
@@ -694,14 +721,7 @@ func computeProbeTargets() []*net.UDPAddr {
 // replyProbe answers a "who is kvmshare here?" probe with a normal
 // beacon, unicast straight back to the prober.
 func (d *discovery) replyProbe(to *net.UDPAddr) {
-	s := d.core.GetSettings()
-	payload, _ := json.Marshal(beaconPayload{
-		ID:      d.core.GetMachineId(),
-		Name:    d.core.displayName(),
-		Role:    string(s.Mode),
-		Port:    d.core.serverPort(),
-		Running: d.core.roleActive(string(s.Mode)),
-	})
+	payload, _ := json.Marshal(d.beaconPayloadFor())
 	conn, err := net.DialUDP("udp4", nil, to)
 	if err != nil {
 		return
@@ -779,9 +799,11 @@ func (d *discovery) republish() {
 		d.reg.Shutdown()
 		d.reg = nil
 	}
-	s := d.core.GetSettings()
-	port := d.core.serverPort()
-	id := d.core.GetMachineId()
+	// Same contract as the UDP beacon: advertise what is actually
+	// running (see advertisedRole), never the GUI's mode dropdown.
+	adv := d.beaconPayloadFor()
+	port := adv.Port
+	id := adv.ID
 
 	reg, err := zeroconf.Register(
 		"kvmshare-"+id,
@@ -790,10 +812,10 @@ func (d *discovery) republish() {
 		port,
 		[]string{
 			"id=" + id,
-			"name=" + d.core.displayName(),
-			"role=" + string(s.Mode),
+			"name=" + adv.Name,
+			"role=" + adv.Role,
 			"port=" + itoa(port),
-			"running=" + strconv.FormatBool(d.core.roleActive(string(s.Mode))),
+			"running=" + strconv.FormatBool(adv.Running),
 		},
 		nil,
 	)

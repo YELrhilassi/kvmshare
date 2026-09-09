@@ -38,10 +38,13 @@ export default function LiveOverview() {
   const [sweeping, setSweeping] = useState(false);
 
   const isServer = mode === "server";
-  // Only machines that can work with this one: a server lists clients,
-  // a client lists servers. A same-role machine has nothing to do with
-  // this machine here.
-  const rows = peers.filter((p) => (isServer ? p.role === "client" : p.role === "server"));
+  // Every discovered machine stays listed. A strict role filter made
+  // rows vanish whenever either machine changed role — which read as
+  // the whole list flapping. Rows that can work with this machine (a
+  // server lists clients, a client lists servers) get connect actions;
+  // a same-role machine is still shown, muted, with its real role.
+  const rows = peers;
+  const usable = (p: Peer) => (isServer ? p.role === "client" : p.role === "server");
 
   const stateOf = (p: Peer): RowState => {
     if (isServer) {
@@ -90,7 +93,8 @@ export default function LiveOverview() {
   const trust = (p: Peer, on: boolean) =>
     act(() => (isServer ? (on ? api().TrustClient(p.id) : api().RevokeClient(p.id)) : on ? api().TrustServer(p.id) : api().RevokeServer(p.id)));
 
-  const roleTag = isServer ? "client" : "server";
+  // Rows render each peer's advertised role — never this machine's
+  // mode, which mislabeled every row whenever the two disagreed.
   // Every discovered machine is actionable (trust, connect); there is
   // nothing to filter out. The empty message only covers "nothing on
   // the network at all".
@@ -130,7 +134,7 @@ export default function LiveOverview() {
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium">{p.name}</span>
                     <span className="rounded-full border border-border/60 px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground/70">
-                      {roleTag}
+                      {p.role}
                     </span>
                     <span
                       className={cn(
@@ -175,35 +179,35 @@ export default function LiveOverview() {
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
                   {isServer ? (
-                    <>
-                      {connected ? (
-                        <>
-                          <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "disconnect"))}>
-                            Disconnect
-                          </Button>
-                          <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "restart"))}>
-                            Restart
-                          </Button>
-                          <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, false)}>
-                            Revoke
-                          </Button>
-                        </>
-                      ) : (
-                        <>
-                          <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, !trustedPeer)}>
-                            {trustedPeer ? "Revoke" : "Trust"}
-                          </Button>
-                          <Button variant="outline" size="sm" onClick={() => void act(() => api().SendConnectRequest(p.id))}>
-                            Connect here
-                          </Button>
-                        </>
-                      )}
-                    </>
+                    connected ? (
+                      <>
+                        <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "disconnect"))}>
+                          Disconnect
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "restart"))}>
+                          Restart
+                        </Button>
+                        <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, false)}>
+                          Revoke
+                        </Button>
+                      </>
+                    ) : usable(p) ? (
+                      <>
+                        <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, !trustedPeer)}>
+                          {trustedPeer ? "Revoke" : "Trust"}
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={() => void act(() => api().SendConnectRequest(p.id))}>
+                          Connect here
+                        </Button>
+                      </>
+                    ) : (
+                      <span className="text-[10px] text-muted-foreground/50">same role as this machine</span>
+                    )
                   ) : state === "trusted" ? (
                     <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, false)}>
                       Revoke
                     </Button>
-                  ) : !connected ? (
+                  ) : !connected && usable(p) ? (
                     <>
                       <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => void trust(p, !trustedPeer)}>
                         {trustedPeer ? "Revoke" : "Trust"}
@@ -212,6 +216,8 @@ export default function LiveOverview() {
                         Connect
                       </Button>
                     </>
+                  ) : !connected ? (
+                    <span className="text-[10px] text-muted-foreground/50">same role as this machine</span>
                   ) : null}
                 </div>
               </div>
