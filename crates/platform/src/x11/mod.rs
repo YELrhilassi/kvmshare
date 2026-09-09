@@ -30,6 +30,7 @@ pub mod capture;
 pub mod engine;
 pub(crate) mod geometry;
 pub mod injector;
+pub mod wheel_daemon;
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;

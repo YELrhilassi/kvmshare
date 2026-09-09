@@ -65,6 +65,9 @@ install: build
 	install -m755 $(SERVER_BIN) $(BINDIR)/kvmshare-server
 	install -m755 $(CLIENT_BIN) $(BINDIR)/kvmshare-client
 	install -m755 $(GUI_BIN) $(BINDIR)/kvmshare-gui
+	@# Manifest: sha256 of the installed set, checked by the GUI before
+	@# every spawn (a mixed-version install must never run silently).
+	@cd $(BINDIR) && sha256sum kvmshare-server kvmshare-client kvmshare-gui > binaries.sha256
 	@if [ ! -f $(CONFIG_DIR)/kvmshare-server.toml ]; then \
 		cp kvmshare-server.toml $(CONFIG_DIR)/kvmshare-server.toml; \
 		echo "  sample config -> $(CONFIG_DIR)/kvmshare-server.toml"; \

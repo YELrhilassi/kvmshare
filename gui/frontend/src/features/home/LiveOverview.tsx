@@ -5,6 +5,7 @@ import { DEFAULT_PORT } from "@/lib/constants";
 import { Button } from "@/components/ui/button";
 import { Section } from "@/components/Section";
 import { cn, shortID } from "@/lib/utils";
+import { RotateCw } from "lucide-react";
 
 // Every machine on the network that can work with this one, in one
 // list, each with its own state. A machine only counts as "nearby"
@@ -31,9 +32,10 @@ function isTrusted(trusted: string[], id: string): boolean {
 }
 
 export default function LiveOverview() {
-  const { mode, clients, peers, trusted, clientState } = useApp();
+  const { mode, clients, peers, trusted, clientState, refresh } = useApp();
   const [err, setErr] = useState("");
   const [copiedId, setCopiedId] = useState("");
+  const [sweeping, setSweeping] = useState(false);
 
   const isServer = mode === "server";
   // Only machines that can work with this one: a server lists clients,
@@ -67,6 +69,24 @@ export default function LiveOverview() {
     window.setTimeout(() => setCopiedId(""), 1500);
   };
 
+  // Force a discovery sweep: clear the peer map, re-announce, re-probe
+  // the subnet now. The result also seeds the pushed state (the event
+  // dedupe compares snapshots, so identical lists stay quiet). The
+  // brief spin keeps the button honest about what it just did.
+  const rescan = async () => {
+    if (sweeping) return;
+    setSweeping(true);
+    setErr("");
+    try {
+      await api().RefreshDiscovery();
+      await refresh();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      window.setTimeout(() => setSweeping(false), 600);
+    }
+  };
+
   const trust = (p: Peer, on: boolean) =>
     act(() => (isServer ? (on ? api().TrustClient(p.id) : api().RevokeClient(p.id)) : on ? api().TrustServer(p.id) : api().RevokeServer(p.id)));
 
@@ -79,7 +99,22 @@ export default function LiveOverview() {
     "No other machines found yet. They show up here automatically once they're running — or connect by address from the Client page.";
 
   return (
-    <Section title="On this network">
+    <Section
+      title="On this network"
+      action={
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 gap-1.5 px-2 text-xs text-muted-foreground"
+          onClick={() => void rescan()}
+          disabled={sweeping}
+          title="Clear discovered machines and probe the network again"
+        >
+          <RotateCw className={cn("h-3.5 w-3.5", sweeping && "animate-spin")} />
+          Refresh
+        </Button>
+      }
+    >
       {visible.length === 0 ? (
         <p className="text-sm text-muted-foreground">{empty}</p>
       ) : (

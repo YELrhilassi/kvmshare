@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"kvmshare/gui/internal/selfupdate"
 )
 
 // A kvmshare role runs in the background, independent of the GUI: closing
@@ -24,6 +27,28 @@ import (
 //   - Stop     = kill our child if any, else signal the pid recorded in
 //     the lock file, and wait for the lock to clear.
 //   - Starting one role stops the other (a machine is one or the other).
+
+// verifyBinary refuses to spawn a binary that is not part of a
+// consistent install (see selfupdate/manifest.go): the dir the binary
+// lives in must carry a manifest and the binary must match it. A
+// manifest-less dir (old install) fails closed with a reinstall
+// message — the mixed-version cursor bugs this prevents are far more
+// expensive than one forced reinstall. KVMSHARE_SKIP_MANIFEST=1 is the
+// dev escape hatch for hand-built binaries (make install still writes
+// a manifest; a bare cargo build + copy does not).
+func (a *App) verifyBinary(path string) error {
+	if os.Getenv("KVMSHARE_SKIP_MANIFEST") == "1" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if err := selfupdate.VerifyBinaries(dir); err != nil {
+		if errors.Is(err, selfupdate.ErrNoManifest) {
+			return fmt.Errorf("%s has no %s — reinstall kvmshare (kvmshare-install --local or make install) so all binaries are from one build", dir, selfupdate.ManifestName)
+		}
+		return err
+	}
+	return nil
+}
 
 // proc wraps a managed child process with a reaper goroutine.
 //
@@ -328,6 +353,9 @@ func (a *App) spawnServerLocked() (*proc, error) {
 	if _, err := os.Stat(a.serverPath); err != nil {
 		return nil, fmt.Errorf("server binary not found at %s (run make install)", a.serverPath)
 	}
+	if err := a.verifyBinary(a.serverPath); err != nil {
+		return nil, err
+	}
 	// The log-control file sets the level/enabled the operator chose;
 	// the process polls it, so later changes apply without a restart.
 	a.writeLogCtlLocked(roleServer)
@@ -427,6 +455,9 @@ func (a *App) ClientStart() (bool, error) {
 
 	if _, err := os.Stat(a.clientPath); err != nil {
 		return false, fmt.Errorf("client binary not found at %s (run make install)", a.clientPath)
+	}
+	if err := a.verifyBinary(a.clientPath); err != nil {
+		return false, err
 	}
 	addr := strings.TrimSpace(a.settings.ClientAddr)
 	if addr == "" {

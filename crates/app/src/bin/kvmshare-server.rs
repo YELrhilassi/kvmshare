@@ -237,7 +237,7 @@ fn auto_config_screen_size(config_path: &PathBuf, name: &str, info: &ScreenInfo)
     // as-is.
     let w = info.width.max(1);
     let h = info.height.max(1);
-    if (w == screen.width && h == screen.height) {
+    if w == screen.width && h == screen.height {
         return Ok(()); // already correct
     }
     screen.width = w;

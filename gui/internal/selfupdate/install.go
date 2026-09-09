@@ -69,6 +69,12 @@ func Apply(extracted map[string]string) ([]string, error) {
 	if err := installExtras(); err != nil {
 		return written, err
 	}
+	// Vouch for the set: record what was installed so the GUI can
+	// verify the binaries before spawning them (a mismatched install
+	// — stale binary mixed with fresh ones — must never run silently).
+	if err := WriteManifest(dir, written); err != nil {
+		return written, fmt.Errorf("write manifest: %w", err)
+	}
 	return written, nil
 }
 

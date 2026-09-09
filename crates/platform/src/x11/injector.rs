@@ -65,6 +65,7 @@ use kvmshare_protocol::message::{KeyKind, ScreenInfo};
 
 use super::buttons;
 use super::geometry::{visible_desktop, VisibleDesktop};
+use super::wheel_daemon::{self, WheelClient};
 
 /// How often the real cursor position is refreshed from the X server
 /// (ms). The motion loop reads the position every tick; the cached value
@@ -157,6 +158,11 @@ pub struct X11Injector {
     /// Buttons injected as down and not yet released (same contract as
     /// [`X11Injector::keys_down`]).
     buttons_down: HashSet<u8>,
+    /// The virtual-wheel daemon client ([`WheelClient`]): wheel events
+    /// go through a uinput mouse when it is up (the only path GLFW/
+    /// kitty-style apps scroll on — see the wheel_daemon module docs);
+    /// `None` (or a failed send) falls back to XTest buttons.
+    wheel: Option<WheelClient>,
 }
 
 impl X11Injector {
@@ -178,6 +184,12 @@ impl X11Injector {
         // Anchor both trackers at the real position: the first command
         // is measured from where the cursor actually is, not from (0,0).
         let start = Self::query_real(&conn, root, &visible).unwrap_or((0, 0));
+        // The wheel daemon is a user-session sidecar (see
+        // [`wheel_daemon`]): make sure it is up, then connect to it.
+        // Both are best-effort — without it, wheel still works in
+        // GTK-style apps via the XTest fallback.
+        wheel_daemon::ensure_daemon();
+        let wheel = WheelClient::connect();
         Ok(Self {
             conn,
             root,
@@ -188,6 +200,7 @@ impl X11Injector {
             bounds,
             keys_down: HashSet::new(),
             buttons_down: HashSet::new(),
+            wheel,
         })
     }
 
@@ -305,11 +318,37 @@ impl Injector for X11Injector {
         let ty = if pressed { BUTTON_PRESS } else { BUTTON_RELEASE };
         let _ = self.conn.xtest_fake_input(ty, x11_button, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
         let _ = self.conn.flush();
+        // Keep the virtual wheel's drag-state in sync (left held while
+        // wheeling must match what the X server believes — see the
+        // wheel_daemon module docs). Fire-and-forget; a missing daemon
+        // costs nothing here.
+        if let Some(w) = &mut self.wheel {
+            w.set_button(button, pressed);
+        }
     }
 
     fn wheel(&mut self, dx: i32, dy: i32) {
         // Clamp to a sane number of notches per message.
         let notches = (dx.abs() + dy.abs()).clamp(1, 10);
+        // Preferred path: the virtual uinput wheel (real kernel input
+        // events — scrolls in kitty & friends, not just GTK apps). The
+        // left button's *virtual* state rides along so drag-wheel
+        // semantics match a physical mouse. A daemon that appears after
+        // construction (first connect raced its startup) is picked up
+        // here: the connect attempt is one stat() at wheel-event rates.
+        if self.wheel.is_none() {
+            self.wheel = WheelClient::connect();
+        }
+        let via_daemon = self
+            .wheel
+            .as_mut()
+            .is_some_and(|w| w.send(dx, dy, self.buttons_down.contains(&1)));
+        if via_daemon {
+            return;
+        }
+        // Fallback: XTest core buttons. Delivered to every app, but
+        // GLFW-based ones ignore them when scroll-valuator devices
+        // exist (see the wheel_daemon module docs).
         let Some(button) = buttons::wheel_to_x11(dx, dy) else { return };
         for _ in 0..notches {
             let _ = self.conn.xtest_fake_input(BUTTON_PRESS, button, x11rb::CURRENT_TIME, self.root, 0, 0, 0);

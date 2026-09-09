@@ -158,6 +158,7 @@ interface GoApp {
   ApplyUpdate(): Promise<UpdateResult>;
   GetMachineId(): Promise<string>;
   DiscoverPeers(): Promise<Peer[]>;
+  RefreshDiscovery(): Promise<Peer[]>;
   ListClients(): Promise<ConnectedClient[]>;
   ClientCommand(name: string, action: string): Promise<void>;
   TrustClient(id: string): Promise<void>;
@@ -252,6 +253,7 @@ export const api = (): GoApp => ({
   ApplyUpdate: () => call<UpdateResult>("ApplyUpdate"),
   GetMachineId: () => call<string>("GetMachineId"),
   DiscoverPeers: () => call<Peer[]>("DiscoverPeers"),
+  RefreshDiscovery: () => call<Peer[]>("RefreshDiscovery"),
   ListClients: () => call<ConnectedClient[]>("ListClients"),
   ClientCommand: (name, action) => call<void>("ClientCommand", name, action),
   TrustClient: (id) => call<void>("TrustClient", id),

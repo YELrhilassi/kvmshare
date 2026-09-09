@@ -154,6 +154,8 @@ func Uninstall(log func(string, ...any)) error {
 			removed++
 		}
 	}
+	// The manifest vouches for the installed set — remove it with the set.
+	_ = os.Remove(filepath.Join(dir, selfupdate.ManifestName))
 	if err := removeDesktopIntegration(dir); err != nil {
 		logf(log, "warning cleaning desktop integration: %v", err)
 	}

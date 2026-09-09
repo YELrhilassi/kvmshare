@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"kvmshare/gui/internal/selfupdate"
 )
 
 // fakeRoleBin is a tiny test binary that mirrors the real kvmshare
@@ -32,6 +34,15 @@ func TestMain(m *testing.M) {
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "build fakerole:", err)
+		os.Exit(1)
+	}
+	// Manifest next to the fake binaries: the GUI verifies a role
+	// binary against its install-dir manifest before spawning (see
+	// process.go verifyBinary), so the harness must present a
+	// consistent "install" — which also exercises verification in
+	// every lifecycle test.
+	if err := selfupdate.WriteManifest(dir, []string{fakeRoleBin}); err != nil {
+		fmt.Fprintln(os.Stderr, "manifest fakerole:", err)
 		os.Exit(1)
 	}
 	os.Exit(m.Run())
@@ -983,6 +994,15 @@ func TestPairingRequestConnects(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.handleDatagram(req, from)
+
+	// The request is queued off the listener goroutine (the listener must
+	// never block on the connect flow); drain it deterministically.
+	select {
+	case job := <-d.pairQueue:
+		d.handlePairing(job.data, job.from)
+	default:
+		t.Fatal("pairing request was not queued for the worker")
+	}
 
 	// Trust-on-first-use recorded the sender's id.
 	if !idTrusted(a.GetSettings().TrustedServers, "cccccccc22222222") {

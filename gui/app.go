@@ -260,6 +260,16 @@ func (a *App) SingleInstance() (raised bool, err error) {
 }
 
 func lookPathElse(name, fallback string) string {
+	// Sibling first: the GUI and its role binaries ship (and are
+	// upgraded) together in one install directory. Searching PATH first
+	// let a stale copy from an older install silently win over the
+	// freshly deployed one — the launcher must never mix versions.
+	if sib, err := os.Executable(); err == nil {
+		sibling := filepath.Join(filepath.Dir(sib), binName(name, runtime.GOOS))
+		if st, err := os.Stat(sibling); err == nil && !st.IsDir() {
+			return sibling
+		}
+	}
 	if p, err := exec.LookPath(name); err == nil {
 		return p
 	}

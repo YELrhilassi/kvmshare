@@ -1,0 +1,15 @@
+# kvmshare — virtual wheel device access.
+#
+# The wheel daemon creates a virtual mouse via uinput so injected wheel
+# events go through the real kernel input pipeline (XI2 scroll valuators
+# + server-emulated core buttons) — the only path every application
+# accepts, including GLFW/terminals that ignore XTest-emulated wheel.
+#
+# This rule makes /dev/uinput usable by the `input` group, so the
+# daemon runs as the plain session user: kvmshare never needs root at
+# runtime. (With a setuid daemon or a sudoers rule instead, this file
+# is unnecessary — the daemon drops privileges itself either way.)
+#
+# Install: sudo cp deploy/70-kvmshare-uinput.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger /dev/uinput
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"

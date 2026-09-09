@@ -31,13 +31,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/grandcat/zeroconf"
@@ -59,6 +62,29 @@ const discoveryPort = defaultPort + 1
 const beaconInterval = 2 * time.Second
 const probeInterval = 10 * time.Second
 const peerTTL = 15 * time.Second
+
+// Pairing work runs on its own goroutine so the listener never blocks
+// on it. Depth covers a brief connect stall; overflow drops (senders
+// retry naturally with their next request), and each job carries a
+// deadline so a queued request can't act on stale state.
+const pairQueueLen = 8
+
+// How long a queued pairing request stays actionable.
+const pairJobMaxAge = 10 * time.Second
+
+// Health-watch cadence and thresholds. quietAfter must comfortably
+// exceed beaconInterval: two live machines exchange beacons every 2 s,
+// so a healthy session is never quiet this long.
+const watchInterval = 30 * time.Second
+const quietAfter = 90 * time.Second
+const warnCooldown = 10 * time.Minute
+
+// How long a cached set of broadcast/probe targets stays fresh. The
+// interface enumeration used to run on every 2 s beacon tick; caching
+// makes steady-state discovery cost almost no syscalls, and a refresh
+// forces a re-enumeration so a network change is picked up within one
+// interval instead of at process restart.
+const targetsCacheTTL = 60 * time.Second
 
 // A machine seen on the local network.
 type Peer struct {
@@ -124,19 +150,44 @@ type discovery struct {
 	cancel context.CancelFunc
 
 	// beaconConn sends broadcasts; listenConn receives beacons and
-	// pairing commands on the same port.
+	// pairing commands on the same port. Both are owned by the loops
+	// that created them: a dead loop closes and nils its socket so the
+	// diagnostics watchLoop can see the gap and heal it, instead of the
+	// whole channel silently dying for the GUI's lifetime.
 	listenConn *net.UDPConn
-	started    sync.Once
-	active     atomic.Bool
-	stop       chan struct{}
+	beaconConn *net.UDPConn
+
+	started sync.Once
+	active  atomic.Bool
+	stop    chan struct{}
+
+	// pairQueue carries pairing requests off the listener goroutine.
+	// Handling a "connect" inline used to run the whole client-start
+	// flow on the socket-read loop; a slow connect stalled every read
+	// until the kernel buffer overflowed and discovery went deaf. The
+	// worker drops a request when the queue is full (the sender retries
+	// with its next beacon-period request) — never blocks the listener.
+	pairQueue chan pairJob
+
+	// Bounded diagnostic log: one warning per condition per cooldown,
+	// so a broken network costs a handful of log lines per hour instead
+	// of one every tick.
+	lastBeaconWarn atomic.Int64 // unix nanos of last "no beacons" warning
+	lastListenWarn atomic.Int64 // unix nanos of last "cannot listen" warning
+	lastQuietWarn  atomic.Int64 // unix nanos of last "hearing nothing" warning
+	netCacheMu     sync.Mutex
+	netCacheAt     time.Time
+	netCacheBcast  []*net.UDPAddr
+	netCacheProbe  []*net.UDPAddr
 }
 
 func newDiscovery(core *App) *discovery {
 	return &discovery{
-		core:  core,
-		peers: map[string]*Peer{},
-		seen:  map[string]time.Time{},
-		stop:  make(chan struct{}),
+		core:      core,
+		peers:     map[string]*Peer{},
+		seen:      map[string]time.Time{},
+		stop:      make(chan struct{}),
+		pairQueue: make(chan pairJob, pairQueueLen),
 	}
 }
 
@@ -146,22 +197,24 @@ func newDiscovery(core *App) *discovery {
 func (d *discovery) start() {
 	d.started.Do(func() {
 		d.active.Store(true)
+		go d.pairWorker()
 		go d.beaconLoop()
-		go d.listen()
-		go d.probeLoop() // unicast fallback where broadcast/multicast is filtered
-		go d.browse()    // mDNS: best-effort second channel
+		go d.listenLoop() // self-healing wrapper around the receive path
+		go d.probeLoop()  // unicast fallback where broadcast/multicast is filtered
+		go d.browse()     // mDNS: best-effort second channel
+		go d.watchLoop()  // diagnostics: loud when discovery is unhealthy
 		d.republish()
 	})
 }
 
 // ---------------------------------------------------------------------------
-// Broadcast channel
+// Network targets (cached)
 // ---------------------------------------------------------------------------
 
-// broadcastAddr returns the destination(s) for beacons: the limited
-// broadcast plus this machine's subnet broadcast (some routers only
-// forward the subnet-directed form).
-func broadcastAddrs() []*net.UDPAddr {
+// computeBroadcastAddrs enumerates the actual destinations: the limited
+// broadcast plus each interface's subnet-directed broadcast (some
+// routers only forward one of the two forms).
+func computeBroadcastAddrs() []*net.UDPAddr {
 	out := []*net.UDPAddr{{IP: net.IPv4bcast, Port: discoveryPort}}
 	// Subnet-directed broadcast per interface, derived from the address
 	// with a /24 mask (the overwhelmingly common home/office case).
@@ -187,64 +240,200 @@ func broadcastAddrs() []*net.UDPAddr {
 	return out
 }
 
-// beaconLoop broadcasts this machine's presence every beaconInterval.
-func (d *discovery) beaconLoop() {
-	// An UNCONNECTED socket: each beacon goes to every broadcast
-	// destination (limited + subnet-directed). A dialed (connected)
-	// socket can only ever reach its single dialed address, and
-	// WriteToUDP on it fails with "use of WriteTo with pre-connected
-	// connection" — which used to silently kill every beacon, leaving
-	// discovery empty on networks where mDNS multicast is filtered.
-	conn, err := net.ListenUDP("udp4", nil)
-	if err != nil {
-		return // no network — discovery is best-effort
+// broadcastAddrs returns the destinations for beacons: the limited
+// broadcast plus this machine's subnet broadcast (some routers only
+// forward the subnet-directed form). Results are cached for
+// targetsCacheTTL — the interface enumeration used to run on every 2 s
+// tick for no benefit on a stable network.
+func (d *discovery) broadcastAddrs() []*net.UDPAddr {
+	d.netCacheMu.Lock()
+	defer d.netCacheMu.Unlock()
+	if d.netCacheBcast == nil || time.Since(d.netCacheAt) > targetsCacheTTL {
+		d.netCacheBcast = computeBroadcastAddrs()
+		d.netCacheAt = time.Now()
 	}
-	defer conn.Close()
-	// Sending to broadcast addresses needs SO_BROADCAST.
-	if raw, err := conn.SyscallConn(); err == nil {
-		_ = raw.Control(func(fd uintptr) {
-			_ = setBroadcast(fd)
-		})
-	}
+	return d.netCacheBcast
+}
 
-	ticker := time.NewTicker(beaconInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-d.stop:
-			return
-		case <-ticker.C:
-			s := d.core.GetSettings()
-			payload, _ := json.Marshal(beaconPayload{
-				ID:      d.core.GetMachineId(),
-				Name:    d.core.displayName(),
-				Role:    string(s.Mode),
-				Port:    d.core.serverPort(),
-				Running: d.core.roleActive(string(s.Mode)),
-			})
-			for _, dst := range broadcastAddrs() {
-				_, _ = conn.WriteToUDP(payload, dst)
-			}
-		}
+// probeTargets is the cached form of computeProbeTargets (see
+// broadcastAddrs for the caching rationale).
+func (d *discovery) probeTargets() []*net.UDPAddr {
+	d.netCacheMu.Lock()
+	defer d.netCacheMu.Unlock()
+	if d.netCacheProbe == nil || time.Since(d.netCacheAt) > targetsCacheTTL {
+		d.netCacheProbe = computeProbeTargets()
+		d.netCacheAt = time.Now()
+	}
+	return d.netCacheProbe
+}
+
+// invalidateTargets drops the cached interface enumeration — called on
+// an explicit refresh, and cheap enough to call after any network
+// change suspicion (a wrong cache costs one stale interval, not data).
+func (d *discovery) invalidateTargets() {
+	d.netCacheMu.Lock()
+	d.netCacheBcast = nil
+	d.netCacheProbe = nil
+	d.netCacheAt = time.Time{}
+	d.netCacheMu.Unlock()
+}
+
+// stopped reports whether shutdown has been requested.
+func (d *discovery) stopped() bool {
+	select {
+	case <-d.stop:
+		return true
+	default:
+		return false
 	}
 }
 
-// listen receives beacons (→ peer list) and pairing commands on the
-// same UDP port.
-func (d *discovery) listen() {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: discoveryPort})
-	if err != nil {
-		return // port busy — discovery is best-effort
+// isFatalUDPError classifies receive/send errors that mean the socket
+// itself is gone (closed under us, interface removed) and must be
+// rebuilt — as opposed to transient errors (routes settling, buffers
+// momentarily full) that a healthy socket rides out.
+func isFatalUDPError(err error) bool {
+	if err == nil {
+		return false
 	}
-	d.mu.Lock()
-	d.listenConn = conn
-	d.mu.Unlock()
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var oe *net.OpError
+	if errors.As(err, &oe) {
+		// EBADF/EINVAL on a live socket means it was closed under us.
+		var se syscall.Errno
+		if errors.As(oe.Err, &se) {
+			return se == syscall.EBADF || se == syscall.EINVAL
+		}
+	}
+	return false
+}
 
+// beaconLoop broadcasts this machine's presence every beaconInterval.
+// The socket is owned by this loop: on fatal send failure it is closed
+// and re-created, so a transient network error (interface flap, sleep/
+// resume) cannot kill discovery for the GUI's lifetime.
+func (d *discovery) beaconLoop() {
+	for {
+		if d.stopped() {
+			return
+		}
+		conn, err := net.ListenUDP("udp4", nil)
+		if err != nil {
+			d.warnOnce(&d.lastBeaconWarn, "discovery: no UDP socket for beacons: ", err, 5*time.Minute)
+			select {
+			case <-d.stop:
+				return
+			case <-time.After(beaconInterval):
+			}
+			continue
+		}
+		if raw, err := conn.SyscallConn(); err == nil {
+			_ = raw.Control(func(fd uintptr) {
+				_ = setBroadcast(fd)
+			})
+		}
+		d.mu.Lock()
+		d.beaconConn = conn
+		d.mu.Unlock()
+
+		d.beaconTick(conn)
+
+		ticker := time.NewTicker(beaconInterval)
+		for healthy := true; healthy; {
+			select {
+			case <-d.stop:
+				ticker.Stop()
+				d.mu.Lock()
+				d.beaconConn = nil
+				d.mu.Unlock()
+				conn.Close()
+				return
+			case <-ticker.C:
+				healthy = d.beaconTick(conn)
+			}
+		}
+		ticker.Stop()
+		// Socket went bad: close and rebuild on the next pass.
+		d.mu.Lock()
+		d.beaconConn = nil
+		for id := range d.seen {
+			delete(d.seen, id)
+		}
+		d.mu.Unlock()
+		conn.Close()
+	}
+}
+
+// beaconTick sends one beacon round. Returns false when the socket is
+// no longer usable and the loop should rebuild it.
+func (d *discovery) beaconTick(conn *net.UDPConn) bool {
+	s := d.core.GetSettings()
+	payload, _ := json.Marshal(beaconPayload{
+		ID:      d.core.GetMachineId(),
+		Name:    d.core.displayName(),
+		Role:    string(s.Mode),
+		Port:    d.core.serverPort(),
+		Running: d.core.roleActive(string(s.Mode)),
+	})
+	dead := false
+	for _, dst := range d.broadcastAddrs() {
+		if _, err := conn.WriteToUDP(payload, dst); err != nil {
+			if isFatalUDPError(err) {
+				dead = true
+			}
+		}
+	}
+	return !dead
+}
+
+// listenLoop receives beacons (→ peer list) and pairing commands on the
+// same UDP port. The socket is owned by this loop; on a fatal receive
+// error the socket is closed and rebuilt, so a transient interface flap
+// degrades one interval instead of silencing discovery forever (the old
+// code returned on the first error and the GUI never listened again —
+// observed live as a 213 KB unread backlog growing for minutes).
+func (d *discovery) listenLoop() {
+	for {
+		if d.stopped() {
+			return
+		}
+		conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: discoveryPort})
+		if err != nil {
+			d.warnOnce(&d.lastListenWarn, "discovery: cannot bind :24801 (another kvmshare GUI? a snap of this port?): ", err, 5*time.Minute)
+			select {
+			case <-d.stop:
+				return
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+		d.mu.Lock()
+		d.listenConn = conn
+		d.mu.Unlock()
+
+		d.listenServe(conn)
+
+		// Serve returned: socket is dead or we are stopping.
+		d.mu.Lock()
+		d.listenConn = nil
+		d.mu.Unlock()
+		conn.Close()
+	}
+}
+
+// listenServe reads until a fatal receive error or shutdown. Non-fatal
+// errors (transient) are skipped without rebuilding the socket.
+func (d *discovery) listenServe(conn *net.UDPConn) {
 	buf := make([]byte, 2048)
 	for {
 		n, from, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			return
+			if d.stopped() || isFatalUDPError(err) {
+				return
+			}
+			continue // transient — keep reading
 		}
 		d.handleDatagram(buf[:n], from)
 	}
@@ -254,7 +443,9 @@ func (d *discovery) listen() {
 // requests ("connect") and subnet probes ("probe") carry one, beacons
 // do not. A pairing request also carries `id`, so the beacon shape
 // (id + role + port) alone cannot tell them apart (this very ambiguity
-// used to swallow "connect here" requests as beacons).
+// used to swallow "connect here" requests as beacons). Pairing is
+// handed to the worker queue: the listener must never block on the
+// connect flow (that stall once deafened discovery for minutes).
 func (d *discovery) handleDatagram(data []byte, from *net.UDPAddr) {
 	var probe struct {
 		Cmd string `json:"cmd"`
@@ -262,7 +453,13 @@ func (d *discovery) handleDatagram(data []byte, from *net.UDPAddr) {
 	if json.Unmarshal(data, &probe) == nil {
 		switch probe.Cmd {
 		case "connect":
-			d.handlePairing(data, from)
+			select {
+			case d.pairQueue <- pairJob{data: append([]byte(nil), data...), from: from, at: time.Now()}:
+			default:
+				// Queue full: drop. The server's operator retries, and a
+				// saturating queue means the worker is wedged — dropping
+				// beats stalling the listener either way.
+			}
 			return
 		case "probe":
 			d.replyProbe(from)
@@ -275,9 +472,136 @@ func (d *discovery) handleDatagram(data []byte, from *net.UDPAddr) {
 	}
 }
 
+// pairJob is one queued pairing request.
+type pairJob struct {
+	data []byte
+	from *net.UDPAddr
+	at   time.Time
+}
+
+// pairWorker drains the pairing queue off the listener goroutine. Jobs
+// older than pairJobMaxAge are discarded: a request that waited out its
+// sender's retry cycle could act on a peer that has already gone away.
+func (d *discovery) pairWorker() {
+	for {
+		select {
+		case <-d.stop:
+			return
+		case job := <-d.pairQueue:
+			if time.Since(job.at) > pairJobMaxAge {
+				continue
+			}
+			d.handlePairing(job.data, job.from)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
-// Unicast probe channel (fallback for filtered broadcast/multicast)
+// Health watch + bounded diagnostics
 // ---------------------------------------------------------------------------
+
+// watchLoop is the discovery layer's own pulse check. Every watchInterval
+// it verifies the invariants that make discovery work — sockets alive,
+// something heard recently — and, when they break, says so (once per
+// cooldown per condition). This exists because discovery used to fail
+// silently: a dead listener looked exactly like an empty network, and
+// nobody could tell the difference from the outside.
+func (d *discovery) watchLoop() {
+	ticker := time.NewTicker(watchInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-ticker.C:
+			d.checkHealth()
+		}
+	}
+}
+
+// checkHealth runs one watch pass. Deliberately cheap: two mutex-guarded
+// reads, no syscalls.
+func (d *discovery) checkHealth() {
+	d.mu.Lock()
+	listening := d.listenConn != nil
+	beaconing := d.beaconConn != nil
+	var last time.Time
+	for _, t := range d.seen {
+		if t.After(last) {
+			last = t
+		}
+	}
+	nPeers := len(d.peers)
+	d.mu.Unlock()
+	now := time.Now()
+
+	if !listening {
+		d.warnOnce(&d.lastListenWarn, "discovery: receive socket down — rebuilding", nil, warnCooldown)
+	}
+	if !beaconing {
+		d.warnOnce(&d.lastBeaconWarn, "discovery: beacon socket down — rebuilding", nil, warnCooldown)
+	}
+	// Hearing nothing at all is itself a condition worth one line: with
+	// two kvmshare machines on a LAN, beacons arrive every couple of
+	// seconds. A long silent stretch with healthy sockets means the
+	// network filters the discovery traffic (AP isolation, VLAN) —
+	// exactly the case the user needs to know about, because the fix is
+	// on the network side (or manual addresses). Only meaningful once
+	// this GUI has been up long enough to expect traffic (quietAfter).
+	if listening && beaconing && nPeers == 0 && now.Sub(last) > quietAfter {
+		d.warnOnce(&d.lastQuietWarn, "discovery: healthy but hearing no beacons — the network may filter broadcast/multicast (AP isolation?); manual addresses still work", nil, warnCooldown)
+	}
+}
+
+// warnOnce logs a warning at most once per cooldown window (keyed by
+// the atomic timestamp), so a persistent condition costs one line per
+// cooldown instead of one per tick.
+func (d *discovery) warnOnce(key *atomic.Int64, msg string, err error, cooldown time.Duration) {
+	now := time.Now().UnixNano()
+	last := key.Load()
+	if last != 0 && now-last < cooldown.Nanoseconds() {
+		return
+	}
+	if !key.CompareAndSwap(last, now) {
+		return // another goroutine won the race
+	}
+	if err != nil {
+		log.Printf("kvmshare-gui: %s%v", msg, err)
+		return
+	}
+	log.Printf("kvmshare-gui: %s", msg)
+}
+
+// ---------------------------------------------------------------------------
+// Manual refresh
+// ---------------------------------------------------------------------------
+
+// refresh clears discovery state and forces an immediate sweep: peers
+// re-announced now, subnet re-probed now, interfaces re-enumerated now.
+// Backs the UI's refresh button — the user-visible answer to "the list
+// looks stale", without waiting out the next probe interval.
+func (d *discovery) refresh() {
+	if d.stopped() {
+		return
+	}
+	d.invalidateTargets()
+	d.mu.Lock()
+	d.peers = map[string]*Peer{}
+	d.seen = map[string]time.Time{}
+	d.mu.Unlock()
+	// Announce and ask immediately — the next regular ticks are a
+	// full interval away and a refresh should feel instant.
+	d.mu.Lock()
+	beacon := d.beaconConn
+	listener := d.listenConn
+	d.mu.Unlock()
+	if beacon != nil {
+		d.beaconTick(beacon)
+	}
+	if listener != nil {
+		d.probeOnce()
+	}
+}
 
 // probeLoop sends a "who is kvmshare here?" datagram to every host on
 // the local subnets once per probeInterval. Machines reply with a
@@ -301,6 +625,8 @@ func (d *discovery) probeLoop() {
 
 // probeOnce pings every candidate host from the shared listener socket,
 // so replies arrive on the same socket the listener already reads.
+// Skips itself when the listener socket is down (replies must arrive on
+// it — probing with replies undeliverable is pure waste).
 func (d *discovery) probeOnce() {
 	d.mu.Lock()
 	conn := d.listenConn
@@ -312,7 +638,7 @@ func (d *discovery) probeOnce() {
 		Cmd string `json:"cmd"`
 		ID  string `json:"id"`
 	}{Cmd: "probe", ID: d.core.GetMachineId()})
-	for _, dst := range probeTargets() {
+	for _, dst := range d.probeTargets() {
 		_, _ = conn.WriteToUDP(payload, dst)
 	}
 }
@@ -323,7 +649,7 @@ func (d *discovery) probeOnce() {
 // anything larger is left to the broadcast/mDNS channels (and manual
 // addresses). The limited broadcast and each subnet's directed
 // broadcast are covered by the beacon channel instead.
-func probeTargets() []*net.UDPAddr {
+func computeProbeTargets() []*net.UDPAddr {
 	var out []*net.UDPAddr
 	seen := map[string]bool{}
 	ifs, _ := net.Interfaces()
@@ -416,8 +742,7 @@ func (d *discovery) expire() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	cutoff := time.Now().Add(-peerTTL)
-	for id, p := range d.peers {
-		_ = p
+	for id := range d.peers {
 		if last, ok := d.seen[id]; ok && last.Before(cutoff) {
 			delete(d.peers, id)
 			delete(d.seen, id)
@@ -564,6 +889,18 @@ func (a *App) DiscoverPeers() []Peer {
 		return []Peer{}
 	}
 	return a.disc.list()
+}
+
+// RefreshDiscovery forces a full discovery sweep: state cleared,
+// interfaces re-enumerated, announce + probe sent immediately. Backs
+// the UI refresh button. Returns the fresh peer list so the click gives
+// instant feedback even before the next pushed state event.
+func (a *App) RefreshDiscovery() ([]Peer, error) {
+	if a.disc == nil {
+		return nil, fmt.Errorf("discovery not started")
+	}
+	a.disc.refresh()
+	return a.disc.list(), nil
 }
 
 // ---------------------------------------------------------------------------
