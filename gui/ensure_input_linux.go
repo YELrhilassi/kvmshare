@@ -2,15 +2,26 @@
 
 package main
 
-// Input-device access on Linux. While this machine runs as the server the
-// backend isolates the physical input devices at the kernel (EVIOCGRAB)
-// so no app can react to forwarded input — reading those devices needs a
-// one-time system grant that the installer performs (a udev rule with the
-// user's uid baked in as OWNER, plus a live chown — no logind, no group
-// membership, no re-login). This file triggers that step from the GUI:
-// `kvmshare-install --input-access` is grant-only-if-missing and
-// self-elevating, so nothing ever happens once access exists and at most
-// one privilege prompt appears the first time.
+// Device access on Linux, covering everything the product needs:
+//
+//   - server role: read on /dev/input/event* so the backend can isolate
+//     the physical input devices at the kernel (EVIOCGRAB) while the
+//     shared cursor is on another machine.
+//   - client role (and server): write on /dev/uinput so the per-session
+//     wheel daemon can create its virtual mouse — injected scroll then
+//     goes through the real kernel pipeline, the only path every
+//     application accepts (GLFW apps like kitty ignore XTest-emulated
+//     wheel).
+//
+// Both grants are one udev rule installed by the installer (`kvmshare-install
+// --input-access`): grant-only-if-missing, self-elevating through the
+// desktop's standard privilege prompt, silent forever once access exists.
+// This file triggers that step from the GUI, so the user never sees a
+// shell command — at most one consent prompt on first use, exactly like
+// the Windows UAC prompt. If the prompt is declined (or no polkit agent
+// exists) everything keeps working with reduced fidelity: the server
+// reports isolation as unavailable, and wheel falls back to XTest in
+// the apps that still accept it.
 
 import (
 	"os"
@@ -20,14 +31,11 @@ import (
 )
 
 // ensureInputAccess checks — in the background, never blocking startup —
-// whether this machine can isolate its input devices, and grants access
-// through the sibling installer when it cannot. Silent in every case:
-// errors just mean the server runs without isolation (it reports that
-// itself).
+// whether this machine has the device access it needs for its role, and
+// grants it through the sibling installer when it cannot. Silent in
+// every case: errors just mean reduced fidelity (reported by the roles
+// themselves, never a GUI error).
 func (a *App) ensureInputAccess() {
-	if a.settings.Mode != ModeServer {
-		return // isolation is server-side only; clients need nothing
-	}
 	// The portable installer and make install place kvmshare-install next
 	// to the role binaries. Without it (a bare copy of the GUI) there is
 	// nothing to run.

@@ -67,7 +67,9 @@ install: build
 	install -m755 $(GUI_BIN) $(BINDIR)/kvmshare-gui
 	@# Manifest: sha256 of the installed set, checked by the GUI before
 	@# every spawn (a mixed-version install must never run silently).
-	@cd $(BINDIR) && sha256sum kvmshare-server kvmshare-client kvmshare-gui > binaries.sha256
+	@# The wheel daemon rides along with the role binaries.
+	install -m755 target/release/kvmshare-wheel-daemon $(BINDIR)/kvmshare-wheel-daemon 2>/dev/null || true
+	@cd $(BINDIR) && sha256sum kvmshare-server kvmshare-client kvmshare-gui kvmshare-wheel-daemon > binaries.sha256
 	@if [ ! -f $(CONFIG_DIR)/kvmshare-server.toml ]; then \
 		cp kvmshare-server.toml $(CONFIG_DIR)/kvmshare-server.toml; \
 		echo "  sample config -> $(CONFIG_DIR)/kvmshare-server.toml"; \
@@ -93,6 +95,7 @@ ensure-input-access:
 			[ -e "$$d" ] || continue; \
 			if [ ! -r "$$d" ]; then ok=0; break; fi; \
 		done; \
+		if [ -w /dev/uinput ]; then :; else ok=0; fi; \
 		if [ "$$ok" = "1" ]; then \
 			echo "  input access already granted"; \
 		else \
@@ -101,9 +104,10 @@ ensure-input-access:
 		fi; \
 	fi
 
-## Grant the desktop user read access to physical input devices so the
-## server can isolate them while the cursor is on a client. Self-elevates
-## through pkexec (works as root directly, e.g. sudo make input-access).
+## Grant the desktop user device access for both roles: read on the
+## physical inputs (server isolation) and write on /dev/uinput (the
+## virtual wheel). Self-elevates through pkexec (works as root directly,
+## e.g. sudo make input-access).
 input-access:
 	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install ./cmd/kvmshare-install
 	cd gui && ./kvmshare-install --input-access
@@ -184,6 +188,6 @@ clean:
 
 ## Remove installed files (keeps $(CONFIG_DIR)).
 uninstall:
-	rm -f $(BINDIR)/kvmshare-server $(BINDIR)/kvmshare-client $(BINDIR)/kvmshare-gui
+	rm -f $(BINDIR)/kvmshare-server $(BINDIR)/kvmshare-client $(BINDIR)/kvmshare-gui $(BINDIR)/kvmshare-wheel-daemon
 	rm -f $(APPS_DIR)/kvmshare.desktop
 	@echo "removed kvmshare binaries and launcher (config kept at $(CONFIG_DIR))"

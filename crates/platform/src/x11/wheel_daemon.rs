@@ -69,6 +69,17 @@ pub fn socket_path() -> PathBuf {
     dir.join(format!("kvmshare-wheel-{uid}.sock"))
 }
 
+/// daemon_alive reports whether a *live* wheel daemon is listening on
+/// `path`. The test is a datagram `connect`: it succeeds only against a
+/// socket the kernel knows is bound — a leftover file from a killed
+/// daemon (SIGTERM runs no destructors, so the unlink guard never
+/// fires) fails here and gets re-spawned instead of being trusted
+/// forever. This is the single liveness oracle for clients; nothing
+/// else may consult the filesystem.
+pub fn daemon_alive(path: &std::path::Path) -> bool {
+    UnixDatagram::unbound().and_then(|s| s.connect(path)).is_ok()
+}
+
 /// The uid whose session this socket belongs to. Covers all three
 /// execution modes:
 ///
@@ -156,9 +167,12 @@ impl WheelClient {
     /// back to XTest buttons); `Err` = unexpected (also falls back).
     pub fn connect() -> Option<Self> {
         let path = socket_path();
-        // A missing socket file is the normal no-daemon case — not even
-        // a warning (the daemon is optional by design).
-        if path.metadata().is_err() {
+        // Probe liveness, not file existence: a SIGTERM-killed daemon
+        // leaves its socket file behind (destructors do not run), and
+        // trusting the file made clients skip spawning forever. A live
+        // daemon has a bound socket: datagram `connect` succeeds only
+        // against it.
+        if !daemon_alive(&path) {
             return None;
         }
         let sock = UnixDatagram::unbound().ok()?;
@@ -320,7 +334,12 @@ pub mod server {
 
     impl Daemon {
         fn open() -> Result<Self, String> {
-            let fd = unsafe { libc::open(UINPUT_PATH.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CLOEXEC) };
+            // CString, not as_ptr(): a Rust &str is not NUL-terminated,
+            // so passing it raw to open() made the kernel read past the
+            // end — usually failing with ENOENT despite the node being
+            // right there.
+            let path = std::ffi::CString::new(UINPUT_PATH).expect("uinput path has no NUL");
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
             if fd < 0 {
                 return Err(format!(
                     "cannot open {UINPUT_PATH} ({}): deploy the setuid daemon or a udev/sudoers rule",
@@ -426,9 +445,10 @@ pub mod server {
     /// user → serve. Nothing on the serving path needs root, and the
     /// socket ends up owned by the session (0600), writable only by the
     /// user whose desktop receives the events. The normal deployment
-    /// needs none of that: a udev rule (`deploy/70-kvmshare-uinput.rules`)
-    /// makes `/dev/uinput` group-`input`, and the daemon runs as the
-    /// plain session user.
+    /// needs none of that: the installer's udev rule grants the desktop
+    /// user write access to `/dev/uinput` (alongside the physical-input
+    /// read grant), so the daemon runs as the plain session user — no
+    /// root, no sudo, at any point after install.
     pub fn run() -> Result<(), String> {
         let path = socket_path();
         // A live daemon holds a bound socket on `path`: a datagram
@@ -503,8 +523,8 @@ pub mod server {
 /// at startup; failure is logged once and everything keeps working via
 /// the XTest fallback.
 pub fn ensure_daemon() {
-    if socket_path().metadata().is_ok() {
-        return; // already up (or stale — the daemon overwrites it)
+    if daemon_alive(&socket_path()) {
+        return; // a live daemon is listening — nothing to do
     }
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -543,9 +563,11 @@ pub fn ensure_daemon() {
                 log_warn!("cannot reap wheel daemon exits (thread spawn failed)");
             }
             // Wait briefly for the socket to appear so the first wheel
-            // frame is not lost to the fallback.
+            // frame is not lost to the fallback — judged by liveness,
+            // not file existence (the daemon binds late; a leftover file
+            // must not end the wait early).
             for _ in 0..20 {
-                if socket_path().metadata().is_ok() {
+                if daemon_alive(&socket_path()) {
                     log_info!("wheel daemon started");
                     return;
                 }
