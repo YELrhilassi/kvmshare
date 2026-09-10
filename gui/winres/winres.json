@@ -39,11 +39,11 @@
           "0000": {
             "CompanyName": "kvmshare",
             "FileDescription": "kvmshare GUI",
-            "FileVersion": "0.1.0",
+            "FileVersion": "0.6.0",
             "InternalName": "kvmshare-gui",
             "OriginalFilename": "kvmshare-gui.exe",
             "ProductName": "kvmshare",
-            "ProductVersion": "0.1.0"
+            "ProductVersion": "0.6.0"
           }
         }
       }
