@@ -204,5 +204,4 @@ fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
 }
 
 #[cfg(test)]
-#[path = "layout_tests.rs"]
 mod tests;

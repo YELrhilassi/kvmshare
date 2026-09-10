@@ -30,17 +30,17 @@ cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags production .
 | Area | Where | What's proven |
 |------|-------|---------------|
 | Protocol round-trips | `crates/protocol/src/message/mod.rs`, `wire.rs`, `frame.rs` | every message encodes/decodes exactly; trailing bytes and unknown types rejected; oversized payloads rejected; partial reads assembled |
-| Layout math | `crates/core/src/layout_tests.rs` | adjacency, entry points, exit direction, normalization |
-| Session / crossings | `crates/core/src/session/session_tests.rs` | wall-band arming, push firing, the parked hidden cursor, entry-inset anti-bounce, escape key, dynamic admission, layout swaps, disconnect-returns-home |
-| Motion | `crates/core/src/motion/*_tests.rs` | gain windows, pending motion accumulation/truncation, follower convergence/overshoot bounds, probe windows |
-| Transport & UDP | `crates/core/src/transport.rs`, `udp_tests.rs` | framing, desync resync, envelope pack/unpack, sequence wrap (`is_newer`) |
+| Layout math | `crates/core/src/layout/tests.rs` | adjacency, entry points, exit direction, normalization |
+| Session / crossings | `crates/core/src/session/tests/` | wall-band arming, push firing, the parked hidden cursor, entry-inset anti-bounce, escape key, dynamic admission, layout swaps, disconnect-returns-home |
+| Motion | `crates/core/src/motion/{follower,gain,pending,probe}/tests.rs` | gain windows, pending motion accumulation/truncation, follower convergence/overshoot bounds, probe windows |
+| Transport & UDP | `crates/core/src/udp/tests.rs` | framing, desync resync, envelope pack/unpack, sequence wrap (`is_newer`) |
 | Role locking | `crates/app/src/guard.rs` | locks are exclusive, mutual exclusion between roles, re-acquire after release, locks survive the files existing |
-| Config | `crates/app/src/config.rs` | round-trip to layout, duplicate-name rejection |
+| Config | `crates/app/src/config/` (mod + io + geometry) | round-trip to layout, duplicate-name rejection, local-screen correction |
 | Args | `crates/app/src/args.rs` | default-port normalization |
 | Logging | `crates/log/src/lib.rs` | level parsing/ordering, control-file hot reload, enabled toggle |
 | Key tables | `crates/platform/src/keys.rs` | both directions consistent (a bad entry can never silently break a cross-OS pair) |
-| Windows capture decode | `crates/platform/src/windows/capture_tests.rs` | raw-input → message translation |
-| **End-to-end** | `crates/app/tests/e2e.rs` | a real `Server` + real `Client` over real TCP/UDP with mock input + a recording injector: cursor enters/moves/crosses back, motion delivers the full command, buttons/keys forward, reconnect is not deafened by stale UDP sequences, crossing after idle survives the beacon watchdog, disconnect returns home, unknown clients admitted dynamically, config hot-reload returns the cursor home and drops stale clients |
+| Windows capture decode | `crates/platform/src/windows/capture/tests.rs` | raw-input → message translation |
+| **End-to-end** | `crates/app/tests/e2e/` | a real `Server` + real `Client` over real TCP/UDP with mock input + a recording injector: cursor enters/moves/crosses back, motion delivers the full command, buttons/keys forward, reconnect is not deafened by stale UDP sequences, crossing after idle survives the beacon watchdog, disconnect returns home, unknown clients admitted dynamically, config hot-reload returns the cursor home and drops stale clients |
 
 The e2e suite is the closest thing to a manual two-machine test that
 runs without any OS plumbing — the platform traits are replaced by
@@ -49,12 +49,15 @@ injector) is exercised.
 
 ## 10.3 What the Go tests cover
 
-- `gui/app_test.go` — settings persistence (including the "absent log
+- `gui` package tests (`*_test.go` next to their files) — settings
+  persistence (including the "absent log
   fields default to ON" migration), config load/save validation,
   process start/stop + role exclusivity, instance locking, network
   listing, log tailing.
-- `gui/notify_test.go` — the client connect/disconnect log parser and
-  transition detection.
+- `gui/internal/notify/notify_test.go` — the client connect/disconnect
+  log parser and transition detection.
+- `gui/internal/discovery/discovery_test.go` — beacon datagram
+  classification and address normalization.
 - `gui/internal/selfupdate/selfupdate_test.go` — version comparison,
   checksum parsing, archive extraction.
 
@@ -63,8 +66,9 @@ injector) is exercised.
 - **The session brain is tested exhaustively without an OS** — this is
   why crossings, edge cases and regressions are caught in CI rather than
   on real hardware.
-- **Tests live next to the code** (`#[path = "..._tests.rs"]` modules or
-  sibling files), so a module's tests move with it.
+- **Tests live next to the code** (each module's `tests.rs` submodule —
+  e.g. `crates/core/src/layout/tests.rs`), so a module's tests move with
+  it and there are no `#[path]` attributes to drift.
 - **Platform behavior that cannot run in CI** (real X11 grab semantics,
   Windows Raw Input, hooks, DPI) is either isolated in unit-testable
   pure functions (the windows capture decode, the key tables) or

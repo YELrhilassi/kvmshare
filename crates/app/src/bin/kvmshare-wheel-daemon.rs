@@ -3,19 +3,19 @@
 //! produces (XI2 scroll-valuator device events + server-emulated core
 //! Button4/5).
 //!
-//! Linux only: runs as root (setuid binary or a sudoers rule) because
-//! /dev/uinput is root-only; it drops to the session user after the two
-//! privileged steps (opening the device, binding the socket) and serves
-//! wheel frames from a 0600 socket only the session owner can write to.
-//! See `kvmshare_platform::x11::wheel_daemon` for the protocol and the
-//! rationale.
+//! Linux only. Runs as the plain session user: access to /dev/uinput
+//! is granted once at install time by the GUI's installer step (udev
+//! rule via pkexec — see `gui/internal/installer`), never at runtime.
+//! It serves wheel frames from a 0600 datagram socket only the session
+//! owner can write to. See `kvmshare_platform::x11::wheel_daemon` for
+//! the protocol and `wheel_server` for the injection side.
 
 #[cfg(target_os = "linux")]
 fn main() {
     if let Err(e) = kvmshare_log::init("info", None) {
         eprintln!("wheel-daemon: logging: {e}");
     }
-    if let Err(e) = kvmshare_platform::x11::wheel_daemon::server::run() {
+    if let Err(e) = kvmshare_platform::x11::wheel_server::run() {
         eprintln!("wheel-daemon: {e}");
         std::process::exit(1);
     }

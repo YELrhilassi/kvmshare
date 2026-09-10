@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+
+	"kvmshare/gui/internal/discovery"
 )
 
 // The one event name the frontend subscribes to.
@@ -46,7 +48,7 @@ type LiveSnapshot struct {
 	ClientName  string            `json:"clientName"`
 	Running     runningSnapshot   `json:"running"`
 	ClientState ClientState       `json:"clientState"`
-	Peers       []Peer            `json:"peers"`
+	Peers       []discovery.Peer  `json:"peers"`
 	Clients     []ConnectedClient `json:"clients"`
 	Trusted     []string          `json:"trusted"`
 }

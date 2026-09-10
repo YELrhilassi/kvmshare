@@ -62,5 +62,4 @@ impl PendingMotion {
 }
 
 #[cfg(test)]
-#[path = "pending_tests.rs"]
-mod pending_tests;
+mod tests;

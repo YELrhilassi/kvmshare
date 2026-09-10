@@ -12,7 +12,8 @@ use kvmshare_core::client::{Clipboard, Injector};
 use kvmshare_core::server::{Engine, Liveness};
 use kvmshare_protocol::message::Message;
 
-const MSG: &str = "kvmshare: this OS does not have a platform backend yet (Linux/X11 is implemented)";
+const MSG: &str =
+    "kvmshare: this OS does not have a platform backend yet (Linux/X11 is implemented)";
 
 /// A clipboard that never works — only reachable on unsupported OSes,
 /// where [`server`] errors before anything could use it. Exists so the
@@ -32,13 +33,19 @@ impl Clipboard for StubClipboard {
 
 pub fn server(
     _display: Option<&str>,
-) -> Result<(Receiver<Message>, Box<dyn Engine>, Box<dyn Clipboard>, std::sync::Arc<Liveness>), String> {
+) -> Result<
+    (
+        Receiver<Message>,
+        Box<dyn Engine>,
+        Box<dyn Clipboard>,
+        std::sync::Arc<Liveness>,
+    ),
+    String,
+> {
     Err(MSG.into())
 }
 
-pub fn client(
-    _display: Option<&str>,
-) -> Result<(Box<dyn Injector>, Box<dyn Clipboard>), String> {
+pub fn client(_display: Option<&str>) -> Result<(Box<dyn Injector>, Box<dyn Clipboard>), String> {
     Err(MSG.into())
 }
 

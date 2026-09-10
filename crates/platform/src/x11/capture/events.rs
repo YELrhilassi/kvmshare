@@ -58,7 +58,10 @@ pub enum CaptureCommand {
 /// right bytes — as long as every wanted bit is OR'd into a **single**
 /// word. Passing one `XIEventMask` per event instead puts each bit in
 /// its own word and silently selects nothing.
-pub(crate) fn select_input_events(conn: &RustConnection, root: xproto::Window) -> Result<(), String> {
+pub(crate) fn select_input_events(
+    conn: &RustConnection,
+    root: xproto::Window,
+) -> Result<(), String> {
     let mut word = 0u32;
     for bit in [
         // Raw events: device deltas / buttons / keys (warp-free).
@@ -74,10 +77,17 @@ pub(crate) fn select_input_events(conn: &RustConnection, root: xproto::Window) -
         word |= u32::from(bit);
     }
 
-    xinput::xi_select_events(&conn, root, &[EventMask { deviceid: DEVICE_ALL, mask: vec![XIEventMask::from(word)] }])
-        .map_err(|e| format!("xi_select_events: {e}"))?
-        .check()
-        .map_err(|e| format!("xi_select_events reply: {e}"))?;
+    xinput::xi_select_events(
+        &conn,
+        root,
+        &[EventMask {
+            deviceid: DEVICE_ALL,
+            mask: vec![XIEventMask::from(word)],
+        }],
+    )
+    .map_err(|e| format!("xi_select_events: {e}"))?
+    .check()
+    .map_err(|e| format!("xi_select_events reply: {e}"))?;
     conn.flush().map_err(|e| format!("X11 flush: {e}"))?;
     Ok(())
 }
@@ -133,5 +143,4 @@ pub(crate) struct Held {
 }
 
 #[cfg(test)]
-#[path = "capture_tests.rs"]
 mod tests;

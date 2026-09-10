@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"kvmshare/gui/internal/fileutil"
 	"os"
 	"strings"
 
@@ -168,7 +169,7 @@ func (a *App) SaveConfig(cfg Config) error {
 	}
 	// Atomic replace: the running server watches this file, so it must
 	// never see a torn write.
-	if err := atomicWriteFile(a.configPath, raw, 0o644); err != nil {
+	if err := fileutil.Write(a.configPath, raw, 0o644); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 

@@ -89,8 +89,15 @@ impl X11Clipboard {
         // Remote sessions (SSH, a second X server) have no real
         // clipboard; the None arm keeps the client fully functional for
         // cursor/keyboard control there.
-        let clipboard = if display.is_none() { arboard::Clipboard::new().ok() } else { None };
-        Self { clipboard, last_remote: None }
+        let clipboard = if display.is_none() {
+            arboard::Clipboard::new().ok()
+        } else {
+            None
+        };
+        Self {
+            clipboard,
+            last_remote: None,
+        }
     }
 }
 
@@ -167,19 +174,29 @@ pub struct X11Injector {
 
 impl X11Injector {
     pub fn new(display: Option<&str>) -> Result<Self, String> {
-        let (conn, screen_num) = RustConnection::connect(display).map_err(|e| format!("X11 connect: {e}"))?;
+        let (conn, screen_num) =
+            RustConnection::connect(display).map_err(|e| format!("X11 connect: {e}"))?;
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
         // The visible desktop, with the whole root as the fallback (one
         // output at the origin — the common case — is identical).
-        let visible = visible_desktop(&conn, screen_num)
-            .unwrap_or_else(|| VisibleDesktop::whole_root(screen.width_in_pixels as u32, screen.height_in_pixels as u32));
+        let visible = visible_desktop(&conn, screen_num).unwrap_or_else(|| {
+            VisibleDesktop::whole_root(
+                screen.width_in_pixels as u32,
+                screen.height_in_pixels as u32,
+            )
+        });
         let bounds = visible.size;
 
-        if conn.extension_information(xfixes::X11_EXTENSION_NAME).map_err(|e| format!("XFixes query: {e}"))?.is_none() {
+        if conn
+            .extension_information(xfixes::X11_EXTENSION_NAME)
+            .map_err(|e| format!("XFixes query: {e}"))?
+            .is_none()
+        {
             return Err("XFixes extension not available".into());
         }
-        conn.xfixes_query_version(5, 0).map_err(|e| format!("XFixes version: {e}"))?;
+        conn.xfixes_query_version(5, 0)
+            .map_err(|e| format!("XFixes version: {e}"))?;
 
         // Anchor both trackers at the real position: the first command
         // is measured from where the cursor actually is, not from (0,0).
@@ -207,7 +224,11 @@ impl X11Injector {
     /// One `QueryPointer` round-trip, translated into visible-local
     /// pixels. `None` when the server does not answer (rare — the caller
     /// keeps the previous value).
-    fn query_real(conn: &RustConnection, root: xproto::Window, visible: &VisibleDesktop) -> Option<(i32, i32)> {
+    fn query_real(
+        conn: &RustConnection,
+        root: xproto::Window,
+        visible: &VisibleDesktop,
+    ) -> Option<(i32, i32)> {
         let reply = conn.query_pointer(root).ok()?.reply().ok()?;
         Some(visible.from_root(reply.root_x as i32, reply.root_y as i32))
     }
@@ -241,7 +262,9 @@ impl X11Injector {
             return;
         }
         let (rx, ry) = self.visible.to_root(x, y);
-        let _ = self.conn.warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, rx as i16, ry as i16);
+        let _ = self
+            .conn
+            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, rx as i16, ry as i16);
         let _ = self.conn.flush();
         // We placed it; the periodic refresh confirms (or corrects)
         // within one [`REAL_QUERY_INTERVAL`]. Filling it in here keeps
@@ -262,7 +285,11 @@ impl Injector for X11Injector {
         // The visible desktop, not the root window: this is the size the
         // server lays the screen out with, and the user only ever sees
         // the visible area (see [`super::geometry`]).
-        ScreenInfo { width: self.bounds.0, height: self.bounds.1, scale: 1.0 }
+        ScreenInfo {
+            width: self.bounds.0,
+            height: self.bounds.1,
+            scale: 1.0,
+        }
     }
 
     fn move_cursor(&mut self, x: i32, y: i32) {
@@ -295,7 +322,9 @@ impl Injector for X11Injector {
         // waits on a round-trip, while the value it hands to the beacon
         // and the pin detector is never older than one refresh period.
         let now = Instant::now();
-        let due = self.last_query.is_none_or(|t| now.duration_since(t) >= REAL_QUERY_INTERVAL);
+        let due = self
+            .last_query
+            .is_none_or(|t| now.duration_since(t) >= REAL_QUERY_INTERVAL);
         if due {
             self.last_query = Some(now);
             if let Some((x, y)) = self.pointer_pos() {
@@ -314,9 +343,17 @@ impl Injector for X11Injector {
         } else if !self.buttons_down.remove(&button) {
             return;
         }
-        let Some(x11_button) = buttons::to_x11(button) else { return };
-        let ty = if pressed { BUTTON_PRESS } else { BUTTON_RELEASE };
-        let _ = self.conn.xtest_fake_input(ty, x11_button, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
+        let Some(x11_button) = buttons::to_x11(button) else {
+            return;
+        };
+        let ty = if pressed {
+            BUTTON_PRESS
+        } else {
+            BUTTON_RELEASE
+        };
+        let _ = self
+            .conn
+            .xtest_fake_input(ty, x11_button, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
         let _ = self.conn.flush();
         // Keep the virtual wheel's drag-state in sync (left held while
         // wheeling must match what the X server believes — see the
@@ -349,10 +386,28 @@ impl Injector for X11Injector {
         // Fallback: XTest core buttons. Delivered to every app, but
         // GLFW-based ones ignore them when scroll-valuator devices
         // exist (see the wheel_daemon module docs).
-        let Some(button) = buttons::wheel_to_x11(dx, dy) else { return };
+        let Some(button) = buttons::wheel_to_x11(dx, dy) else {
+            return;
+        };
         for _ in 0..notches {
-            let _ = self.conn.xtest_fake_input(BUTTON_PRESS, button, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
-            let _ = self.conn.xtest_fake_input(BUTTON_RELEASE, button, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
+            let _ = self.conn.xtest_fake_input(
+                BUTTON_PRESS,
+                button,
+                x11rb::CURRENT_TIME,
+                self.root,
+                0,
+                0,
+                0,
+            );
+            let _ = self.conn.xtest_fake_input(
+                BUTTON_RELEASE,
+                button,
+                x11rb::CURRENT_TIME,
+                self.root,
+                0,
+                0,
+                0,
+            );
         }
         let _ = self.conn.flush();
     }
@@ -361,7 +416,9 @@ impl Injector for X11Injector {
         // Canonical HID usage -> evdev -> X keycode (the standard
         // `keycode = evdev + 8` mapping). Unknown usages are dropped: a
         // wrong key would be worse than no key.
-        let Some(evdev) = crate::keys::evdev_from_hid(key) else { return };
+        let Some(evdev) = crate::keys::evdev_from_hid(key) else {
+            return;
+        };
         // Track down-state so `leave` can release whatever the server
         // never sent an up for. A repeat for a key we did not press (it
         // was held across the boundary, pressed on the server) must not
@@ -382,7 +439,9 @@ impl Injector for X11Injector {
         let keycode = evdev + 8;
         let is_press = matches!(kind, KeyKind::Down | KeyKind::Repeat);
         let ty = if is_press { KEY_PRESS } else { KEY_RELEASE };
-        let _ = self.conn.xtest_fake_input(ty, keycode as u8, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
+        let _ =
+            self.conn
+                .xtest_fake_input(ty, keycode as u8, x11rb::CURRENT_TIME, self.root, 0, 0, 0);
         let _ = self.conn.flush();
     }
 
@@ -406,10 +465,7 @@ impl Injector for X11Injector {
             self.button(button, false);
         }
     }
-
 }
 
-
 #[cfg(test)]
-#[path = "injector_tests.rs"]
 mod tests;

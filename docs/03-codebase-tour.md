@@ -11,7 +11,7 @@ actual files.
 kvmshare/
 ├── Cargo.toml              # Rust workspace: protocol, log, core, platform, app
 ├── Makefile                # build, install, dev, test, release, publish
-├── scripts/dev.sh          # watch sources → rebuild + reinstall on change
+├── scripts/                # dev.sh (watch → rebuild), gen_icon.py (icon assets)
 ├── packaging/              # udev input rule (reference) + .desktop launcher
 │
 ├── crates/
@@ -20,16 +20,27 @@ kvmshare/
 │   ├── core/               # layout, session brain, server & client transport logic
 │   ├── platform/           # OS backends: X11 + evdev (Linux), Windows
 │   └── app/                # the kvmshare-server / kvmshare-client binaries
+│   #
+│   # Tests live next to the code they exercise, as `foo/tests.rs`
+│   # submodules (or a `tests/` dir for a multi-file suite, e.g.
+│   # core/src/session/tests/); integration e2e in app/tests/e2e/.
 │
 └── gui/                    # Wails v3 desktop app (Go backend + React frontend)
     ├── main.go             # app entry: single instance, window, tray
-    ├── app.go              # bound service: settings, paths, processes
-    ├── process*.go         # process management (Unix + Windows variants)
-    ├── tray.go / notify.go # system tray + connect/disconnect notifications
+    ├── app.go              # bound service: state + construction
+    ├── paths.go / settings.go / instance.go   # file layout, persisted settings, single-instance
+    ├── process.go / roles.go / rolelock.go    # spawn plumbing, role start/stop, lock detection
+    ├── peers_api.go / discovery_host.go       # discovery bridge methods + Host adapter
+    ├── clients.go / clientstate.go / live.go  # connected-clients, client state, live status
+    ├── config.go / trust.go / update.go / netlog.go / machine_id.go   # config, pairing trust, updates, log tailing
+    ├── tray.go / tray_xembed_linux.go / tray_menu_linux.go /           # tray + XEmbed cgo engine /
+    │       tray_xembed_bridge_linux.go                                  #   popup menu / pure-Go wiring
     ├── frontend/           # Vite + React + TypeScript UI (embedded in the binary)
     ├── cmd/kvmshare-install/   # CLI installer/updater
     ├── installer/          # GUI installer (Wails window)
-    └── internal/           # shared install/update/selfupdate logic
+    └── internal/           # decoupled packages: discovery, ids, installer,
+                            # selfupdate, fileutil (atomic writes),
+                            # sessionbus (D-Bus ownership), notify (watcher)
 ```
 
 The Rust side is a **Cargo workspace**: `cargo build --workspace`

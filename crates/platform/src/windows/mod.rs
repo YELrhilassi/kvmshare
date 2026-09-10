@@ -134,7 +134,9 @@ pub fn hostname() -> String {
     }
     // COMPUTERNAME can differ from the FQDN computer name; prefer the
     // short form Windows displays everywhere.
-    let short = String::from_utf16_lossy(&buf[..len as usize]).trim().to_owned();
+    let short = String::from_utf16_lossy(&buf[..len as usize])
+        .trim()
+        .to_owned();
     if !short.is_empty() {
         return short;
     }
@@ -170,9 +172,18 @@ impl Server {
         timer::HighResTimer::engage_forever();
         let (input, capture_tick, isolate) = capture::start()?;
         let engine = Box::new(engine::Win32Engine::new(isolate));
-        let clipboard: Box<dyn kvmshare_core::client::Clipboard> = Box::new(clipboard::Clipboard::new());
-        let liveness = Arc::new(Liveness { capture_tick_ms: capture_tick, ..Default::default() });
-        Ok(Self { input, engine, clipboard, liveness })
+        let clipboard: Box<dyn kvmshare_core::client::Clipboard> =
+            Box::new(clipboard::Clipboard::new());
+        let liveness = Arc::new(Liveness {
+            capture_tick_ms: capture_tick,
+            ..Default::default()
+        });
+        Ok(Self {
+            input,
+            engine,
+            clipboard,
+            liveness,
+        })
     }
 }
 

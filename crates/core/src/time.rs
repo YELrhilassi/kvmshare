@@ -16,6 +16,5 @@ pub fn now_ms() -> u64 {
 }
 
 #[cfg(test)]
-#[path = "time_tests.rs"]
 mod tests;
 

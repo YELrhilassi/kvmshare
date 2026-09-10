@@ -45,6 +45,7 @@ extern void kvmTrayStop(void);
 extern void kvmTrayRestart(void);
 extern void kvmTrayQuit(void);
 extern char *kvmTrayState(void);
+extern int menu_run(Display *dpy, int px, int py, int *was_running);
 
 static Display *tray_dpy = NULL;
 static Window   tray_win = 0;
@@ -243,189 +244,6 @@ static int xembed_manager_present(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Popup menu. XEmbed has no menu protocol, so the icon's right-click opens
-// this small override-redirect window with a pointer+keyboard grab. It is
-// transient by design: built per click, destroyed on selection or dismiss.
-// ---------------------------------------------------------------------------
-
-#define MENU_W 190
-#define MENU_ITEM_H 26
-#define MENU_PAD 4
-#define MENU_ITEMS 5
-
-static Window menu_win = 0;
-static int    menu_running = 0;      // role running? (from kvmTrayState)
-static char   menu_state[64];        // "server · running" row
-static char   menu_startstop[64];    // "Start server" / "Stop server"
-
-static int menu_height(void) { return MENU_PAD * 2 + MENU_ITEMS * MENU_ITEM_H; }
-
-// menu_refresh_labels pulls the current role state from Go and rebuilds
-// the dynamic menu text. Called every time the menu opens, so the labels
-// are always current.
-static void menu_refresh_labels(void) {
-	char *st = kvmTrayState();
-	if (st != NULL) {
-		char *sep = strrchr(st, '|');
-		if (sep != NULL) {
-			menu_running = (sep[1] == '1');
-			*sep = '\0';
-		}
-		snprintf(menu_state, sizeof menu_state, "%s · %s", st,
-			menu_running ? "running" : "stopped");
-		snprintf(menu_startstop, sizeof menu_startstop, "%s %s",
-			menu_running ? "Stop" : "Start", st);
-		free(st);
-	} else {
-		snprintf(menu_state, sizeof menu_state, "kvmshare");
-		snprintf(menu_startstop, sizeof menu_startstop, "Start");
-	}
-}
-
-// menu_item_text returns the label for row i (NULL for none).
-static const char *menu_item_text(int i) {
-	switch (i) {
-	case 0: return menu_state;
-	case 1: return "Open kvmshare";
-	case 2: return menu_startstop;
-	case 3: return "Restart";
-	case 4: return "Quit";
-	}
-	return NULL;
-}
-
-// menu_draw paints the menu: dark surface, dimmed state row, a separator,
-// and an accent highlight on the hovered item.
-static void menu_draw(XFontStruct *fs, int hover) {
-	if (menu_win == 0) return;
-	GC gc = DefaultGC(tray_dpy, DefaultScreen(tray_dpy));
-	int h = menu_height();
-	XSetForeground(tray_dpy, gc, 0x1b1b1f);
-	XFillRectangle(tray_dpy, menu_win, gc, 0, 0, MENU_W, h);
-	// Separator under the state row.
-	XSetForeground(tray_dpy, gc, 0x3a3a40);
-	XFillRectangle(tray_dpy, menu_win, gc, 10, MENU_PAD + MENU_ITEM_H - 1, MENU_W - 20, 1);
-	for (int i = 0; i < MENU_ITEMS; i++) {
-		const char *text = menu_item_text(i);
-		if (text == NULL) continue;
-		int y0 = MENU_PAD + i * MENU_ITEM_H;
-		if (i == hover) {
-			XSetForeground(tray_dpy, gc, 0x2d6cf6);
-			XFillRectangle(tray_dpy, menu_win, gc, 2, y0, MENU_W - 4, MENU_ITEM_H);
-			XSetForeground(tray_dpy, gc, 0xffffff);
-		} else if (i == 0) {
-			XSetForeground(tray_dpy, gc, 0x8a8a90);
-		} else {
-			XSetForeground(tray_dpy, gc, 0xe8e8ea);
-		}
-		int ty = y0 + (MENU_ITEM_H + fs->ascent - fs->descent) / 2;
-		XDrawString(tray_dpy, menu_win, gc, 12, ty, text, (int)strlen(text));
-	}
-	XFlush(tray_dpy);
-}
-
-// menu_item_at maps a position inside the menu window to a row, or 0 when
-// the position is outside the menu or on the non-clickable state row.
-static int menu_item_at(int x, int y) {
-	if (x < 0 || y < 0 || x >= MENU_W || y >= menu_height()) return 0;
-	int i = (y - MENU_PAD) / MENU_ITEM_H;
-	if (i < 0 || i >= MENU_ITEMS) return 0;
-	return i;
-}
-
-// menu_run shows the popup at the pointer, runs it until an item is
-// chosen or it is dismissed, and returns the chosen row (0 = dismissed).
-static int menu_run(int px, int py) {
-	int scr = DefaultScreen(tray_dpy);
-	int sw = WidthOfScreen(DefaultScreenOfDisplay(tray_dpy));
-	int sh = HeightOfScreen(DefaultScreenOfDisplay(tray_dpy));
-	int mw = MENU_W, mh = menu_height();
-	if (px + mw > sw) px = sw - mw;
-	if (py + mh > sh) py = sh - mh;
-	if (px < 0) px = 0;
-	if (py < 0) py = 0;
-
-	menu_refresh_labels();
-
-	menu_win = XCreateSimpleWindow(tray_dpy, RootWindow(tray_dpy, scr),
-		px, py, mw, mh, 1, 0x4a4a50, 0x1b1b1f);
-	XStoreName(tray_dpy, menu_win, "kvmshare");
-	XSetWindowAttributes attrs;
-	attrs.override_redirect = True;
-	XChangeWindowAttributes(tray_dpy, menu_win, CWOverrideRedirect, &attrs);
-	XSelectInput(tray_dpy, menu_win, ExposureMask | ButtonPressMask |
-		ButtonReleaseMask | PointerMotionMask | KeyPressMask);
-	XMapRaised(tray_dpy, menu_win);
-
-	XFontStruct *fs = XLoadQueryFont(tray_dpy, "fixed");
-	if (fs == NULL) {
-		XDestroyWindow(tray_dpy, menu_win);
-		menu_win = 0;
-		return 0;
-	}
-
-	Cursor arrow = XCreateFontCursor(tray_dpy, XC_left_ptr);
-	if (XGrabPointer(tray_dpy, menu_win, False,
-		ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
-		GrabModeAsync, GrabModeAsync, None, arrow, CurrentTime) != GrabSuccess) {
-		XFreeFont(tray_dpy, fs);
-		XFreeCursor(tray_dpy, arrow);
-		XDestroyWindow(tray_dpy, menu_win);
-		menu_win = 0;
-		return 0;
-	}
-	// A keyboard grab is best-effort: Escape-to-dismiss is nice but not
-	// worth failing the menu over if another app holds the keyboard.
-	XGrabKeyboard(tray_dpy, menu_win, False, GrabModeAsync, GrabModeAsync, CurrentTime);
-	XFlush(tray_dpy);
-
-	int hover = -1, armed = 0, action = 0, done = 0;
-	menu_draw(fs, hover);
-
-	while (!done) {
-		XEvent ev;
-		XNextEvent(tray_dpy, &ev);
-		switch (ev.type) {
-		case Expose:
-			menu_draw(fs, hover);
-			break;
-		case MotionNotify: {
-			int i = menu_item_at(ev.xmotion.x, ev.xmotion.y);
-			if (i != hover) { hover = i; menu_draw(fs, hover); }
-			break;
-		}
-		case ButtonPress: {
-			int i = menu_item_at(ev.xbutton.x, ev.xbutton.y);
-			if (i > 0) { armed = i; menu_draw(fs, hover); }
-			else { done = 1; } // click outside the menu: dismiss
-			break;
-		}
-		case ButtonRelease: {
-			int i = menu_item_at(ev.xbutton.x, ev.xbutton.y);
-			// Release on the armed item selects it; release anywhere else
-			// dismisses (standard popup-menu behavior).
-			if (i > 0 && i == armed) { action = i; }
-			done = 1;
-			armed = 0;
-			break;
-		}
-		case KeyPress: {
-			KeySym ks = XLookupKeysym(&ev.xkey, 0);
-			if (ks == XK_Escape || ks == XK_Return) { done = 1; }
-			break;
-		}
-		}
-	}
-
-	XUngrabKeyboard(tray_dpy, CurrentTime);
-	XUngrabPointer(tray_dpy, CurrentTime);
-	XDestroyWindow(tray_dpy, menu_win);
-	menu_win = 0;
-	XFreeCursor(tray_dpy, arrow);
-	XFreeFont(tray_dpy, fs);
-	XFlush(tray_dpy);
-	return action;
-}
 
 // xembed_tray_run owns the icon for the process lifetime: init, then an
 // event loop that redraws, re-docks when the manager restarts, opens the
@@ -474,13 +292,14 @@ static int xembed_tray_run(const unsigned char *rgba, int w, int h) {
 					if (ev.xbutton.button == Button1) {
 						kvmTrayOpen();
 					} else if (ev.xbutton.button == Button3) {
-						int a = menu_run(ev.xbutton.x_root, ev.xbutton.y_root);
-						switch (a) {
-						case 1: kvmTrayOpen(); break;
-						case 2: if (menu_running) kvmTrayStop(); else kvmTrayStart(); break;
-						case 3: kvmTrayRestart(); break;
-						case 4: kvmTrayQuit(); break;
-						}
+					int was_running = 0;
+					int a = menu_run(tray_dpy, ev.xbutton.x_root, ev.xbutton.y_root, &was_running);
+					switch (a) {
+					case 1: kvmTrayOpen(); break;
+					case 2: if (was_running) kvmTrayStop(); else kvmTrayStart(); break;
+					case 3: kvmTrayRestart(); break;
+					case 4: kvmTrayQuit(); break;
+					}
 					}
 					break;
 				case DestroyNotify:
@@ -532,12 +351,6 @@ static int xembed_tray_run(const unsigned char *rgba, int w, int h) {
 */
 import "C"
 import (
-	"bytes"
-	"image"
-	"image/png"
-	"sync"
-	"time"
-
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -551,128 +364,6 @@ func xembedManagerPresent() bool {
 // process exits. Left-click opens the window; right-click shows the popup
 // menu (Open, Start/Stop, Restart, Quit) whose labels track the live role
 // state. `core` and `win` must outlive the app.
-func setupXEmbedTray(app *application.App, core *App, win *application.WebviewWindow) {
-	icon, err := decodeTrayIcon()
-	if err != nil {
-		app.Logger.Info("tray: XEmbed fallback unavailable — bad icon asset")
-		return
-	}
-
-	xembedAct = xembedActions{
-		open: func() {
-			app.Logger.Info("tray: menu — open window")
-			win.Show()
-			win.Focus()
-		},
-		start: func() {
-			app.Logger.Info("tray: menu — start role")
-			if _, err := core.StartActive(); err != nil {
-				app.Logger.Error("tray: menu — start failed", "err", err)
-			}
-		},
-		stop: func() {
-			app.Logger.Info("tray: menu — stop role")
-			if err := core.StopActive(); err != nil {
-				app.Logger.Error("tray: menu — stop failed", "err", err)
-			}
-		},
-		restart: func() {
-			// StopActive waits for the role lock to be released, so the
-			// start that follows cannot collide with the old instance.
-			app.Logger.Info("tray: menu — restart role")
-			if err := core.StopActive(); err != nil {
-				app.Logger.Error("tray: menu — restart stop failed", "err", err)
-			}
-			if _, err := core.StartActive(); err != nil {
-				app.Logger.Error("tray: menu — restart start failed", "err", err)
-			}
-		},
-		quit: func() {
-			// Quitting must not strand the role: a running server or
-			// client would keep sharing input with the other machine (and,
-			// on Windows, keep the elevated client's input gate on) with
-			// no tray left to control it.
-			app.Logger.Info("tray: menu — quit")
-			if err := core.StopAll(); err != nil {
-				app.Logger.Warn("tray: quit — could not stop every role process, quitting anyway", "err", err)
-			}
-			app.Quit()
-		},
-	}
-
-	// Seed the menu labels, then keep them current for the tray's life.
-	// The C thread reads them via kvmTrayState each time the menu opens.
-	refreshXEmbedState(core)
-	go func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			refreshXEmbedState(core)
-		}
-	}()
-
-	// The C thread parks in its event loop for the process lifetime.
-	go func() {
-		data := C.CBytes(icon.rgba)
-		defer C.free(data)
-		app.Logger.Info("tray: XEmbed icon thread starting", "size", icon.w)
-		ok := C.xembed_tray_run((*C.uchar)(data), C.int(icon.w), C.int(icon.h))
-		if ok == 0 {
-			app.Logger.Info("tray: XEmbed fallback unavailable — no X display")
-		} else {
-			app.Logger.Info("tray: XEmbed icon thread exited")
-		}
-	}()
-}
-
-// refreshXEmbedState pushes the current role state into the shared struct
-// that the C menu reads (via kvmTrayState).
-func refreshXEmbedState(core *App) {
-	st := computeTrayState(core)
-	role := "server"
-	if st.role == ModeClient {
-		role = "client"
-	}
-	setXEmbedState(role, st.running)
-}
-
-// xembedActions are the popup menu's actions, wired once in
-// setupXEmbedTray before the icon thread starts and read from the C
-// thread through the //export callbacks below. Assigned-before-start, so
-// no locking is needed.
-type xembedActions struct {
-	open    func()
-	start   func()
-	stop    func()
-	restart func()
-	quit    func()
-}
-
-var xembedAct xembedActions
-
-// xembedState is the role status the C menu renders. It is written by
-// the refresh ticker (Go) and read by the C thread via kvmTrayState when
-// the menu opens — the mutex keeps the two safe.
-type xembedState struct {
-	mu      sync.Mutex
-	role    string // "server" | "client"
-	running bool
-}
-
-var xembedSt xembedState
-
-func setXEmbedState(role string, running bool) {
-	xembedSt.mu.Lock()
-	xembedSt.role = role
-	xembedSt.running = running
-	xembedSt.mu.Unlock()
-}
-
-func getXEmbedState() (string, bool) {
-	xembedSt.mu.Lock()
-	defer xembedSt.mu.Unlock()
-	return xembedSt.role, xembedSt.running
-}
 
 //export kvmTrayState
 func kvmTrayState() *C.char {
@@ -685,53 +376,52 @@ func kvmTrayState() *C.char {
 }
 
 //export kvmTrayOpen
-func kvmTrayOpen() { if xembedAct.open != nil { xembedAct.open() } }
-
-//export kvmTrayStart
-func kvmTrayStart() { if xembedAct.start != nil { xembedAct.start() } }
-
-//export kvmTrayStop
-func kvmTrayStop() { if xembedAct.stop != nil { xembedAct.stop() } }
-
-//export kvmTrayRestart
-func kvmTrayRestart() { if xembedAct.restart != nil { xembedAct.restart() } }
-
-//export kvmTrayQuit
-func kvmTrayQuit() { if xembedAct.quit != nil { xembedAct.quit() } }
-
-// trayPixels is a decoded icon as raw RGBA.
-type trayPixels struct {
-	rgba []byte
-	w, h int
+func kvmTrayOpen() {
+	if xembedAct.open != nil {
+		xembedAct.open()
+	}
 }
 
-// decodeTrayIcon decodes the embedded tray.png to RGBA.
-func decodeTrayIcon() (trayPixels, error) {
-	img, err := png.Decode(bytes.NewReader(trayIcon))
-	if err != nil {
-		return trayPixels{}, err
+//export kvmTrayStart
+func kvmTrayStart() {
+	if xembedAct.start != nil {
+		xembedAct.start()
 	}
-	b := img.Bounds()
-	w, h := b.Dx(), b.Dy()
-	rgba := make([]byte, w*h*4)
-	// image/png decodes to *image.NRGBA or *image.RGBA; both store 8-bit
-	// channels in this layout, but NRGBA is non-premultiplied which is
-	// what the C side expects.
-	switch src := img.(type) {
-	case *image.NRGBA:
-		copy(rgba, src.Pix)
-	default:
-		// Convert any other model through NRGBA.
-		for y := 0; y < h; y++ {
-			for x := 0; x < w; x++ {
-				r, g, bb, a := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
-				i := (y*w + x) * 4
-				rgba[i] = byte(r >> 8)
-				rgba[i+1] = byte(g >> 8)
-				rgba[i+2] = byte(bb >> 8)
-				rgba[i+3] = byte(a >> 8)
-			}
+}
+
+//export kvmTrayStop
+func kvmTrayStop() {
+	if xembedAct.stop != nil {
+		xembedAct.stop()
+	}
+}
+
+//export kvmTrayRestart
+func kvmTrayRestart() {
+	if xembedAct.restart != nil {
+		xembedAct.restart()
+	}
+}
+
+//export kvmTrayQuit
+func kvmTrayQuit() {
+	if xembedAct.quit != nil {
+		xembedAct.quit()
+	}
+}
+
+// launchTrayIconThread hands the decoded RGBA icon to the cgo engine and
+// parks a goroutine on the icon thread for the process lifetime.
+func launchTrayIconThread(app *application.App, icon trayPixels) {
+	go func() {
+		data := C.CBytes(icon.rgba)
+		defer C.free(data)
+		app.Logger.Info("tray: XEmbed icon thread starting", "size", icon.w)
+		ok := C.xembed_tray_run((*C.uchar)(data), C.int(icon.w), C.int(icon.h))
+		if ok == 0 {
+			app.Logger.Info("tray: XEmbed fallback unavailable — no X display")
+		} else {
+			app.Logger.Info("tray: XEmbed icon thread exited")
 		}
-	}
-	return trayPixels{rgba: rgba, w: w, h: h}, nil
+	}()
 }

@@ -132,7 +132,11 @@ pub(super) fn system_screen_info() -> ScreenInfo {
     // SAFETY: GetDpiForSystem is available on Windows 10 1607+;
     // older systems fail and we fall back to 96 (scale 1.0).
     let scale = (unsafe { hidpi::GetDpiForSystem() } as f64 / 96.0) as f32;
-    ScreenInfo { width: w.max(0) as u32, height: h.max(0) as u32, scale }
+    ScreenInfo {
+        width: w.max(0) as u32,
+        height: h.max(0) as u32,
+        scale,
+    }
 }
 
 impl Injector for Win32Injector {
@@ -234,7 +238,9 @@ impl Injector for Win32Injector {
         } else if !self.buttons_down.remove(&button) {
             return;
         }
-        let Some((flag, xbutton)) = buttons::sendinput_flags(button, pressed) else { return };
+        let Some((flag, xbutton)) = buttons::sendinput_flags(button, pressed) else {
+            return;
+        };
         // SAFETY: building a well-formed INPUT union and passing it to
         // SendInput; the union's active field matches INPUT_MOUSE.
         let mut input: km::INPUT = unsafe { std::mem::zeroed() };
@@ -247,7 +253,9 @@ impl Injector for Win32Injector {
     }
 
     fn wheel(&mut self, dx: i32, dy: i32) {
-        let Some(flag) = buttons::wheel_flag(dx, dy) else { return };
+        let Some(flag) = buttons::wheel_flag(dx, dy) else {
+            return;
+        };
         // SAFETY: well-formed wheel event; data carries the notch delta
         // in WHEEL_DELTA units.
         let mut input: km::INPUT = unsafe { std::mem::zeroed() };
@@ -261,7 +269,9 @@ impl Injector for Win32Injector {
         // Canonical HID usage -> set-1 scancode (with the E0 extended
         // flag). Unknown usages are dropped: a wrong key would be worse
         // than no key.
-        let Some((scan, extended)) = crate::keys::scancode_from_hid(key) else { return };
+        let Some((scan, extended)) = crate::keys::scancode_from_hid(key) else {
+            return;
+        };
         // Track down-state so `leave` can release whatever the server
         // never sent an up for. A repeat for a key we did not press (it
         // was held across the boundary, pressed on the server) must not
@@ -325,7 +335,6 @@ impl Injector for Win32Injector {
             self.button(button, false);
         }
     }
-
 }
 
 /// The Windows clipboard, as the client's standalone [`Clipboard`]
@@ -348,7 +357,9 @@ impl Drop for Win32Injector {
 
 impl Win32Clipboard {
     pub fn new() -> Self {
-        Self { inner: crate::windows::clipboard::Clipboard::new() }
+        Self {
+            inner: crate::windows::clipboard::Clipboard::new(),
+        }
     }
 }
 

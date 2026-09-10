@@ -61,7 +61,7 @@ function Editor({ config }: { config: LayoutConfig }) {
   }, [savedMsg, dispatch]);
 
   // dispatch is stable, so these callbacks keep a constant identity and
-  // the memoized ScreenNodes only re-render when their own data changes.
+  // the memoized canvas nodes only re-render when their own data changes.
   const onSelect = useCallback((index: number) => dispatch({ type: "select", index }), [dispatch]);
   const onMove = useCallback(
     (index: number, x: number, y: number) => dispatch({ type: "move", index, x, y }),

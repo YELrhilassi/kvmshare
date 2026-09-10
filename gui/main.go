@@ -17,6 +17,7 @@ package main
 import (
 	"embed"
 	"io/fs"
+	"kvmshare/gui/internal/sessionbus"
 	"log"
 	"log/slog"
 	"os"
@@ -54,7 +55,7 @@ func main() {
 	// daemon) that survives the GUI — the process explosion. This adopts
 	// an existing bus or creates exactly one managed one, and stops it
 	// again on exit.
-	stopBus := ensureSessionBus(core.stateDir)
+	stopBus := sessionbus.Ensure(core.stateDir)
 	defer stopBus()
 
 	// Input isolation (Linux server) needs a one-time system grant. The

@@ -9,23 +9,24 @@ never speaks the wire protocol itself.
 ```
 gui/
 ├── main.go                # entry: single instance, session bus, window, tray
-├── app.go                 # the bound App service: settings, paths, processes, logs
+├── app.go                 # the bound App service: state + construction
+├── paths.go / settings.go / instance.go      # file layout, persisted settings, single-instance
 ├── config.go              # layout + [network] config (TOML) load/save
 ├── machine_id.go          # machine id (same file the Rust binaries read)
-├── discovery.go           # mDNS advertise + browse (zeroconf), auto-connect
-├── clients.go             # connected-client list (clients.json) + control file (server.cmd)
+├── peers_api.go / discovery_host.go          # discovery bridge + Host adapter
+├── clients.go / clientstate.go               # connected clients (clients.json), client state
 ├── trust.go               # trust a client by machine id, watcher loop
-├── process.go             # process management (spawn/stop/adopt/auto-restart)
+├── process.go / roles.go / rolelock.go       # spawn plumbing / role start-stop / lock detection
 ├── process_os_unix.go     #   Unix primitives (flock, process groups, signals)
 ├── process_os_windows.go  #   Windows primitives (LockFileEx, TerminateProcess)
-├── notify.go              # client connect/disconnect notifications (tails server log)
 ├── tray.go                # system tray: SNI + XEmbed backends, role menu
+├── tray_xembed_linux.go   #   XEmbed cgo engine (Xlib icon + event loop)
+├── tray_menu_linux.go     #   XEmbed popup menu (own cgo file)
+├── tray_xembed_bridge_linux.go               #   XEmbed pure-Go wiring (state, actions)
 ├── netlog.go              # network interfaces + log tailing
 ├── update.go              # in-app self-update (GitHub releases)
-├── sessionbus_linux.go    # D-Bus session-bus ownership (Linux)
 ├── ensure_input_linux.go  # one-time input-device grant (Linux server)
 ├── ensure_uac_windows.go  # move UAC prompts to the normal desktop (Windows)
-├── fileutil.go            # atomic file writes
 │
 ├── frontend/              # Vite + React + TS + shadcn/ui
 │   └── src/
@@ -37,7 +38,14 @@ gui/
 │
 ├── cmd/kvmshare-install/  # CLI installer/updater bootstrap
 ├── installer/             # GUI installer (Wails window)
-└── internal/              # installer + selfupdate shared logic
+└── internal/              # decoupled packages
+    ├── discovery/         # beacon + mDNS engine, pairing, peer list
+    ├── ids/               # machine-id helpers
+    ├── installer/         # install steps (incl. the pkexec input grant)
+    ├── selfupdate/        # update download/apply logic
+    ├── fileutil/          # atomic file writes
+    ├── sessionbus/        # D-Bus session-bus ownership (Linux + stub)
+    └── notify/            # connect/disconnect notifications (tails server log)
 ```
 
 ## 8.1 The bound service
@@ -66,7 +74,7 @@ Key methods the frontend calls: `GetSettings`/`SetSettings`,
 
 ## 8.1a Discovery & pairing
 
-**Files: `gui/discovery.go`, `gui/trust.go`, `gui/machine_id.go`**
+**Files: `gui/internal/discovery/`, `gui/discovery_host.go`, `gui/peers_api.go`, `gui/trust.go`, `gui/machine_id.go`**
 
 - Every kvmshare advertises its role over **mDNS** (`_kvmshare._tcp`,
   service name = the machine id + role). Servers also publish their
@@ -129,8 +137,7 @@ The GUI is a controller, not a babysitter:
 The Layout page is the canvas where the user arranges the screens. It
 is split into pure geometry (`geometry.ts`), a document reducer
 (`useLayoutDocument.ts`), a view hook (`useCanvasView.ts`) and three
-presentational pieces (Toolbar, Canvas with GridLayer/ScreenNode,
-ScreenInspector):
+presentational pieces (Toolbar, Canvas with GridLayer, ScreenInspector):
 
 - Real screen proportions on a world grid; **zoom is relative** — 100%
   always fits the whole desktop, so the full layout and grid are visible
@@ -160,10 +167,10 @@ ScreenInspector):
   hiding into a ghost. Menu labels track live role state; Quit stops
   every role first so a background role is never stranded without a
   tray to control it.
-- **`notify.go`** — tails the server log for the stable
+- **`internal/notify`** — tails the server log for the stable
   `client X connected` / `disconnected` markers and raises desktop
   notifications over D-Bus; also feeds the tray's connected-client count.
-- **`sessionbus_linux.go`** — makes sure a D-Bus session bus exists
+- **`internal/sessionbus`** — makes sure a D-Bus session bus exists
   before anything touches D-Bus: adopt an existing one, else create
   **exactly one** private bus under the state dir (killed on exit).
   This prevents the classic per-launch immortal dbus-activated process
@@ -201,9 +208,11 @@ ScreenInspector):
   (`APP_SERVICE`) holds the wire prefix; interfaces mirror the Go
   structs one-to-one.
 - **`app/AppProvider.tsx`** — one store for the whole app: the role and
-  live process state with a **single** 2 s poller. Pages read
-  `useApp()` instead of running their own intervals, so they can never
-  disagree about what is running. `app/App.tsx` is the shell: top bar
+  live process state, fed by a **single push subscription** to the
+  backend's `kvmshare:state` snapshots (emitted only when something
+  changed) plus one-shot `refresh()` after user actions — no polling.
+  Pages read `useApp()` instead of running their own intervals, so they
+  can never disagree about what is running. `app/App.tsx` is the shell: top bar
   with a compact nav that only shows pages belonging to the current
   role (server mode: Home/Server/Layout/Logs; client mode:
   Home/Client/Logs). A role switch on Home can invalidate the open
@@ -221,7 +230,7 @@ ScreenInspector):
   start/stop (points to Home).
 - **features/layout/** — see §8.3. Canvas gestures are handled through
   refs with direct DOM writes during a drag (one state update on
-  release); ScreenNode is memoized so only a changed screen re-renders.
+  release); screens are memoized so only a changed screen re-renders.
 - **features/logs/** — LogsPage (level select, enable switch, clear)
   over LogViewer (`lib/useLogTail` polls the file every 1.5 s, sticks
   to the bottom unless scrolled up).

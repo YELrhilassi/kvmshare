@@ -70,10 +70,15 @@ pub(crate) fn spawn_enumerator(
                     }
                 }
                 let fd = inotify.as_ref().expect("watch established").as_raw_fd();
-                let mut pfd = [libc::pollfd { fd, events: libc::POLLIN, revents: 0 }];
+                let mut pfd = [libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }];
                 // SAFETY: pfd is a single valid pollfd backed by the
                 // inotify fd, which lives for the call.
-                let ready = unsafe { libc::poll(pfd.as_mut_ptr(), 1, FALLBACK_PERIOD.as_millis() as i32) };
+                let ready =
+                    unsafe { libc::poll(pfd.as_mut_ptr(), 1, FALLBACK_PERIOD.as_millis() as i32) };
                 if ready < 0 {
                     // EINTR or a transient error: pause and retry.
                     thread::sleep(Duration::from_millis(100));
@@ -147,7 +152,8 @@ fn parse_inotify(buf: &[u8]) -> bool {
     let mut changed = false;
     while off + 16 <= buf.len() {
         let mask = u32::from_ne_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
-        let len = u32::from_ne_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]]) as usize;
+        let len = u32::from_ne_bytes([buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]])
+            as usize;
         if mask & (WATCH_MASK | libc::IN_Q_OVERFLOW) != 0 {
             changed = true;
         }

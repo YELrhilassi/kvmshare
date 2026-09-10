@@ -31,6 +31,7 @@ pub mod engine;
 pub(crate) mod geometry;
 pub mod injector;
 pub mod wheel_daemon;
+pub mod wheel_server;
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -67,8 +68,16 @@ impl Server {
         let (input, capture_tick, wake) = capture::start(display, cmd_rx)?;
         let engine = Box::new(engine::X11Engine::new(display, cmd_tx, wake)?);
         let clipboard: Box<dyn Clipboard> = Box::new(injector::X11Clipboard::new(display));
-        let liveness = Arc::new(Liveness { capture_tick_ms: capture_tick, ..Default::default() });
-        Ok(Self { input, engine, clipboard, liveness })
+        let liveness = Arc::new(Liveness {
+            capture_tick_ms: capture_tick,
+            ..Default::default()
+        });
+        Ok(Self {
+            input,
+            engine,
+            clipboard,
+            liveness,
+        })
     }
 }
 
@@ -99,5 +108,9 @@ pub fn primary_display() -> Option<kvmshare_protocol::message::ScreenInfo> {
         Some(v) => v.size,
         None => (root.width_in_pixels as u32, root.height_in_pixels as u32),
     };
-    Some(kvmshare_protocol::message::ScreenInfo { width: w, height: h, scale: 1.0 })
+    Some(kvmshare_protocol::message::ScreenInfo {
+        width: w,
+        height: h,
+        scale: 1.0,
+    })
 }

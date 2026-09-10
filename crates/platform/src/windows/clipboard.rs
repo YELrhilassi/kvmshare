@@ -11,9 +11,9 @@
 //! `last_remote` echo-guard.
 
 use kvmshare_log::log_warn;
+use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL};
 use windows_sys::Win32::System::DataExchange as dx;
 use windows_sys::Win32::System::Memory as mem;
-use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL};
 
 /// `CF_UNICODETEXT` (13). Not exported by windows-sys; standard value.
 const CF_UNICODETEXT: u32 = 13;
@@ -135,5 +135,4 @@ impl kvmshare_core::client::Clipboard for Clipboard {
 }
 
 #[cfg(test)]
-#[path = "clipboard_tests.rs"]
 mod tests;

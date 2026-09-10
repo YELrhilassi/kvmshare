@@ -43,7 +43,6 @@ export default function LiveOverview() {
   // the whole list flapping. Rows that can work with this machine (a
   // server lists clients, a client lists servers) get connect actions;
   // a same-role machine is still shown, muted, with its real role.
-  const rows = peers;
   const usable = (p: Peer) => (isServer ? p.role === "client" : p.role === "server");
 
   const stateOf = (p: Peer): RowState => {
@@ -98,7 +97,6 @@ export default function LiveOverview() {
   // Every discovered machine is actionable (trust, connect); there is
   // nothing to filter out. The empty message only covers "nothing on
   // the network at all".
-  const visible = rows;
   const empty =
     "No other machines found yet. They show up here automatically once they're running — or connect by address from the Client page.";
 
@@ -119,11 +117,11 @@ export default function LiveOverview() {
         </Button>
       }
     >
-      {visible.length === 0 ? (
+      {peers.length === 0 ? (
         <p className="text-sm text-muted-foreground">{empty}</p>
       ) : (
         <div className="divide-y divide-border/50">
-          {visible.map((p) => {
+          {peers.map((p) => {
             const state = stateOf(p);
             const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
             const connected = state === "connected";

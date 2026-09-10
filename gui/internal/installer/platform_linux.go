@@ -151,7 +151,7 @@ func ensureInputAccess() error {
 		return nil // already granted — stay silent, never re-prompt
 	}
 	return integrateViaPkexec()
-}// grantedFor reports whether every input device node is readable by uid:
+} // grantedFor reports whether every input device node is readable by uid:
 // owned by them, or world-readable (mode has the other-read bit) — and
 // whether uinput is writable by uid (owned, or write-open to others).
 // This is the root-side probe — see [`ensureInputAccess`].

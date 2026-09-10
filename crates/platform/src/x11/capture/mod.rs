@@ -23,11 +23,18 @@
 //! * [`events`] — XI2 event selection and raw-event decoding
 //!   (multi-valuator safe), key repeat state, and the command
 //!   vocabulary.
-//! * [`thread`] — the capture thread: the event loop, command
-//!   execution, and the beacon thread.
+//! * [`thread`] — the capture thread: the event loop, event decoding,
+//!   motion/beacon flushing, key repeats.
+//! * [`commands`] — engine-command execution: warp, cursor visibility,
+//!   the input grab, kernel device isolation.
+//! * [`beacon`] — the pointer-poll thread that feeds position beacons
+//!   from its own connection.
 
+mod beacon;
+mod commands;
 mod events;
 mod thread;
 
+pub use beacon::spawn_beacon_thread;
 pub use events::CaptureCommand;
-pub use thread::{spawn_beacon_thread, start};
+pub use thread::start;

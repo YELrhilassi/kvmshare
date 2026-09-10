@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,12 +29,38 @@ type ClientState struct {
 	ConnectingSinceMs int64 `json:"connectingSinceMs"`
 }
 
+// connectingClock remembers when the current "connecting" run began.
+// It is written from two goroutines — the state loop and the Wails
+// bridge (ClientStatus is a bound method) — so it carries its own
+// mutex; a plain field here was a data race the race detector never
+// saw only because the two writers happened to alternate.
+type connectingClock struct {
+	mu    sync.Mutex
+	since time.Time
+}
+
+// mark records the transition into "connecting", returning when this
+// run began (now, when the transition is fresh).
+func (c *connectingClock) mark(connecting bool) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if connecting {
+		if c.since.IsZero() {
+			c.since = time.Now()
+		}
+		return c.since
+	}
+	c.since = time.Time{}
+	return time.Time{}
+}
+
 // ClientStatus reads the client's live state file. Missing or unreadable
 // means "not connected" (no client has written anything yet).
 func (a *App) ClientStatus() ClientState {
 	path := filepath.Join(a.stateDir, "client.state")
 	raw, err := os.ReadFile(path)
 	if err != nil {
+		a.connectingSince.mark(false)
 		return ClientState{Status: "disconnected", Server: ""}
 	}
 	st := ClientState{Status: "disconnected"}
@@ -56,14 +83,6 @@ func (a *App) ClientStatus() ClientState {
 	// is really connecting; the file alone cannot tell a stale
 	// "connecting" from a live one (reconciledClientState fixes that
 	// before this reaches the page).
-	if st.Status == "connecting" {
-		now := time.Now()
-		if a.connectingSince.IsZero() {
-			a.connectingSince = now
-		}
-		st.ConnectingSinceMs = a.connectingSince.UnixMilli()
-	} else {
-		a.connectingSince = time.Time{}
-	}
+	st.ConnectingSinceMs = a.connectingSince.mark(st.Status == "connecting").UnixMilli()
 	return st
 }

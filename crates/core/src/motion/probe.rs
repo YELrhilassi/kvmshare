@@ -125,5 +125,4 @@ impl MotionProbe {
 }
 
 #[cfg(test)]
-#[path = "probe_tests.rs"]
-mod probe_tests;
+mod tests;

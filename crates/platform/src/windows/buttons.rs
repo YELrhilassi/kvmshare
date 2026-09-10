@@ -99,7 +99,11 @@ pub fn from_wparam(msg: u32, mouse_data: u32) -> Option<(u8, bool)> {
         wm::WM_XBUTTONDOWN | wm::WM_XBUTTONUP => {
             let pressed = msg == wm::WM_XBUTTONDOWN;
             let which = (mouse_data >> 16) & 0xFFFF;
-            let button = if which == wm::XBUTTON1 as u32 { buttons::EXTRA_1 } else { buttons::EXTRA_2 };
+            let button = if which == wm::XBUTTON1 as u32 {
+                buttons::EXTRA_1
+            } else {
+                buttons::EXTRA_2
+            };
             Some((button, pressed))
         }
         _ => None,
@@ -107,5 +111,4 @@ pub fn from_wparam(msg: u32, mouse_data: u32) -> Option<(u8, bool)> {
 }
 
 #[cfg(test)]
-#[path = "buttons_tests.rs"]
 mod tests;

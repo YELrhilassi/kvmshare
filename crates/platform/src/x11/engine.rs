@@ -71,5 +71,4 @@ impl Engine for X11Engine {
         // Also executed on the capture connection (same reason as warp).
         self.send(CaptureCommand::CursorVisible(visible));
     }
-
 }

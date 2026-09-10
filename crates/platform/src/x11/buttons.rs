@@ -62,5 +62,4 @@ pub fn wheel_to_x11(dx: i32, dy: i32) -> Option<u8> {
 }
 
 #[cfg(test)]
-#[path = "buttons_tests.rs"]
 mod tests;

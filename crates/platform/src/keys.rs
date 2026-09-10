@@ -35,13 +35,19 @@ pub fn hid_from_evdev(evdev: u16) -> Option<u32> {
 
 /// (set-1 make code, E0-extended flag) for a HID usage id, when known.
 pub fn scancode_from_hid(hid: u32) -> Option<(u16, bool)> {
-    HID_TO_SCAN.iter().find(|(h, _, _)| *h == hid).map(|(_, s, e)| (*s, *e))
+    HID_TO_SCAN
+        .iter()
+        .find(|(h, _, _)| *h == hid)
+        .map(|(_, s, e)| (*s, *e))
 }
 
 /// The HID usage id for a (set-1 make code, E0-extended flag) pair,
 /// when known.
 pub fn hid_from_scancode(scan: u16, extended: bool) -> Option<u32> {
-    HID_TO_SCAN.iter().find(|(_, s, e)| *s == scan && *e == extended).map(|(h, _, _)| *h)
+    HID_TO_SCAN
+        .iter()
+        .find(|(_, s, e)| *s == scan && *e == extended)
+        .map(|(h, _, _)| *h)
 }
 
 /// HID usage of Scroll Lock — the escape key. While the cursor is on a
@@ -147,25 +153,25 @@ const HID_TO_EVDEV: &[(u32, u16)] = &[
     (0x51, 108), // Down
     (0x52, 103), // Up
     // Keypad
-    (0x53, 69), // Num Lock
-    (0x54, 98), // KP /
-    (0x55, 55), // KP *
-    (0x56, 74), // KP -
-    (0x57, 78), // KP +
-    (0x58, 96), // KP Enter
-    (0x59, 79), // KP 1
-    (0x5a, 80), // KP 2
-    (0x5b, 81), // KP 3
-    (0x5c, 75), // KP 4
-    (0x5d, 76), // KP 5
-    (0x5e, 77), // KP 6
-    (0x5f, 71), // KP 7
-    (0x60, 72), // KP 8
-    (0x61, 73), // KP 9
-    (0x62, 82), // KP 0
-    (0x63, 83), // KP .
+    (0x53, 69),  // Num Lock
+    (0x54, 98),  // KP /
+    (0x55, 55),  // KP *
+    (0x56, 74),  // KP -
+    (0x57, 78),  // KP +
+    (0x58, 96),  // KP Enter
+    (0x59, 79),  // KP 1
+    (0x5a, 80),  // KP 2
+    (0x5b, 81),  // KP 3
+    (0x5c, 75),  // KP 4
+    (0x5d, 76),  // KP 5
+    (0x5e, 77),  // KP 6
+    (0x5f, 71),  // KP 7
+    (0x60, 72),  // KP 8
+    (0x61, 73),  // KP 9
+    (0x62, 82),  // KP 0
+    (0x63, 83),  // KP .
     (0x67, 117), // KP = (KEY_KPEQUAL)
-    (0x85, 85), // KP , (KEY_KPJPCOMMA)
+    (0x85, 85),  // KP , (KEY_KPJPCOMMA)
     // International (JIS etc.)
     (0x87, 89),  // Int'l 1 (Ro)
     (0x88, 93),  // Int'l 2 (Katakana)
@@ -212,24 +218,56 @@ const HID_TO_EVDEV: &[(u32, u16)] = &[
 
 /// (evdev code, HID usage) pairs — the reverse of [`HID_TO_EVDEV`].
 const EVDEV_TO_HID: &[(u16, u32)] = &[
-    (1, 0x29),   // ESC
-    (2, 0x1e), (3, 0x1f), (4, 0x20), (5, 0x21), (6, 0x22), (7, 0x23), (8, 0x24), (9, 0x25), (10, 0x26), (11, 0x27),
+    (1, 0x29), // ESC
+    (2, 0x1e),
+    (3, 0x1f),
+    (4, 0x20),
+    (5, 0x21),
+    (6, 0x22),
+    (7, 0x23),
+    (8, 0x24),
+    (9, 0x25),
+    (10, 0x26),
+    (11, 0x27),
     (12, 0x2d), // -
     (13, 0x2e), // =
     (14, 0x2a), // Backspace
     (15, 0x2b), // Tab
-    (16, 0x14), (17, 0x1a), (18, 0x08), (19, 0x15), (20, 0x17), (21, 0x1c), (22, 0x18), (23, 0x0c), (24, 0x12), (25, 0x13),
+    (16, 0x14),
+    (17, 0x1a),
+    (18, 0x08),
+    (19, 0x15),
+    (20, 0x17),
+    (21, 0x1c),
+    (22, 0x18),
+    (23, 0x0c),
+    (24, 0x12),
+    (25, 0x13),
     (26, 0x2f), // [
     (27, 0x30), // ]
     (28, 0x28), // Enter
     (29, 0xe0), // Left Ctrl
-    (30, 0x04), (31, 0x16), (32, 0x07), (33, 0x09), (34, 0x0a), (35, 0x0b), (36, 0x0d), (37, 0x0e), (38, 0x0f),
+    (30, 0x04),
+    (31, 0x16),
+    (32, 0x07),
+    (33, 0x09),
+    (34, 0x0a),
+    (35, 0x0b),
+    (36, 0x0d),
+    (37, 0x0e),
+    (38, 0x0f),
     (39, 0x33), // ;
     (40, 0x34), // '
     (41, 0x35), // `
     (42, 0xe1), // Left Shift
     (43, 0x31), // Backslash
-    (44, 0x1d), (45, 0x1b), (46, 0x06), (47, 0x19), (48, 0x05), (49, 0x11), (50, 0x10),
+    (44, 0x1d),
+    (45, 0x1b),
+    (46, 0x06),
+    (47, 0x19),
+    (48, 0x05),
+    (49, 0x11),
+    (50, 0x10),
     (51, 0x36), // ,
     (52, 0x37), // .
     (53, 0x38), // /
@@ -238,27 +276,43 @@ const EVDEV_TO_HID: &[(u16, u32)] = &[
     (56, 0xe2), // Left Alt
     (57, 0x2c), // Space
     (58, 0x39), // Caps Lock
-    (59, 0x3a), (60, 0x3b), (61, 0x3c), (62, 0x3d), (63, 0x3e), (64, 0x3f), (65, 0x40), (66, 0x41), (67, 0x42), (68, 0x43),
+    (59, 0x3a),
+    (60, 0x3b),
+    (61, 0x3c),
+    (62, 0x3d),
+    (63, 0x3e),
+    (64, 0x3f),
+    (65, 0x40),
+    (66, 0x41),
+    (67, 0x42),
+    (68, 0x43),
     (69, 0x53), // Num Lock
     (70, 0x47), // Scroll Lock
-    (71, 0x5f), (72, 0x60), (73, 0x61), // KP 7 8 9
+    (71, 0x5f),
+    (72, 0x60),
+    (73, 0x61), // KP 7 8 9
     (74, 0x56), // KP -
-    (75, 0x5c), (76, 0x5d), (77, 0x5e), // KP 4 5 6
+    (75, 0x5c),
+    (76, 0x5d),
+    (77, 0x5e), // KP 4 5 6
     (78, 0x57), // KP +
-    (79, 0x59), (80, 0x5a), (81, 0x5b), // KP 1 2 3
+    (79, 0x59),
+    (80, 0x5a),
+    (81, 0x5b), // KP 1 2 3
     (82, 0x62), // KP 0
     (83, 0x63), // KP .
     (85, 0x85), // KP ,
     (86, 0x32), // Non-US #
-    (87, 0x44), (88, 0x45), // F11 F12
-    (89, 0x87), // Ro
-    (93, 0x88), // Katakana
-    (94, 0x8a), // Henkan
-    (95, 0x8b), // Muhenkan
-    (96, 0x58), // KP Enter
-    (97, 0xe4), // Right Ctrl
-    (98, 0x54), // KP /
-    (99, 0x46), // Print Screen
+    (87, 0x44),
+    (88, 0x45),  // F11 F12
+    (89, 0x87),  // Ro
+    (93, 0x88),  // Katakana
+    (94, 0x8a),  // Henkan
+    (95, 0x8b),  // Muhenkan
+    (96, 0x58),  // KP Enter
+    (97, 0xe4),  // Right Ctrl
+    (98, 0x54),  // KP /
+    (99, 0x46),  // Print Screen
     (100, 0xe6), // Right Alt
     (102, 0x4a), // Home
     (103, 0x52), // Up
@@ -333,9 +387,16 @@ const HID_TO_SCAN: &[(u32, u16, bool)] = &[
     (0x1c, 0x15, false), // y
     (0x1d, 0x2c, false), // z
     // Digits
-    (0x1e, 0x02, false), (0x1f, 0x03, false), (0x20, 0x04, false), (0x21, 0x05, false),
-    (0x22, 0x06, false), (0x23, 0x07, false), (0x24, 0x08, false), (0x25, 0x09, false),
-    (0x26, 0x0a, false), (0x27, 0x0b, false),
+    (0x1e, 0x02, false),
+    (0x1f, 0x03, false),
+    (0x20, 0x04, false),
+    (0x21, 0x05, false),
+    (0x22, 0x06, false),
+    (0x23, 0x07, false),
+    (0x24, 0x08, false),
+    (0x25, 0x09, false),
+    (0x26, 0x0a, false),
+    (0x27, 0x0b, false),
     // Editing / whitespace / punctuation
     (0x28, 0x1c, false), // Enter
     (0x29, 0x01, false), // Escape
@@ -356,9 +417,18 @@ const HID_TO_SCAN: &[(u32, u16, bool)] = &[
     (0x38, 0x35, false), // / ?
     (0x39, 0x3a, false), // Caps Lock
     // Function row
-    (0x3a, 0x3b, false), (0x3b, 0x3c, false), (0x3c, 0x3d, false), (0x3d, 0x3e, false),
-    (0x3e, 0x3f, false), (0x3f, 0x40, false), (0x40, 0x41, false), (0x41, 0x42, false),
-    (0x42, 0x43, false), (0x43, 0x44, false), (0x44, 0x57, false), (0x45, 0x58, false),
+    (0x3a, 0x3b, false),
+    (0x3b, 0x3c, false),
+    (0x3c, 0x3d, false),
+    (0x3d, 0x3e, false),
+    (0x3e, 0x3f, false),
+    (0x3f, 0x40, false),
+    (0x40, 0x41, false),
+    (0x41, 0x42, false),
+    (0x42, 0x43, false),
+    (0x43, 0x44, false),
+    (0x44, 0x57, false),
+    (0x45, 0x58, false),
     // Navigation cluster (E0-extended)
     (0x46, 0x37, true),  // Print Screen
     (0x47, 0x46, false), // Scroll Lock
@@ -379,9 +449,15 @@ const HID_TO_SCAN: &[(u32, u16, bool)] = &[
     (0x56, 0x4a, false), // KP -
     (0x57, 0x4e, false), // KP +
     (0x58, 0x1c, true),  // KP Enter
-    (0x59, 0x4f, false), (0x5a, 0x50, false), (0x5b, 0x51, false), // KP 1 2 3
-    (0x5c, 0x4b, false), (0x5d, 0x4c, false), (0x5e, 0x4d, false), // KP 4 5 6
-    (0x5f, 0x47, false), (0x60, 0x48, false), (0x61, 0x49, false), // KP 7 8 9
+    (0x59, 0x4f, false),
+    (0x5a, 0x50, false),
+    (0x5b, 0x51, false), // KP 1 2 3
+    (0x5c, 0x4b, false),
+    (0x5d, 0x4c, false),
+    (0x5e, 0x4d, false), // KP 4 5 6
+    (0x5f, 0x47, false),
+    (0x60, 0x48, false),
+    (0x61, 0x49, false), // KP 7 8 9
     (0x62, 0x52, false), // KP 0
     (0x63, 0x53, false), // KP .
     (0x67, 0x59, false), // KP =
@@ -421,5 +497,4 @@ const HID_TO_SCAN: &[(u32, u16, bool)] = &[
 ];
 
 #[cfg(test)]
-#[path = "keys_tests.rs"]
 mod tests;

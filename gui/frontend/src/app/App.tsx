@@ -79,7 +79,7 @@ function Shell() {
         </header>
 
         <main className="min-h-0 flex-1 overflow-hidden">
-          {effectivePage === "home" && <HomePage onNavigate={setPage} />}
+          {effectivePage === "home" && <HomePage />}
           {effectivePage === "server" && <ServerPage />}
           {effectivePage === "client" && <ClientPage />}
           {effectivePage === "layout" && <LayoutPage />}

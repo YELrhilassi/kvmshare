@@ -24,8 +24,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use kvmshare_core::client::{Clipboard, Injector};
-use kvmshare_core::server::Liveness;
 use kvmshare_core::server::Engine;
+use kvmshare_core::server::Liveness;
 use kvmshare_protocol::message::Message;
 
 pub mod keys;
@@ -41,10 +41,10 @@ pub mod evdev;
 // Per-OS backends. Each implements the same Engine/Injector contracts;
 // the key table in `keys` is shared so the wire identity is identical
 // everywhere.
-#[cfg(target_os = "linux")]
-pub mod x11;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "linux")]
+pub mod x11;
 
 /// Start the server-side platform: capture local input and build the
 /// engine that controls the local cursor, plus the standalone clipboard
@@ -56,7 +56,15 @@ pub mod windows;
 /// platforms without displays.
 pub fn server(
     display: Option<&str>,
-) -> Result<(Receiver<Message>, Box<dyn Engine>, Box<dyn Clipboard>, Arc<Liveness>), String> {
+) -> Result<
+    (
+        Receiver<Message>,
+        Box<dyn Engine>,
+        Box<dyn Clipboard>,
+        Arc<Liveness>,
+    ),
+    String,
+> {
     #[cfg(target_os = "linux")]
     {
         let s = x11::Server::start(display)?;
@@ -170,9 +178,7 @@ pub fn hostname() -> String {
 /// lives on its own lock and thread in the client — a clipboard call
 /// that stalls (another process holding the clipboard open) must never
 /// be able to freeze the cursor.
-pub fn client(
-    display: Option<&str>,
-) -> Result<(Box<dyn Injector>, Box<dyn Clipboard>), String> {
+pub fn client(display: Option<&str>) -> Result<(Box<dyn Injector>, Box<dyn Clipboard>), String> {
     #[cfg(target_os = "linux")]
     {
         x11::client_injector(display)

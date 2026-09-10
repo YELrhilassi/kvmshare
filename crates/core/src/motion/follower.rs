@@ -224,5 +224,4 @@ impl PositionFollower {
 }
 
 #[cfg(test)]
-#[path = "follower_tests.rs"]
-mod follower_tests;
+mod tests;

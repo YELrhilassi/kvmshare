@@ -76,5 +76,4 @@ pub fn is_newer(seq: u32, last: u32) -> bool {
 }
 
 #[cfg(test)]
-#[path = "udp_tests.rs"]
 mod tests;

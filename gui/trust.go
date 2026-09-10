@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"kvmshare/gui/internal/discovery"
 )
 
 // TrustClient adds a machine id to the server config's trusted_ids list
@@ -166,7 +168,7 @@ func (a *App) AutoConnectLoop() {
 
 // peerMatchesClientAddr reports whether a discovered server matches the
 // address the user last connected to (same host, any port).
-func (a *App) peerMatchesClientAddr(p Peer) bool {
+func (a *App) peerMatchesClientAddr(p discovery.Peer) bool {
 	addr := strings.TrimSpace(a.GetSettings().ClientAddr)
 	host := addr
 	if i := strings.LastIndex(host, ":"); i > 0 {

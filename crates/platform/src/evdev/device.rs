@@ -34,7 +34,9 @@ fn classify(dev: &Device) -> bool {
         .supported_relative_axes()
         .is_some_and(|a| a.contains(RelativeAxisCode::REL_X));
     let keyboard = dev.supported_keys().is_some_and(|k| {
-        k.contains(KeyCode::KEY_A) || k.contains(KeyCode::KEY_ENTER) || k.contains(KeyCode::KEY_SPACE)
+        k.contains(KeyCode::KEY_A)
+            || k.contains(KeyCode::KEY_ENTER)
+            || k.contains(KeyCode::KEY_SPACE)
     });
     pointer || keyboard
 }
@@ -77,7 +79,10 @@ pub(crate) fn open_devices(known: &HashSet<PathBuf>) -> (Vec<Opened>, bool) {
             // SAFETY: open(2) with a NUL-terminated path; the result is
             // checked before it is wrapped.
             let fd = unsafe {
-                libc::open(cpath.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
             };
             if fd < 0 {
                 let err = io::Error::last_os_error();
@@ -138,7 +143,9 @@ pub(crate) struct PressState {
 
 impl PressState {
     pub(crate) fn new() -> Self {
-        Self { pressed: HashSet::new() }
+        Self {
+            pressed: HashSet::new(),
+        }
     }
 
     /// Classify one EV_KEY value against what this reader pressed.
@@ -189,8 +196,14 @@ pub(crate) fn handle_event(
             RelativeAxisCode::REL_X => motion.push(ev.value() as f64, 0.0),
             RelativeAxisCode::REL_Y => motion.push(0.0, ev.value() as f64),
             // One notch per kernel event — never doubled.
-            RelativeAxisCode::REL_WHEEL => send(Message::MouseWheel { dx: 0, dy: ev.value() }),
-            RelativeAxisCode::REL_HWHEEL => send(Message::MouseWheel { dx: ev.value(), dy: 0 }),
+            RelativeAxisCode::REL_WHEEL => send(Message::MouseWheel {
+                dx: 0,
+                dy: ev.value(),
+            }),
+            RelativeAxisCode::REL_HWHEEL => send(Message::MouseWheel {
+                dx: ev.value(),
+                dy: 0,
+            }),
             _ => {}
         },
         (EventType::KEY, code) => {
@@ -206,13 +219,18 @@ pub(crate) fn handle_event(
             };
             if let Some(id) = button {
                 if press.button(id, ev.value() != 0) {
-                    send(Message::MouseButton { button: id, pressed: ev.value() != 0 });
+                    send(Message::MouseButton {
+                        button: id,
+                        pressed: ev.value() != 0,
+                    });
                 }
                 return;
             }
             // Keyboard keys travel as canonical HID usages, exactly like
             // the X capture path.
-            let Some(hid) = hid_from_evdev(code.0) else { return };
+            let Some(hid) = hid_from_evdev(code.0) else {
+                return;
+            };
             if hid == ESCAPE_KEY_HID {
                 // Swallow press and release: control comes home, the key
                 // itself never reaches the client.
@@ -231,5 +249,4 @@ pub(crate) fn handle_event(
 }
 
 #[cfg(test)]
-#[path = "evdev_tests.rs"]
 mod tests;

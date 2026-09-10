@@ -44,7 +44,10 @@ impl VisibleDesktop {
     /// failure). One output at the origin is indistinguishable from the
     /// true layout, which is exactly why the fallback is safe.
     pub fn whole_root(width: u32, height: u32) -> Self {
-        Self { origin: (0, 0), size: (width, height) }
+        Self {
+            origin: (0, 0),
+            size: (width, height),
+        }
     }
 
     /// Translate visible-local pixels into root-window pixels.
@@ -64,15 +67,28 @@ impl VisibleDesktop {
 pub fn visible_desktop(conn: &RustConnection, screen_num: usize) -> Option<VisibleDesktop> {
     let setup = conn.setup();
     let root = setup.roots.get(screen_num)?.root;
-    if conn.extension_information(randr::X11_EXTENSION_NAME).ok()?.is_none() {
+    if conn
+        .extension_information(randr::X11_EXTENSION_NAME)
+        .ok()?
+        .is_none()
+    {
         return None;
     }
-    let resources = conn.randr_get_screen_resources_current(root).ok()?.reply().ok()?;
+    let resources = conn
+        .randr_get_screen_resources_current(root)
+        .ok()?
+        .reply()
+        .ok()?;
     let mut min = (i32::MAX, i32::MAX);
     let mut max = (i32::MIN, i32::MIN);
     let mut found = false;
     for output in resources.outputs {
-        let info = match conn.randr_get_output_info(output, x11rb::CURRENT_TIME).ok()?.reply().ok() {
+        let info = match conn
+            .randr_get_output_info(output, x11rb::CURRENT_TIME)
+            .ok()?
+            .reply()
+            .ok()
+        {
             Some(info) => info,
             None => continue,
         };
@@ -83,7 +99,12 @@ pub fn visible_desktop(conn: &RustConnection, screen_num: usize) -> Option<Visib
         if info.connection != randr::Connection::CONNECTED || info.crtc == x11rb::NONE {
             continue;
         }
-        let Some(crtc) = conn.randr_get_crtc_info(info.crtc, x11rb::CURRENT_TIME).ok()?.reply().ok() else {
+        let Some(crtc) = conn
+            .randr_get_crtc_info(info.crtc, x11rb::CURRENT_TIME)
+            .ok()?
+            .reply()
+            .ok()
+        else {
             continue;
         };
         let (x, y) = (crtc.x as i32, crtc.y as i32);
@@ -123,7 +144,10 @@ mod tests {
     fn translation_shifts_by_the_origin() {
         // A monitor whose visible area sits at (1920, 200) in the root
         // (a laptop panel right of the primary, for instance).
-        let v = VisibleDesktop { origin: (1920, 200), size: (1920, 1080) };
+        let v = VisibleDesktop {
+            origin: (1920, 200),
+            size: (1920, 1080),
+        };
         // Visible-local (0, 0) is the *true* visible corner, which lives
         // at the origin in root pixels.
         assert_eq!(v.to_root(0, 0), (1920, 200));

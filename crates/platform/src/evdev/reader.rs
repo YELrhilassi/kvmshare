@@ -93,7 +93,12 @@ impl EvdevReader {
             .name("kvmshare-evdev".into())
             .spawn(move || reader_main(tx, remote2, ack2, enum_rx, known_paths, wake_rx))
             .expect("cannot spawn evdev reader");
-        Self { remote, wake: wake_tx, ack, _thread: thread }
+        Self {
+            remote,
+            wake: wake_tx,
+            ack,
+            _thread: thread,
+        }
     }
 
     /// Switch the reader between forwarding (remote) and silent (local)
@@ -174,7 +179,10 @@ fn reader_main(
     wake_rx: UnixStream,
 ) {
     let (mut devices, mut denied) = open_devices(&HashSet::new());
-    known_paths.lock().unwrap().extend(devices.iter().map(|d| d.path.clone()));
+    known_paths
+        .lock()
+        .unwrap()
+        .extend(devices.iter().map(|d| d.path.clone()));
     let mut was_remote = false;
     let mut press = PressState::new();
     let mut motion = PendingMotion::default();
@@ -224,9 +232,17 @@ fn reader_main(
         // No timeout: idle is the kernel's job, not this thread's.
         pollfds.clear();
         for d in devices.iter() {
-            pollfds.push(libc::pollfd { fd: d.dev.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            pollfds.push(libc::pollfd {
+                fd: d.dev.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
         }
-        pollfds.push(libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 });
+        pollfds.push(libc::pollfd {
+            fd: wake_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
         // SAFETY: pollfds is a valid array of pollfd; the device fds are
         // owned by `devices` and stay alive for the call.
         let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, -1) };
@@ -327,9 +343,7 @@ fn purge(devices: &mut [Opened]) {
     for d in devices.iter_mut() {
         loop {
             match d.dev.fetch_events() {
-                Ok(events) => {
-                    for _ in events {}
-                }
+                Ok(events) => for _ in events {},
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
@@ -346,7 +360,11 @@ fn set_grabbed(devices: &mut [Opened], grab: bool) {
         let res = if grab { d.dev.grab() } else { d.dev.ungrab() };
         match res {
             Ok(()) => ok += 1,
-            Err(e) => log_warn!("evdev: {}: cannot {}: {e}", d.name, if grab { "grab" } else { "release" }),
+            Err(e) => log_warn!(
+                "evdev: {}: cannot {}: {e}",
+                d.name,
+                if grab { "grab" } else { "release" }
+            ),
         }
     }
     if grab {

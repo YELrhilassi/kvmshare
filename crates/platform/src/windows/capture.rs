@@ -86,7 +86,8 @@ use super::buttons;
 
 /// Window class name for the hidden capture window.
 const CAPTURE_CLASS: &[u16] = &[
-    'K' as u16, 'V' as u16, 'M' as u16, 'S' as u16, 'H' as u16, 'A' as u16, 'R' as u16, 'E' as u16, 0,
+    'K' as u16, 'V' as u16, 'M' as u16, 'S' as u16, 'H' as u16, 'A' as u16, 'R' as u16, 'E' as u16,
+    0,
 ];
 
 /// How often the position beacon polls `GetCursorPos` (ms). Same order
@@ -132,7 +133,8 @@ static TX: OnceLock<Sender<Message>> = OnceLock::new();
 /// presses are deduplicated against it: only true down/up transitions
 /// are forwarded, so a stuck key can never be left on the receiving
 /// machine.
-static KEYS_DOWN: LazyLock<Mutex<HashSet<(u16, bool)>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static KEYS_DOWN: LazyLock<Mutex<HashSet<(u16, bool)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Set when an escape (Scroll Lock) press was consumed while the cursor
 /// was away; the matching release is swallowed too (it was never
@@ -236,17 +238,25 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                             drop(down);
                             return 1;
                         }
-                        hook_send(Message::Key { kind: KeyKind::Down, key });
+                        hook_send(Message::Key {
+                            kind: KeyKind::Down,
+                            key,
+                        });
                     }
                 } else if is_up && was_down {
                     down.remove(&id);
-                    if id == (ESCAPE_SCAN, ESCAPE_EXTENDED) && ESCAPE_CONSUMED.swap(false, Ordering::SeqCst) {
+                    if id == (ESCAPE_SCAN, ESCAPE_EXTENDED)
+                        && ESCAPE_CONSUMED.swap(false, Ordering::SeqCst)
+                    {
                         // Release of a consumed escape: swallow it too.
                         drop(down);
                         return 1;
                     }
                     if let Some(key) = crate::keys::hid_from_scancode(id.0, id.1) {
-                        hook_send(Message::Key { kind: KeyKind::Up, key });
+                        hook_send(Message::Key {
+                            kind: KeyKind::Up,
+                            key,
+                        });
                     }
                 }
             }
@@ -355,7 +365,10 @@ pub fn start() -> Result<(Receiver<Message>, Arc<AtomicU64>, Arc<AtomicBool>), S
 /// report the outcome over the start handshake, then block on the
 /// message queue — which services the hooks — forwarding what matters.
 /// Runs forever; returns only on a fatal error.
-fn run_forever(init: Sender<Result<(), String>>, capture_tick: Arc<AtomicU64>) -> Result<(), String> {
+fn run_forever(
+    init: Sender<Result<(), String>>,
+    capture_tick: Arc<AtomicU64>,
+) -> Result<(), String> {
     let hwnd = match create_capture_window() {
         Ok(h) => h,
         Err(e) => {
@@ -371,7 +384,8 @@ fn run_forever(init: Sender<Result<(), String>>, capture_tick: Arc<AtomicU64>) -
     // SAFETY: both procs are `extern "system"` statics matching the
     // low-level-hook procedure shape the API requires.
     let mouse = unsafe { wm::SetWindowsHookExW(wm::WH_MOUSE_LL, Some(mouse_proc), hinstance, 0) };
-    let keyboard = unsafe { wm::SetWindowsHookExW(wm::WH_KEYBOARD_LL, Some(keyboard_proc), hinstance, 0) };
+    let keyboard =
+        unsafe { wm::SetWindowsHookExW(wm::WH_KEYBOARD_LL, Some(keyboard_proc), hinstance, 0) };
     if mouse.is_null() || keyboard.is_null() {
         let err = format!(
             "input hooks failed to install (mouse: {}, keyboard: {})",
@@ -439,7 +453,7 @@ static LAST_BEACON: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 /// since the last poll. See the module docs for why the session needs
 /// these and why changes only. Skipped while the cursor is on a client:
 /// it is hidden and pinned, its position is meaningless to the session
-/// (which ignores local beacons in Remote mode anyway), and the 
+/// (which ignores local beacons in Remote mode anyway), and the
 /// re-anchoring would fight the forwarded motion.
 fn on_timer() {
     if isolate() {
@@ -476,5 +490,4 @@ fn wheel_notches(data: u32) -> i32 {
 }
 
 #[cfg(test)]
-#[path = "capture_tests.rs"]
 mod tests;

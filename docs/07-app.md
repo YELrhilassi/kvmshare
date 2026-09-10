@@ -6,7 +6,9 @@ poller. Everything here is above the core/platform crates.
 
 ## 7.1 The config file
 
-**File: `crates/app/src/config.rs`**
+**Files: `crates/app/src/config/` — the model + validation in `mod.rs`,
+persistence (load/save/atomic write) in `io.rs`, layout geometry in
+`geometry.rs`.**
 
 The server config (`kvmshare-server.toml`) describes **one machine's
 role as a server**: the port to listen on, the connection policy, and

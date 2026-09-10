@@ -89,5 +89,4 @@ impl GainTracker {
 }
 
 #[cfg(test)]
-#[path = "gain_tests.rs"]
-mod gain_tests;
+mod tests;
