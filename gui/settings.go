@@ -33,12 +33,28 @@ type Settings struct {
 	// accepts connection requests from (discovery pairing). Empty means
 	// "no server may command this machine to connect".
 	TrustedServers []string `json:"trustedServers"`
+	// RevokedServers is the list of server machine ids the operator
+	// explicitly refused. Revocation is sticky: it survives a later
+	// pairing request and, crucially, it overrides the last-used-address
+	// fallback auto-connect uses. Without it, "revoke" only removed the
+	// id from TrustedServers — and auto-connect would reconnect to the
+	// very server the operator had just refused, because its address
+	// still matched the last connection.
+	RevokedServers []string `json:"revokedServers"`
 	// AcceptPairing lets any local kvmshare server request a connection
 	// (a convenience with a trust trade-off; off by default).
 	AcceptPairing bool `json:"acceptPairing"`
 	// AutoConnect makes the client automatically connect to the last
 	// used server when it appears on the network (discovery).
 	AutoConnect bool `json:"autoConnect"`
+	// AutoConnectPaused is set whenever a client session ends *by
+	// request* — the operator pressed Stop, or the server sent the
+	// disconnect command — and cleared by an explicit Start/Connect. It
+	// is what stops auto-connect from immediately undoing an operator's
+	// "stop": without it, pressing Stop with auto-connect on restarted
+	// the client a second later. Persisted so a GUI restart does not
+	// silently resume a session the operator ended.
+	AutoConnectPaused bool `json:"autoConnectPaused"`
 }
 
 // LogSettings is what the Logs page shows and edits: the logging
@@ -105,12 +121,15 @@ func (a *App) GetSettings() Settings {
 
 // ConnectToServer points the client at `addr` (host:port) and starts it.
 // Used by discovery pairing: a trusted server asked this machine to
-// connect. Idempotent when a client is already running.
+// connect. Idempotent when a client is already running — an active
+// session is never disturbed, and its saved address is left alone.
 func (a *App) ConnectToServer(addr string) error {
 	a.mu.Lock()
-	next := a.settings
-	next.ClientAddr = addr
-	a.settings = next
+	if a.clientProc.running() || a.roleActive(roleClient) {
+		a.mu.Unlock()
+		return nil // already connected: don't clobber the live session
+	}
+	a.settings.ClientAddr = addr
 	a.saveSettingsLocked()
 	a.mu.Unlock()
 	_, err := a.ClientStart()
@@ -131,6 +150,17 @@ func (a *App) SetSettings(s Settings) error {
 	if !validLogLevel(s.LogLevel) {
 		a.mu.Unlock()
 		return fmt.Errorf("unknown log level %q (use error, warn, info, debug or trace)", s.LogLevel)
+	}
+	// The revocation list and the auto-connect pause are managed by the
+	// trust and lifecycle paths, not by the settings form — the frontend
+	// only renders the fields it knows, so a later `{...settings}` write
+	// would otherwise silently blank them. Enabling auto-connect is the
+	// one settings change that re-arms it (a deliberate "turn it back
+	// on" supersedes whatever ended the last session).
+	s.RevokedServers = a.settings.RevokedServers
+	s.AutoConnectPaused = a.settings.AutoConnectPaused
+	if s.AutoConnect && !a.settings.AutoConnect {
+		s.AutoConnectPaused = false
 	}
 	a.settings = s
 	a.saveSettingsLocked()

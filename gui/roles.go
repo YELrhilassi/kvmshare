@@ -110,6 +110,11 @@ func (a *App) ServerStop() error {
 func (a *App) ClientStop() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// An operator stop is a decision, not a transient failure: hold
+	// auto-connect off until they explicitly start again, or the watcher
+	// would restart the client a tick later and the Stop would look
+	// broken.
+	a.pauseAutoConnectLocked()
 	return a.stopRoleLocked(roleClient)
 }
 
@@ -228,11 +233,21 @@ func (a *App) spawnServerLocked() (*proc, error) {
 
 // ClientStart starts the client against the configured server address.
 // Same adopt/stop-the-other-role/conflict-retry contract as
-// ServerStart.
+// ServerStart. The body lives in clientStartLocked so the auto-connect
+// path can decide-and-start under a single hold of a.mu — otherwise a
+// check that passes can go stale before the start, and the start can
+// kill a server the operator began in the gap.
 func (a *App) ClientStart() (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// An explicit start is the operator re-arming auto-connect: whatever
+	// ended the last session by request (Stop, or the server's
+	// disconnect), this supersedes it.
+	a.clearAutoConnectPauseLocked()
+	return a.clientStartLocked()
+}
 
+func (a *App) clientStartLocked() (bool, error) {
 	if a.clientProc.running() || a.roleActive(roleClient) {
 		return true, nil // already running (adopt the background instance)
 	}

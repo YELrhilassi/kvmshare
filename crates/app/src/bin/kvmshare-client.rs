@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use kvmshare_app::guard::{self, RoleGuard};
-use kvmshare_app::{hostname, machine_id, parse_client_args, state_dir, with_default_port, write_client_state, DEFAULT_PORT};
+use kvmshare_app::{hostname, machine_id, parse_client_args, state_dir, with_default_port, write_client_state, write_client_state_stopped, DEFAULT_PORT};
 use kvmshare_core::client::{Client, SessionEnd};
 use kvmshare_log::{log_error, log_info, log_warn};
 use kvmshare_protocol::message::Message;
@@ -110,7 +110,10 @@ fn run() -> Result<(), String> {
                     // The operator starts the client again when wanted.
                     Ok(SessionEnd::Disconnected) => {
                         log_info!("disconnected by the server — staying stopped");
-                        write_client_state(&state_dir, "disconnected", &addr);
+                        // The `stopped` marker tells the GUI this was a
+                        // requested stop, not a transient drop, so its
+                        // auto-connect does not undo it.
+                        write_client_state_stopped(&state_dir, &addr);
                         return Ok(());
                     }
                     // Reconnect/restart: immediately, fresh handshake.

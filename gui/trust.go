@@ -1,24 +1,24 @@
 package main
 
-// Trust and auto-connect: the two sides of "set it up once, connect
-// automatically after".
+// Trust, revocation and the trust matchers shared by pairing and
+// auto-connect (the auto-connect policy itself lives in autoconnect.go).
 //
 //   - Server side — a server operator sees a nearby machine in the
 //     discovery list and clicks "trust": its machine id is added to the
 //     config's `[network] trusted_ids`, so the allowlist accepts it even
 //     before a layout screen is pinned for it. Entries accept the short
 //     id (8 chars) or the full 32-char id — matching is by prefix.
-//   - Client side — the GUI's settings carry a trusted-servers list and
-//     an auto-connect flag. When auto-connect is on and a server whose
-//     id is trusted (or whose address matches the last-used server)
-//     appears on the network, the client connects by itself.
+//   - Client side — machine ids the operator accepts requests from
+//     (TrustedServers) and ids they explicitly refused (RevokedServers).
+//     Revocation is sticky and outranks every convenience path.
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
-	"time"
 
-	"kvmshare/gui/internal/discovery"
+	"kvmshare/gui/internal/ids"
 )
 
 // TrustClient adds a machine id to the server config's trusted_ids list
@@ -65,28 +65,40 @@ func (a *App) RevokeClient(id string) error {
 	return a.SaveConfig(cfg)
 }
 
-// RevokeServer removes a server machine id from this machine's
-// trusted-servers list — its connection requests are refused again
-// (unless pairing is enabled). Idempotent; accepts short or full ids.
+// RevokeServer refuses a server machine id on this machine. It is
+// removed from the trusted list AND added to the revoked list — the two
+// together mean "never accept this server again, not even by pairing"
+// and, critically, "never auto-connect to it, not even because its
+// address matches the last connection". If the client is currently
+// connected to that server, the session is stopped: revocation should
+// take effect now, not at the next restart.
+//
+// Idempotent; accepts short or full ids.
 func (a *App) RevokeServer(id string) error {
 	id = strings.TrimSpace(id)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	kept := a.settings.TrustedServers[:0]
-	for _, t := range a.settings.TrustedServers {
-		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
-			continue
-		}
-		kept = append(kept, t)
+	if len(id) < 4 {
+		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
 	}
-	a.settings.TrustedServers = kept
+	a.mu.Lock()
+	a.settings.TrustedServers = dropID(a.settings.TrustedServers, id)
+	if !idRevoked(a.settings.RevokedServers, id) {
+		a.settings.RevokedServers = append(a.settings.RevokedServers, id)
+	}
 	a.saveSettingsLocked()
+	a.mu.Unlock()
+
+	// If we are connected to the machine we just revoked, end it now.
+	if addr, ok := a.livePeerAddr(id); ok && a.clientTargets(addr) {
+		return a.ClientStop()
+	}
 	return nil
 }
 
 // TrustServer adds a server machine id to this machine's trusted-servers
-// list (the client accepts connection requests from it). Idempotent;
-// accepts short or full ids.
+// list (the client accepts connection requests from it). Trusting an id
+// is the explicit opposite of revoking it, so a revoked id is cleared —
+// otherwise a re-trust would be silently dead (the revoke check wins
+// everywhere). Idempotent; accepts short or full ids.
 func (a *App) TrustServer(id string) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
@@ -94,87 +106,64 @@ func (a *App) TrustServer(id string) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, t := range a.settings.TrustedServers {
-		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
-			return nil
-		}
+	a.settings.RevokedServers = dropID(a.settings.RevokedServers, id)
+	if !idTrusted(a.settings.TrustedServers, id) {
+		a.settings.TrustedServers = append(a.settings.TrustedServers, id)
 	}
-	a.settings.TrustedServers = append(a.settings.TrustedServers, id)
 	a.saveSettingsLocked()
 	return nil
 }
 
-// autoConnectBlocked reports whether auto-connect must stay quiet right
-// now. It is checked at the top of each tick AND again immediately
-// before connecting, because the decision goes stale fast: the user can
-// switch modes or start a role while the peer scan runs. In particular
-// a RUNNING SERVER blocks auto-connect: connecting as a client would
-// stop it (one role per machine), so "switch to server, click share"
-// could otherwise end with the fresh server killed and the machine
-// reconnecting as a client a moment later — the user's explicit choice
-// must always win over convenience.
-func (a *App) autoConnectBlocked() bool {
-	s := a.GetSettings()
-	if s.Mode != ModeClient || !s.AutoConnect {
-		return true
-	}
-	// A role is running locally — a client (already connected) or a
-	// server (explicitly shared). Auto-connecting over either would
-	// fight the user.
-	return a.ClientRunning() || a.ServerRunning()
+// idRevoked reports whether id has been explicitly refused. Same prefix
+// matching as trust (short or full ids, both directions), so revoking
+// the short id also refuses the full one.
+func idRevoked(revoked []string, id string) bool {
+	return ids.Trusted(revoked, id)
 }
 
-// AutoConnectLoop watches discovery: when auto-connect is on, a client
-// that is not running connects to a trusted server (or the last used
-// server) as soon as it appears. Cheap: it only acts on a *transition*
-// (server newly seen), and it never fights the user — see
-// autoConnectBlocked.
-func (a *App) AutoConnectLoop() {
-	go func() {
-		var lastSeen map[string]bool // peer id -> present
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if a.autoConnectBlocked() {
-				lastSeen = nil
-				continue
-			}
-			s := a.GetSettings()
-			peers := a.DiscoverPeers()
-			now := map[string]bool{}
-			for _, p := range peers {
-				if p.Role != "server" {
-					continue
-				}
-				now[p.ID] = true
-				if lastSeen[p.ID] {
-					continue // seen before; don't re-trigger
-				}
-				if idTrusted(s.TrustedServers, p.ID) || a.peerMatchesClientAddr(p) {
-					// The scan takes time; re-validate so a mode switch
-					// or an explicit start that happened meanwhile wins.
-					if a.autoConnectBlocked() {
-						break
-					}
-					addr := fmt.Sprintf("%s:%d", p.Addr, portOrDefault(p.Port))
-					_ = a.ConnectToServer(addr)
-					break
-				}
-			}
-			lastSeen = now
+// dropID returns `list` without the entry that matches `id` (prefix
+// match both ways, like trust). It returns a closed-over new slice so
+// the original backing array is never aliased.
+func dropID(list []string, id string) []string {
+	kept := make([]string, 0, len(list))
+	for _, t := range list {
+		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
+			continue
 		}
-	}()
+		kept = append(kept, t)
+	}
+	return kept
 }
 
-// peerMatchesClientAddr reports whether a discovered server matches the
-// address the user last connected to (same host, any port).
-func (a *App) peerMatchesClientAddr(p discovery.Peer) bool {
-	addr := strings.TrimSpace(a.GetSettings().ClientAddr)
-	host := addr
+// livePeerAddr resolves a discovered peer's address by machine id, so a
+// revoke can tell whether the running session belongs to that machine.
+func (a *App) livePeerAddr(id string) (string, bool) {
+	if a.disc == nil {
+		return "", false
+	}
+	p, ok := a.disc.PeerByID(id)
+	if !ok {
+		return "", false
+	}
+	return net.JoinHostPort(p.Addr, strconv.Itoa(portOrDefault(p.Port))), true
+}
+
+// clientTargets reports whether the client's configured server address
+// points at `addr` (same host, any port).
+func (a *App) clientTargets(addr string) bool {
+	host := a.settings.ClientAddr
 	if i := strings.LastIndex(host, ":"); i > 0 {
 		host = host[:i]
 	}
-	return host != "" && host == p.Addr
+	host = strings.TrimSpace(host)
+	if host == "" || addr == "" {
+		return false
+	}
+	want := addr
+	if i := strings.LastIndex(want, ":"); i > 0 {
+		want = want[:i]
+	}
+	return host == want
 }
 
 func portOrDefault(p int) int {

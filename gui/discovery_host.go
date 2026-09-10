@@ -55,7 +55,14 @@ func (a *App) AdvertisedRole() (string, bool) {
 // the server is trusted OR pairing is enabled; when honored, remember
 // the server's id so the next request (and auto-connect) already
 // trusts it.
+//
+// A revoked id is refused outright, before the pairing toggle is even
+// consulted: revocation must mean "no", not "no unless the convenience
+// door happens to be open".
 func (a *App) OnPairRequest(req discovery.PairRequest) {
+	if idRevoked(a.GetSettings().RevokedServers, req.ID) {
+		return
+	}
 	if !ids.Trusted(a.GetSettings().TrustedServers, req.ID) && !a.settingsPairingEnabled() {
 		return
 	}

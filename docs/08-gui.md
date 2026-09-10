@@ -70,7 +70,8 @@ Key methods the frontend calls: `GetSettings`/`SetSettings`,
 `GetLogSettings`/`SetLogSettings`, `ClearLog`, `GetVersion`,
 `CheckForUpdate`, `ApplyUpdate`, `ConnectedClients`,
 `ListClients`, `ClientCommand`, `DiscoverServers`, `ConnectToServer`,
-`TrustClient`, `StartDiscovery`, `AutoConnectEnabled`.
+`TrustClient`/`TrustServer`/`RevokeClient`/`RevokeServer`,
+`StartDiscovery`, `RefreshDiscovery`, `SendConnectRequest`.
 
 ## 8.1a Discovery & pairing
 
@@ -80,9 +81,23 @@ Key methods the frontend calls: `GetSettings`/`SetSettings`,
   service name = the machine id + role). Servers also publish their
   port and display geometry as TXT records. No IP/port typing.
 - The **Client page** lists nearby servers with one-click connect and
-  an **auto-connect** toggle for a chosen server; the watcher also
-  reconnects when a server returns. Discovery failing means even a
-  manual address would fail — it is the same local network.
+  an **auto-connect** toggle for a chosen server. Discovery failing
+  means even a manual address would fail — it is the same local network.
+- **Auto-connect** (`gui/autoconnect.go`) keeps trying while a matching
+  server is visible, retrying with exponential backoff (2 s → 30 s) so
+  losing the first connect to the server's own startup does not leave it
+  permanently unconnected. A candidate must be a *running* server on one
+  of this machine's own subnets, must not be a **revoked** id, and must
+  be trusted or match the last-used address (a trusted id wins). Every
+  operator decision outranks it: a running role blocks it, and a session
+  ended by request — the local Stop, or the server's disconnect command
+  (which marks `client.state` with `stopped=1`) — holds it off until an
+  explicit Start. The decision and the start happen under one lock, so
+  it can never preempt a role the operator just started.
+- **Revocation is sticky**: `RevokeServer` removes the id from
+  `trustedServers` and records it in `revokedServers`, which refuses
+  pairing outright and vetoes the last-used-address fallback. Trusting
+  an id again clears the revocation.
 - **Trusted ids make pairing headless**: add a machine's id (shown on
   its own Home page) to `trusted_ids`, or accept its connect when the
   server asks — the client is admitted dynamically on first connect

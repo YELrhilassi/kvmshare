@@ -58,7 +58,10 @@ export default function ClientPage() {
     if (!settings) return;
     try {
       await api().SetSettings({ ...settings, ...p });
-      setSettings({ ...settings, ...p });
+      // Re-read rather than patching the local copy: the backend owns
+      // fields this form never edits (revoked ids, the auto-connect
+      // pause) and re-arms the pause when auto-connect is turned on.
+      setSettings(await api().GetSettings());
     } catch (e) {
       setError(String(e));
     }
@@ -119,6 +122,11 @@ export default function ClientPage() {
               <p className="text-xs text-muted-foreground">
                 Automatically connect to the server above whenever it is on this network.
               </p>
+              {settings?.autoConnect && settings.autoConnectPaused && (
+                <p className="mt-1 text-xs text-amber-600">
+                  Held off after your last stop. Press Connect to resume automatic connection.
+                </p>
+              )}
             </div>
             <Switch checked={settings?.autoConnect ?? false} onCheckedChange={(v) => void flip({ autoConnect: v })} />
           </div>

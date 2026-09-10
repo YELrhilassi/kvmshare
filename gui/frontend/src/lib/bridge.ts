@@ -40,8 +40,13 @@ export interface Settings {
   logLevel: string;
   logEnabled: boolean;
   trustedServers: string[];
+  // Server-managed (set by revoke/trust and by ending a session): the
+  // settings form never edits these, and the backend preserves them
+  // across a write.
+  revokedServers: string[];
   acceptPairing: boolean;
   autoConnect: boolean;
+  autoConnectPaused: boolean;
 }
 
 export interface ConnectedClient {

@@ -304,8 +304,25 @@ func TestAutoConnectBlockedByRunningRole(t *testing.T) {
 	if err := a.ClientStop(); err != nil {
 		t.Fatal(err)
 	}
+	// An explicit Stop is a decision: auto-connect stays held off until
+	// the operator starts again, so the watcher cannot undo the Stop a
+	// tick later.
+	if !a.autoConnectBlocked() || !a.autoConnectPaused() {
+		t.Fatal("an explicit client stop must pause auto-connect")
+	}
+	// An explicit start re-arms it (ClientStart clears the pause), and
+	// with nothing running again auto-connect is allowed.
+	if _, err := a.ClientStart(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ClientStop(); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	a.clearAutoConnectPauseLocked()
+	a.mu.Unlock()
 	if a.autoConnectBlocked() {
-		t.Fatal("auto-connect should be allowed again after the client stops")
+		t.Fatal("auto-connect should be allowed again once re-armed and idle")
 	}
 
 	// A running server (explicitly shared) → blocked: auto-connecting
@@ -318,6 +335,11 @@ func TestAutoConnectBlockedByRunningRole(t *testing.T) {
 	}
 	if err := a.ServerStop(); err != nil {
 		t.Fatal(err)
+	}
+	// Stopping a server is not ending a client session, so it must not
+	// pause auto-connect the way ClientStop does.
+	if a.autoConnectPaused() {
+		t.Fatal("stopping the server must not pause auto-connect")
 	}
 	if a.autoConnectBlocked() {
 		t.Fatal("auto-connect should be allowed again after the server stops")
