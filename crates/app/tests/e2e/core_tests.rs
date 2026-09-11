@@ -405,7 +405,9 @@ fn config_hot_reload_returns_cursor_home_and_broadcasts() {
         name: "pc".into(),
         rect: Rect { x: 0, y: 0, w: 1920, h: 1080 },
     }]);
-    h.control_tx.send(Control::Reload(new_layout)).unwrap();
+    h.control_tx
+        .send(Control::Reload(new_layout, Default::default(), Default::default()))
+        .unwrap();
     thread::sleep(Duration::from_millis(200));
 
     let ec = calls(&h.engine_calls);

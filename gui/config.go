@@ -43,14 +43,26 @@ type Config struct {
 	Port    int      `json:"port"`
 	Screens []Screen `json:"screens"`
 	Network Network  `json:"network"`
+	// Sections the GUI does not edit directly but must preserve across
+	// saves (dropping them would silently reset the user's shortcuts
+	// and input feel every time the layout was saved). They travel as
+	// parsed key/value maps so the frontend can display them; the Rust
+	// server owns their schema and re-validates on load.
+	Shortcuts map[string]any `json:"shortcuts,omitempty"`
+	Input     map[string]any `json:"input,omitempty"`
 }
 
 // configFile is the on-disk TOML shape. Kept separate from the JSON shape
-// so the two formats can evolve independently.
+// so the two formats can evolve independently. The [shortcuts] and
+// [input] sections use generic key/value maps: the Rust server owns
+// their schema and validates on load, so the Go side must only carry
+// them faithfully, not understand them.
 type configFile struct {
-	Port    int          `toml:"port"`
-	Screens []screenFile `toml:"screens"`
-	Network networkFile  `toml:"network"`
+	Port      int            `toml:"port"`
+	Screens   []screenFile   `toml:"screens"`
+	Network   networkFile    `toml:"network"`
+	Shortcuts map[string]any `toml:"shortcuts,omitempty"`
+	Input     map[string]any `toml:"input,omitempty"`
 }
 
 type networkFile struct {
@@ -104,6 +116,8 @@ func (a *App) LoadConfig() (Config, error) {
 		TrustedIDs: nonNilStrings(cf.Network.TrustedIDs),
 		RevokedIDs: nonNilStrings(cf.Network.RevokedIDs),
 	}
+	cfg.Shortcuts = cf.Shortcuts
+	cfg.Input = cf.Input
 	// Old configs have no [network] section; default to secure.
 	if !cf.Network.Allowlist && !cf.Network.LocalOnly && len(cf.Network.TrustedIDs) == 0 {
 		cfg.Network.Allowlist = true
@@ -163,6 +177,17 @@ func (a *App) SaveConfig(cfg Config) error {
 			}
 		}
 	}
+	// Sections the frontend did not touch keep their on-disk values.
+	if cfg.Shortcuts == nil || cfg.Input == nil {
+		if current, err := a.LoadConfig(); err == nil {
+			if cfg.Shortcuts == nil {
+				cfg.Shortcuts = current.Shortcuts
+			}
+			if cfg.Input == nil {
+				cfg.Input = current.Input
+			}
+		}
+	}
 	cf := configFile{
 		Port: cfg.Port,
 		Network: networkFile{
@@ -171,6 +196,8 @@ func (a *App) SaveConfig(cfg Config) error {
 			TrustedIDs: cfg.Network.TrustedIDs,
 			RevokedIDs: cfg.Network.RevokedIDs,
 		},
+		Shortcuts: cfg.Shortcuts,
+		Input:     cfg.Input,
 	}
 	for _, s := range cfg.Screens {
 		cf.Screens = append(cf.Screens, screenFile{

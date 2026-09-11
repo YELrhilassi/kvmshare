@@ -10,8 +10,9 @@
 
 use std::time::Instant;
 
-use kvmshare_protocol::message::{Message, Rect};
+use kvmshare_protocol::message::{KeyKind, Message, Rect};
 
+use crate::actions::UserAction;
 use crate::layout::Direction;
 use crate::Mode;
 
@@ -43,8 +44,11 @@ impl Session {
             Message::MouseButton { button, pressed } => {
                 self.forward_while_remote(Message::MouseButton { button, pressed })
             }
-            Message::MouseWheel { dx, dy } => self.forward_while_remote(Message::MouseWheel { dx, dy }),
-            Message::Key { kind, key } => self.forward_while_remote(Message::Key { kind, key }),
+            Message::MouseWheel { dx, dy } => {
+                let (dx, dy) = self.prefs.transform_wheel(dx, dy);
+                self.forward_while_remote(Message::MouseWheel { dx, dy })
+            }
+            Message::Key { kind, key } => self.on_local_key(kind, key),
             // The user pressed the escape key (Scroll Lock) while the
             // cursor was on a client: bring control home, no matter what
             // the client is doing. This is the universal "unstick" — it
@@ -52,6 +56,99 @@ impl Session {
             // (an elevated window, a wedged session, a dead client).
             Message::Escape => vec![self.force_local()],
             _ => vec![],
+        }
+    }
+
+    /// A local key event, run through the action engine first: a chord
+    /// the engine owns is consumed (never forwarded) and its action —
+    /// if any — executed; everything else forwards as before while the
+    /// cursor is away. The Scroll Lock escape intercept lives in the
+    /// capture layer and runs *before* this, so `home` stays available
+    /// even with shortcuts disabled.
+    fn on_local_key(&mut self, kind: KeyKind, key: u32) -> Vec<Action> {
+        let at_home = matches!(self.cursor.mode, Mode::Local);
+        match kind {
+            KeyKind::Down => {
+                if let Some(action) = self.actions.key_down(key, self.mods_snapshot(), at_home) {
+                    return self.execute_user_action(action);
+                }
+            }
+            KeyKind::Up => {
+                if self.actions.key_up(key).is_some() {
+                    return vec![]; // the release belongs to the engine
+                }
+            }
+            KeyKind::Repeat => {}
+        }
+        self.forward_while_remote(Message::Key { kind, key })
+    }
+
+    /// Modifier state for the action engine. The capture layer reports
+    /// modifier presses as ordinary key events; the engine accumulates
+    /// them into a chord's mod set itself, so a fresh event needs only
+    /// the empty set unless a chord is mid-flight — the engine's own
+    /// bookkeeping is authoritative between events. (Full mod tracking
+    /// arrives with the customizable-binding UI; the default chords are
+    /// modifier-free.)
+    fn mods_snapshot(&self) -> crate::actions::Mods {
+        crate::actions::Mods::NONE
+    }
+
+    /// Run one user action from the engine. Anything it cannot do in
+    /// the current state (switch to an offline client, cycle with no
+    /// reachable screens) is a no-op — never an error the user must
+    /// see; the shortcut did nothing this time.
+    fn execute_user_action(&mut self, action: UserAction) -> Vec<Action> {
+        match action {
+            UserAction::SwitchToScreen { to } => {
+                let id = self.layout.screens.iter().find(|s| s.name == to).map(|s| s.id);
+                match id {
+                    Some(id) if self.reachable(id) => self.jump_to(id),
+                    _ => vec![],
+                }
+            }
+            UserAction::SwitchNext => {
+                // The next reachable screen in layout order after the
+                // current one (wrapping). With one reachable screen
+                // there is nowhere to go: no-op.
+                let current = match self.cursor.mode {
+                    Mode::Local => 0,
+                    Mode::Remote(id) => id,
+                };
+                let ids: Vec<u8> = self.layout.screens.iter().map(|s| s.id).collect();
+                let start = ids.iter().position(|&id| id == current).map(|p| p + 1).unwrap_or(0);
+                let next = (0..ids.len())
+                    .map(|k| ids[(start + k) % ids.len()])
+                    .find(|&id| id != current && self.reachable(id));
+                match next {
+                    Some(id) => self.jump_to(id),
+                    None => vec![],
+                }
+            }
+            UserAction::ToggleLock => {
+                self.walls_locked = !self.walls_locked;
+                vec![]
+            }
+            UserAction::GoHome if !matches!(self.cursor.mode, Mode::Local) => {
+                vec![self.force_local()]
+            }
+            UserAction::GoHome => vec![],
+        }
+    }
+
+    /// Jump the cursor to screen `id`, entering at its center — the
+    /// direct counterpart of a wall crossing, without one: no inset
+    /// seam (the cursor did not travel an edge) and no direction.
+    fn jump_to(&mut self, id: u8) -> Vec<Action> {
+        let (cx, cy) = match self.layout.find(id) {
+            Some(s) => s.rect.center(),
+            None => return vec![],
+        };
+        self.enter_screen(id, cx, cy);
+        if id == 0 {
+            vec![Action::SwitchToLocal { x: cx, y: cy }]
+        } else {
+            vec![Action::SwitchTo { to: id, x: cx, y: cy }]
         }
     }
 }
@@ -89,7 +186,7 @@ impl Session {
         // real-position beacons re-anchor the virtual cursor anyway.
         let (sx, sy) = match self.cursor.mode {
             Mode::Remote(_) => {
-                let g = self.gain;
+                let g = self.gain * self.prefs.pointer_speed;
                 // Scaled with a fractional carry: truncation toward zero
                 // (like the capture's PendingMotion) keeps slow motion
                 // symmetric in both directions instead of rounding every
@@ -212,6 +309,12 @@ impl Session {
     /// [`ENTRY_INSET`]). Returns nothing on a dead edge (the cursor stays
     /// clamped).
     fn switch_out(&mut self, dir: Direction) -> Vec<Action> {
+        // The user's wall lock: walls are hard while locked. The
+        // escape key and the shortcut actions bypass this (they are
+        // explicit requests, not wall pushes).
+        if self.walls_locked {
+            return vec![];
+        }
         match self.layout.neighbor(0, dir, self.cursor.x, self.cursor.y) {
             // Only a screen with a live client is a destination — a
             // configured-but-offline client is a dead edge (see the
@@ -380,6 +483,9 @@ impl Session {
     /// snaps the virtual cursor to the destination's entry point (inset
     /// past the seam — see [`ENTRY_INSET`]).
     fn cross_from_remote(&mut self, id: u8, dir: Direction) -> Vec<Action> {
+        if self.walls_locked {
+            return vec![];
+        }
         match self.layout.neighbor(id, dir, self.cursor.x, self.cursor.y) {
             // Home is always reachable; another client only while it is
             // connected (see the [`Session::connected`] docs).

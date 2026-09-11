@@ -332,7 +332,13 @@ fn spawn_config_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
                     // broadcasts the new screen map, while the policy edit
                     // can disconnect a client that was just revoked (see
                     // [`Control::SetPolicy`]).
-                    if tx.send(Control::Reload(cfg.to_layout())).is_err()
+                    if tx
+                        .send(Control::Reload(
+                            cfg.to_layout(),
+                            cfg.shortcuts.clone(),
+                            cfg.input.clone(),
+                        ))
+                        .is_err()
                         || tx.send(Control::SetPolicy(cfg.network_policy())).is_err()
                     {
                         return; // server gone

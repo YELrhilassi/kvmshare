@@ -34,6 +34,30 @@ export interface LayoutConfig {
   port: number;
   screens: Screen[];
   network: Network;
+  /** [shortcuts] config section — schema owned by the Rust server. */
+  shortcuts?: ShortcutSection;
+  /** [input] config section — schema owned by the Rust server. */
+  input?: InputSection;
+}
+
+export interface ShortcutSection {
+  enabled: boolean;
+  bindings: Binding[];
+}
+
+/** One shortcut chord: modifier set + canonical HID key + action. */
+export interface Binding {
+  mods: { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean };
+  key: number;
+  /** switch (needs screen) | cycle | lock | home */
+  action: string;
+  screen?: string;
+}
+
+export interface InputSection {
+  pointerSpeed: number;
+  wheelSpeed: number;
+  swapScroll: boolean;
 }
 
 export interface Settings {

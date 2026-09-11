@@ -13,3 +13,5 @@ kvmshare-protocol = { path = "crates/protocol" }
 kvmshare-log = { path = "crates/log" }
 kvmshare-core = { path = "crates/core" }
 kvmshare-platform = { path = "crates/platform" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

@@ -104,6 +104,8 @@ mod tests {
                 ScreenConfig { name: "below".into(), width: 1920, height: 1080, x: 0, y: 1080, scale: 1.0 },
             ],
             network: NetworkConfig::default(),
+            shortcuts: kvmshare_core::BindSection::default(),
+            input: kvmshare_core::InputPrefs::default(),
         };
 
         assert!(cfg.correct_local_screen_to(1024, 768), "a stale size must be corrected");
@@ -136,6 +138,8 @@ mod tests {
                 ScreenConfig { name: "overlap".into(), width: 800, height: 600, x: 1500, y: 200, scale: 1.0 },
             ],
             network: NetworkConfig::default(),
+            shortcuts: kvmshare_core::BindSection::default(),
+            input: kvmshare_core::InputPrefs::default(),
         };
         assert!(cfg.correct_local_screen_to(1024, 768));
         assert_eq!(cfg.screens[1].x, 1500, "an overlapping screen must not shift");

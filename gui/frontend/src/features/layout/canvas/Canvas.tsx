@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Stage, Layer, Rect, Text, Group, Circle } from "react-konva";
+import { Stage, Layer, Rect, Text, Group } from "react-konva";
 import type { KonvaEventObject } from "konva/lib/Node";
 import type { Screen } from "@/lib/bridge";
 import { gridStyle, MODEL_SCALE, snapTo, WORLD_SPAN, type View } from "@/features/layout/geometry";
@@ -267,13 +267,18 @@ export default function Canvas({
   );
 }
 
-// One screen as a Konva Group: a soft glass panel with a header strip
-// (accent dot + name, like a window title bar), a "you" badge on the
-// own screen, and the resolution pinned to the bottom corner. Draggable
-// unless locked. Text lives in a header so it reads at any zoom; the
-// pill-free layout keeps screens looking like screens, not tags.
+// One screen as a Konva Group: a flat, solid panel — no gradients, no
+// shadows, no translucency — with a header band (accent tick + name),
+// a centered resolution line, and a small "you" tag on the own screen.
+// Solid fills and hairline strokes render crisply at every zoom and
+// keep the canvas reading as a diagram, not a mock desktop. Draggable
+// unless locked.
 const OWN_ACCENT = "#34d399"; // emerald — this machine
 const OTHER_ACCENT = "#7dd3fc"; // sky — other machines
+const BODY_FILL = "#1b1e26"; // solid panel
+const HEADER_FILL = "#232732"; // solid header band
+const HAIRLINE = "rgba(255,255,255,0.08)";
+const RADIUS = 3; // very small rounding — crisp, not bubbly
 
 function ScreenRect({
   screen,
@@ -299,9 +304,7 @@ function ScreenRect({
 
   const name = screen.name || "screen";
   const accent = own ? OWN_ACCENT : OTHER_ACCENT;
-  // The header is a fixed fraction of the screen height so a small
-  // screen never drowns in chrome, and never so tall it eats the body.
-  const headerH = Math.min(28, Math.max(20, h * 0.14));
+  const headerH = Math.min(24, Math.max(16, h * 0.12));
   const res = `${screen.width}×${screen.height}`;
 
   return (
@@ -316,98 +319,68 @@ function ScreenRect({
         onSelect();
       }}
     >
-      {/* Body: a dark glass panel with a subtle top glow; the own screen
-          carries a faint emerald tint so it reads as "this machine" at
-          a glance, not just from its badge. */}
+      {/* Body: one solid rect with a hairline stroke; the selection is
+          the accent stroke itself — no glow, no shadow. */}
       <Rect
         width={w}
         height={h}
-        cornerRadius={10}
-        fillLinearGradientStartPoint={{ x: 0, y: 0 }}
-        fillLinearGradientEndPoint={{ x: 0, y: h }}
-        fillLinearGradientColorStops={
-          own
-            ? [0, "rgba(52,211,153,0.12)", 0.35, "rgba(30,33,42,0.92)", 1, "rgba(17,19,26,0.94)"]
-            : [0, "rgba(125,211,252,0.08)", 0.35, "rgba(30,33,42,0.9)", 1, "rgba(17,19,26,0.93)"]
-        }
-        stroke={selected ? accent : own ? "rgba(52,211,153,0.5)" : "rgba(148,163,184,0.32)"}
-        strokeWidth={selected ? 2.5 : 1.25}
-        shadowColor={selected ? accent : "rgba(0,0,0,0.5)"}
-        shadowBlur={selected ? 26 : 14}
-        shadowOpacity={selected ? 0.5 : 1}
-        shadowOffsetY={4}
+        cornerRadius={RADIUS}
+        fill={BODY_FILL}
+        stroke={selected ? accent : own ? "rgba(52,211,153,0.55)" : "rgba(148,163,184,0.35)"}
+        strokeWidth={selected ? 2 : 1}
+        listening
       />
-      {/* Header strip: a slightly lighter band with a hairline below it,
-          framing the name like a window title bar. */}
+      {/* Header band: solid, slightly lighter, hairline separated. */}
       <Rect
         width={w}
         height={headerH}
-        cornerRadius={[10, 10, 0, 0]}
-        fill="rgba(255,255,255,0.05)"
+        cornerRadius={[RADIUS, RADIUS, 0, 0]}
+        fill={HEADER_FILL}
         listening={false}
       />
-      <Rect y={headerH - 1} width={w} height={1} fill="rgba(255,255,255,0.06)" listening={false} />
-      {/* Accent dot + name, left-aligned in the header. */}
-      <Circle x={13} y={headerH / 2} radius={3.5} fill={accent} listening={false} />
+      <Rect y={headerH} width={w} height={1} fill={HAIRLINE} listening={false} />
+      {/* Accent tick + name, left-aligned in the header. */}
+      <Rect x={8} y={headerH / 2 - 3.5} width={3} height={7} cornerRadius={1} fill={accent} listening={false} />
       <Text
         text={name}
-        fontSize={13}
-        fontStyle="600"
-        fill="rgba(255,255,255,0.96)"
-        x={22}
+        fontSize={11}
+        fontStyle="500"
+        fill="rgba(255,255,255,0.92)"
+        letterSpacing={0.3}
+        x={16}
         y={0}
-        width={Math.max(0, w - 22 - (own ? 40 : 8))}
+        width={Math.max(0, w - 16 - (own ? 34 : 8))}
         height={headerH}
         verticalAlign="middle"
         ellipsis
         listening={false}
       />
-      {/* "you" pill, top-right in the header. */}
+      {/* "you" tag, top-right: plain text, no pill. */}
       {own && (
-        <>
-          <Rect
-            x={w - 36}
-            y={(headerH - 15) / 2}
-            width={26}
-            height={15}
-            cornerRadius={7.5}
-            fill="rgba(52,211,153,0.18)"
-            listening={false}
-          />
-          <Text
-            text="you"
-            fontSize={9}
-            fontStyle="700"
-            fill={OWN_ACCENT}
-            align="center"
-            width={26}
-            x={w - 36}
-            y={(headerH - 15) / 2}
-            height={15}
-            verticalAlign="middle"
-            listening={false}
-          />
-        </>
+        <Text
+          text="you"
+          fontSize={9}
+          fontStyle="600"
+          fill={OWN_ACCENT}
+          align="right"
+          width={Math.max(0, w - 8)}
+          x={0}
+          y={0}
+          height={headerH}
+          verticalAlign="middle"
+          listening={false}
+        />
       )}
-      {/* Resolution: a small pill pinned to the bottom-right, readable
-          against anything behind it. */}
-      <Rect
-        x={Math.max(4, w - 72)}
-        y={Math.max(headerH + 6, h - 22)}
-        width={Math.min(64, w - 8)}
-        height={16}
-        cornerRadius={8}
-        fill="rgba(10,10,14,0.65)"
-        listening={false}
-      />
+      {/* Resolution: centered in the body, quiet monospace. No pill —
+          the solid body is contrast enough. */}
       <Text
         text={res}
-        fontSize={9.5}
-        fontFamily="monospace"
-        fill="rgba(255,255,255,0.68)"
+        fontSize={10}
+        fontFamily="ui-monospace, monospace"
+        fill="rgba(255,255,255,0.45)"
         align="center"
         width={w}
-        y={Math.max(headerH + 7, h - 21)}
+        y={headerH + (h - headerH) / 2 - 6}
         listening={false}
       />
     </Group>

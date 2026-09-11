@@ -2,12 +2,14 @@
 //!
 //! Screens live on one big 2D plane (virtual coordinates). The server's
 //! own screen is the "local" screen; clients are positioned around it by
-//! the user in the GUI. The only job of this module is to answer two
+//! the user in the GUI. The only job of this module is to answer three
 //! questions:
 //!
 //! 1. When the cursor is at `(x, y)`, which screen is it on?
 //! 2. If the cursor leaves screen A through edge `dir`, which screen is
 //!    next, and where exactly does it enter?
+//! 3. Is anything about the arrangement ambiguous or surprising? (See
+//!    [`Layout::issues`] — the GUI surfaces the answers.)
 //!
 //! Everything else builds on those answers.
 
@@ -44,6 +46,11 @@ impl Layout {
     /// off". The server applies this to every layout it adopts (config
     /// load and hot reload), so the user never has to fight pixel
     /// alignment in the GUI.
+    ///
+    /// Gaps the user placed deliberately are *not* closed: only pairs
+    /// already within [`EDGE_TOLERANCE`] snap, and crossing across a
+    /// larger gap works anyway (see [`Layout::neighbor`]) — snapping is
+    /// cosmetic, not functional.
     pub fn normalized(&self) -> Layout {
         let mut screens = self.screens.clone();
         // Closing one gap can bring another pair into snapping range, so
@@ -114,21 +121,97 @@ impl Layout {
         self.screens.iter().find(|s| s.rect.contains(x, y))
     }
 
-    /// Find the neighbor of `from_id` across edge `dir`, together with the
-    /// position (in the **neighbor's local coordinates**) where the cursor
-    /// enters it.
+    /// Find the destination when leaving screen `from_id` through edge
+    /// `dir`, with the entry position in the **destination's local
+    /// coordinates**.
     ///
-    /// The entry point keeps the cursor's offset along the shared edge and
-    /// clamps it into the neighbor's span.
+    /// The model is a **ray cast**, not edge contact: the cursor fires a
+    /// ray from its exit point through that edge, and the first screen
+    /// the ray reaches is the destination. A deliberate gap between
+    /// screens is crossed like contact — the ray flies over it — so a
+    /// layout with spacing (or with screens of different sizes at
+    /// different offsets) behaves exactly like a tightly packed one. The
+    /// old edge-contact rule turned any gap past a few pixels into a
+    /// dead edge that silently refused to cross; with a ray, *every*
+    /// edge with any screen beyond it is alive.
+    ///
+    /// Destination choice: among the screens lying in `dir`'s half-plane
+    /// (for `Left`: every screen whose right edge is at or left of this
+    /// screen's left edge, with a small tolerance so a few pixels of
+    /// accidental overlap still connects), the one whose span across the
+    /// ray comes closest to the exit point. Inside the span (the common
+    /// case) the exit position carries straight across; outside it, the
+    /// entry clamps to the nearest corner of the span — the destination
+    /// exists in that direction, so landing at its nearest point is what
+    /// the placement means.
     pub fn neighbor(&self, from_id: u8, dir: Direction, at_x: i32, at_y: i32) -> Option<(u8, i32, i32)> {
         let from = self.find(from_id)?;
-        let candidate = self.screens.iter().find(|s| s.id != from_id && adjacent(from, s, dir))?;
+        // `exit_perp`: the coordinate across `dir`'s span (the ray's
+        // lateral position); the ray's own axis starts at the facing
+        // edge and travels in `dir`.
+        let exit_perp = match dir {
+            Direction::Left | Direction::Right => at_y,
+            Direction::Top | Direction::Bottom => at_x,
+        };
 
+        // Candidates: screens strictly in `dir`'s half-plane past this
+        // screen's facing edge (`EDGE_TOLERANCE` of slack absorbs tiny
+        // overlaps). Score = perpendicular distance from the exit point
+        // to the candidate's span (0 when the exit point is inside it),
+        // then parallel distance (nearest screen wins a tie).
+        let mut best: Option<(i32, i32, &Screen)> = None;
+        for s in &self.screens {
+            if s.id == from_id {
+                continue;
+            }
+            let (s_lo, s_hi, s_edge, past) = match dir {
+                Direction::Left => (s.rect.top(), s.rect.bottom(), s.rect.right(), s.rect.right() <= from.rect.left() + EDGE_TOLERANCE),
+                Direction::Right => (s.rect.top(), s.rect.bottom(), s.rect.left(), s.rect.left() >= from.rect.right() - EDGE_TOLERANCE),
+                Direction::Top => (s.rect.left(), s.rect.right(), s.rect.bottom(), s.rect.bottom() <= from.rect.top() + EDGE_TOLERANCE),
+                Direction::Bottom => (s.rect.left(), s.rect.right(), s.rect.top(), s.rect.top() >= from.rect.bottom() - EDGE_TOLERANCE),
+            };
+            if !past {
+                continue;
+            }
+            let perp = if exit_perp < s_lo {
+                s_lo - exit_perp
+            } else if exit_perp >= s_hi {
+                exit_perp - (s_hi - 1).max(s_lo)
+            } else {
+                0
+            };
+            let parallel = match dir {
+                Direction::Left => (from.rect.left() - s_edge).max(0),
+                Direction::Right => (s_edge - from.rect.right()).max(0),
+                Direction::Top => (from.rect.top() - s_edge).max(0),
+                Direction::Bottom => (s_edge - from.rect.bottom()).max(0),
+            };
+            if best.is_none() || (perp, parallel) < (best.unwrap().0, best.unwrap().1) {
+                best = Some((perp, parallel, s));
+            }
+        }
+        let (_, _, candidate) = best?;
+
+        // Carry the exit position across; clamp into the destination's
+        // span (covers offsets, partial overlaps and corner destinations
+        // alike). `.max(0)` keeps a degenerate zero-size rect sane.
         let (local_x, local_y) = match dir {
-            Direction::Left => (candidate.rect.w - 1, clamp(at_y - candidate.rect.y, 0, candidate.rect.h - 1)),
-            Direction::Right => (0, clamp(at_y - candidate.rect.y, 0, candidate.rect.h - 1)),
-            Direction::Top => (clamp(at_x - candidate.rect.x, 0, candidate.rect.w - 1), candidate.rect.h - 1),
-            Direction::Bottom => (clamp(at_x - candidate.rect.x, 0, candidate.rect.w - 1), 0),
+            Direction::Left => (
+                (candidate.rect.w - 1).max(0),
+                clamp(at_y - candidate.rect.y, 0, (candidate.rect.h - 1).max(0)),
+            ),
+            Direction::Right => (
+                0,
+                clamp(at_y - candidate.rect.y, 0, (candidate.rect.h - 1).max(0)),
+            ),
+            Direction::Top => (
+                clamp(at_x - candidate.rect.x, 0, (candidate.rect.w - 1).max(0)),
+                (candidate.rect.h - 1).max(0),
+            ),
+            Direction::Bottom => (
+                clamp(at_x - candidate.rect.x, 0, (candidate.rect.w - 1).max(0)),
+                0,
+            ),
         };
         Some((candidate.id, local_x, local_y))
     }
@@ -149,42 +232,37 @@ impl Layout {
             None
         }
     }
-}
 
-/// Maximum slack (px) between two screen edges for them to still count as
-/// connected.
-///
-/// GUI-built layouts routinely land a couple of pixels off exact contact
-/// (drag rounding, scaled canvas coordinates, aspect-ratio offsets — the
-/// real layouts that broke this feature had 2 px and 4 px gaps). An
-/// unreachable screen edge because of a tiny gap is far worse than
-/// tolerating a small one: the cursor would hit a *dead edge* and refuse
-/// to cross in either direction.
-const EDGE_TOLERANCE: i32 = 16;
-
-/// Are `a` and `b` adjacent across `dir`, within [`EDGE_TOLERANCE`]?
-///
-/// The facing edges must be near each other (touching, overlapping, or
-/// within the tolerance) **and** the perpendicular spans must overlap
-/// (with the same slack) — that is what makes the two screens share an
-/// edge region the cursor can travel along.
-fn adjacent(a: &Screen, b: &Screen, dir: Direction) -> bool {
-    let tol = EDGE_TOLERANCE;
-    match dir {
-        Direction::Left => {
-            near(a.rect.left(), b.rect.right(), tol) && spans_overlap(a.rect.top(), a.rect.bottom(), b.rect.top(), b.rect.bottom(), tol)
+    /// Everything about the arrangement the user should know before
+    /// relying on it. Returns human-readable, *actionable* warnings —
+    /// the GUI lists them under the canvas so problems never surface as
+    /// silent misbehavior. Empty = the layout is unambiguous.
+    pub fn issues(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for i in 0..self.screens.len() {
+            let a = &self.screens[i];
+            if a.rect.w <= 0 || a.rect.h <= 0 {
+                out.push(format!("screen {:?} has no size — give it its real resolution", a.name));
+                continue;
+            }
+            for b in &self.screens[i + 1..] {
+                let overlap_x = a.rect.left() < b.rect.right() && b.rect.left() < a.rect.right();
+                let overlap_y = a.rect.top() < b.rect.bottom() && b.rect.top() < a.rect.bottom();
+                if overlap_x && overlap_y {
+                    out.push(format!(
+                        "screens {:?} and {:?} overlap — the cursor can only be on one; move them apart",
+                        a.name, b.name
+                    ));
+                }
+            }
         }
-        Direction::Right => {
-            near(a.rect.right(), b.rect.left(), tol) && spans_overlap(a.rect.top(), a.rect.bottom(), b.rect.top(), b.rect.bottom(), tol)
-        }
-        Direction::Top => {
-            near(a.rect.top(), b.rect.bottom(), tol) && spans_overlap(a.rect.left(), a.rect.right(), b.rect.left(), b.rect.right(), tol)
-        }
-        Direction::Bottom => {
-            near(a.rect.bottom(), b.rect.top(), tol) && spans_overlap(a.rect.left(), a.rect.right(), b.rect.left(), b.rect.right(), tol)
-        }
+        out
     }
 }
+
+/// Maximum slack (px) between two screen edges for snap/normalize logic,
+/// and for the ray cast's small overlap tolerance.
+const EDGE_TOLERANCE: i32 = 16;
 
 /// Are two facing edges within `tol` px of each other (touching counts)?
 fn near(edge_a: i32, edge_b: i32, tol: i32) -> bool {
@@ -192,9 +270,8 @@ fn near(edge_a: i32, edge_b: i32, tol: i32) -> bool {
 }
 
 /// Do two 1-D spans `[a_lo, a_hi)` and `[b_lo, b_hi)` overlap, allowing
-/// `tol` px of slack at the ends? Two screens whose spans nearly meet
-/// (small perpendicular offset) still share an edge region to travel
-/// along; the entry clamp pulls the cursor inside.
+/// `tol` px of slack at the ends? Used by normalization only — crossing
+/// uses the ray cast and no longer needs span overlap.
 fn spans_overlap(a_lo: i32, a_hi: i32, b_lo: i32, b_hi: i32, tol: i32) -> bool {
     a_lo - tol < b_hi && b_lo - tol < a_hi
 }

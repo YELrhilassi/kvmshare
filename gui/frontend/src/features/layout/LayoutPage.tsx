@@ -3,13 +3,46 @@ import { api, type LayoutConfig, type Screen } from "@/lib/bridge";
 import Toolbar from "@/features/layout/Toolbar";
 import Canvas from "@/features/layout/canvas/Canvas";
 import ScreenInspector from "@/features/layout/inspector/ScreenInspector";
+import InputShortcutsPage from "@/features/layout/InputShortcutsPage";
 import { useLayoutDocument } from "@/features/layout/useLayoutDocument";
 import { useCanvasView } from "@/features/layout/useCanvasView";
 import { PageSkeleton } from "@/components/PageSkeleton";
+import { cn } from "@/lib/utils";
+
+// Layout page tabs: Arrangement is the canvas (where screens sit);
+// Input & shortcuts is the behavior sub-page (what keys and pointers
+// do). Same config document behind both, one Save per tab area.
+type Tab = "arrange" | "input";
+
+function TabBar({ tab, onTab }: { tab: Tab; onTab: (t: Tab) => void }) {
+  const tabs: { id: Tab; label: string }[] = [
+    { id: "arrange", label: "Arrangement" },
+    { id: "input", label: "Input & shortcuts" },
+  ];
+  return (
+    <div className="flex items-center gap-1 border-b border-border/60 px-8">
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          onClick={() => onTab(t.id)}
+          className={cn(
+            "-mb-px border-b-2 px-3 py-2.5 text-sm transition-colors",
+            tab === t.id
+              ? "border-primary text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 export default function LayoutPage() {
   const [config, setConfig] = useState<LayoutConfig | null>(null);
   const [error, setError] = useState("");
+  const [tab, setTab] = useState<Tab>("arrange");
 
   useEffect(() => {
     let alive = true;
@@ -38,7 +71,12 @@ export default function LayoutPage() {
     return <PageSkeleton rows={2} />;
   }
 
-  return <Editor config={config} />;
+  return (
+    <div className="flex h-full flex-col">
+      <TabBar tab={tab} onTab={setTab} />
+      {tab === "arrange" ? <Editor config={config} /> : <InputShortcutsPage />}
+    </div>
+  );
 }
 
 // The editor: one reducer for the document, one hook for the view, and
@@ -49,6 +87,27 @@ function Editor({ config }: { config: LayoutConfig }) {
   const { state, dispatch } = useLayoutDocument(config.screens);
   const view = useCanvasView(state.screens);
   const { screens, selected, lock, snap, dirty, savedMsg, error } = state;
+
+  // Layout validation, live: overlaps and degenerate sizes surface here
+  // while the user drags, so a broken arrangement never has to be
+  // discovered at the screen. Mirrors the server-side Layout::issues.
+  const issues: string[] = (() => {
+    const out: string[] = [];
+    for (let i = 0; i < screens.length; i++) {
+      const a = screens[i];
+      if (a.width <= 0 || a.height <= 0) {
+        out.push(`"${a.name || "screen"}" has no size — give it its real resolution`);
+        continue;
+      }
+      for (let j = i + 1; j < screens.length; j++) {
+        const b = screens[j];
+        if (a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height) {
+          out.push(`"${a.name || "screen"}" and "${b.name || "screen"}" overlap — move them apart`);
+        }
+      }
+    }
+    return out;
+  })();
 
   // A "saved" toast is only ever transient.
   useEffect(() => {
@@ -102,6 +161,16 @@ function Editor({ config }: { config: LayoutConfig }) {
         savedMsg={savedMsg}
         error={error}
       />
+
+      {issues.length > 0 && (
+        <div className="border-b border-amber-500/30 bg-amber-500/10 px-8 py-2">
+          <ul className="space-y-0.5">
+            {issues.map((msg, i) => (
+              <li key={i} className="text-xs text-amber-500">⚠ {msg}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         <Canvas

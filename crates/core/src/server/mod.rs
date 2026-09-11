@@ -71,8 +71,9 @@ pub use liveness::{EXIT_RESTART, Liveness};
 /// Control messages from the app layer (never travel over the wire).
 #[derive(Debug)]
 pub enum Control {
-    /// The config changed on disk — adopt this new desktop layout now.
-    Reload(Desktop),
+    /// The config changed on disk — adopt this new desktop layout,
+    /// shortcut bindings and input preferences now.
+    Reload(Desktop, crate::actions::BindSection, crate::input::InputPrefs),
     /// The `[network]` policy changed on disk — adopt it now. Separate
     /// from [`Control::Reload`] because it has a side effect a layout edit
     /// must never have: any *connected* client whose machine id is in the
@@ -462,7 +463,13 @@ impl Server {
                 self.apply_policy(policy);
                 return Ok(());
             }
-            Control::Reload(layout) => layout,
+            Control::Reload(layout, bindings, prefs) => {
+                let mut session = self.session.lock().unwrap();
+                session.set_bindings(bindings);
+                session.set_prefs(prefs);
+                drop(session);
+                layout
+            }
         };
         log_info!("layout reloaded: {} screens", layout.screens.len());
 

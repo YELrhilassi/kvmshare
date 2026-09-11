@@ -35,10 +35,13 @@ mod motion;
 
 use kvmshare_protocol::message::{Message, Rect, Screen, ScreenInfo};
 
+use crate::actions::{ActionEngine, BindSection};
+use crate::input::InputPrefs;
 use crate::layout::Layout;
 use crate::Mode;
 
 pub use boundary::{EDGE_BAND, EDGE_PUSH_FALLBACK, EDGE_PUSH_FRESH, ENTRY_INSET, REMOTE_BEACON_FRESH};
+pub use crate::actions::Mods;
 
 /// Something the caller must do in response to an input event.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +127,18 @@ pub struct Session {
     /// with its client offline is therefore a dead edge, exactly like a
     /// desktop edge with no neighbor.
     connected: std::collections::HashSet<u8>,
+    /// The user's shortcut bindings (see [`crate::actions`]). Every
+    /// local key event passes through it before anything else; chords
+    /// it owns are consumed here and never reach the client.
+    actions: ActionEngine,
+    /// Whether edge crossings are locked (the user's ToggleLock
+    /// action). While locked, walls are hard: outward pushes never
+    /// switch — the cursor stays home. The escape key still works (it
+    /// is the rescue hatch, handled before this flag).
+    walls_locked: bool,
+    /// User input preferences (pointer/wheel feel) applied to the
+    /// forwarded stream — see [`crate::input`].
+    prefs: InputPrefs,
 }
 
 impl Session {
@@ -145,6 +160,9 @@ impl Session {
             gain_rem: (0.0, 0.0),
             dynamic: Vec::new(),
             connected: std::collections::HashSet::new(),
+            actions: ActionEngine::new(BindSection::default()),
+            walls_locked: false,
+            prefs: InputPrefs::default(),
         }
     }
 
@@ -153,6 +171,28 @@ impl Session {
     /// only future *remote* motion.
     pub fn set_gain(&mut self, gain: f64) {
         self.gain = gain.clamp(0.25, 3.0);
+    }
+
+    /// Adopt new shortcut bindings (config hot-reload).
+    pub fn set_bindings(&mut self, cfg: BindSection) {
+        self.actions.set_config(cfg);
+    }
+
+    /// Adopt new input preferences (config hot-reload).
+    pub fn set_prefs(&mut self, prefs: InputPrefs) {
+        let mut prefs = prefs;
+        prefs.clamp();
+        self.prefs = prefs;
+    }
+
+    /// The current input preferences (read-only view).
+    pub fn prefs(&self) -> &InputPrefs {
+        &self.prefs
+    }
+
+    /// Are edge crossings currently locked?
+    pub fn walls_locked(&self) -> bool {
+        self.walls_locked
     }
 
     pub fn mode(&self) -> Mode {

@@ -12,8 +12,10 @@
 //! in the `kvmshare-platform` crate and is plugged in through the small
 //! traits defined here.
 
+pub mod actions;
 pub mod client;
 pub mod clipboard;
+pub mod input;
 pub mod layout;
 pub mod motion;
 pub mod server;
@@ -22,6 +24,8 @@ pub mod time;
 pub mod transport;
 pub mod udp;
 
+pub use actions::{ActionEngine, BindSection, UserAction};
+pub use input::InputPrefs;
 pub use layout::{Direction, Layout};
 pub use session::{Action, Session};
 

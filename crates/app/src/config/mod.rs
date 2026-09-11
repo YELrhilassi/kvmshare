@@ -45,6 +45,14 @@ pub struct Config {
     /// when the section is missing, so old configs stay valid.
     #[serde(default)]
     pub network: NetworkConfig,
+    /// Keyboard shortcuts (`[shortcuts]` section). Defaults are applied
+    /// when the section is missing; see [`kvmshare_core::actions`].
+    #[serde(default)]
+    pub shortcuts: kvmshare_core::BindSection,
+    /// Input feel (`[input]` section): pointer speed, wheel speed,
+    /// natural scroll. See [`kvmshare_core::input`].
+    #[serde(default)]
+    pub input: kvmshare_core::InputPrefs,
 }
 
 /// The `[network]` section: who may connect to this server.
@@ -182,6 +190,8 @@ impl Config {
                 scale: 1.0,
             }],
             network: NetworkConfig::default(),
+            shortcuts: kvmshare_core::BindSection::default(),
+            input: kvmshare_core::InputPrefs::default(),
         }
     }
 }
