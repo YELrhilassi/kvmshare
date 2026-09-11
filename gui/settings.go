@@ -73,6 +73,13 @@ type Settings struct {
 	// login screen onward, whether it boots into GNOME, KDE, i3 (XDG
 	// autostart-capable session tools) or Windows.
 	StartRole string `json:"startRole"`
+	// StartHidden opens the GUI minimized to the tray on launch instead
+	// of showing the window. Only meaningful together with
+	// LaunchAtStartup — an operator who starts the app by hand wants the
+	// window — and only honored when a tray host is actually present
+	// (the same guard as close-to-tray: with no tray, hiding would
+	// strand the app invisibly).
+	StartHidden bool `json:"startHidden"`
 }
 
 // LogSettings is what the Logs page shows and edits: the logging
@@ -249,6 +256,17 @@ func (a *App) applyStartRole() {
 			slog.Warn("start-at-launch: client did not start", "err", err)
 		}
 	}
+}
+
+// StartHiddenToTray reports whether the GUI should open minimized to the
+// tray this launch. The operator's choice (StartHidden) is honored only
+// when a tray host actually exists — without one, hiding would strand
+// the app invisibly (the same rule close-to-tray follows).
+func (a *App) StartHiddenToTray() bool {
+	a.mu.Lock()
+	want := a.settings.StartHidden
+	a.mu.Unlock()
+	return want && trayHostAvailable()
 }
 
 // GetLogSettings returns the operator's logging configuration plus the

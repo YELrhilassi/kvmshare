@@ -4,6 +4,7 @@ import { api, type Settings } from "@/lib/bridge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Section } from "@/components/Section";
+import { PageSkeleton } from "@/components/PageSkeleton";
 import { cn } from "@/lib/utils";
 
 // General settings: the machine-level choices that are not tied to one
@@ -54,18 +55,23 @@ export default function SettingsPage() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [autostart, setAutostart] = useState(false);
   const [err, setErr] = useState("");
+  const [loadErr, setLoadErr] = useState("");
   const [saved, setSaved] = useState(false);
 
+  const load = async () => {
+    setLoadErr("");
+    try {
+      const [s, a] = await Promise.all([api().GetSettings(), api().LaunchAtStartupEnabled()]);
+      setSettings(s);
+      setAutostart(a);
+    } catch (e) {
+      setLoadErr(String(e));
+    }
+  };
+
   useEffect(() => {
-    void (async () => {
-      try {
-        const [s, a] = await Promise.all([api().GetSettings(), api().LaunchAtStartupEnabled()]);
-        setSettings(s);
-        setAutostart(a);
-      } catch (e) {
-        setErr(String(e));
-      }
-    })();
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const patch = async (p: Partial<Settings>) => {
@@ -97,8 +103,23 @@ export default function SettingsPage() {
     }
   };
 
+  // Load failure is a real state, not "still loading": show it with a
+  // retry. (A bare early return here used to wedge the page on
+  // "Loading…" forever when the bridge call raced app startup.)
+  if (loadErr) {
+    return (
+      <div className="mx-auto w-full max-w-2xl px-8 py-8">
+        <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
+        <p className="mt-4 text-sm text-destructive">Could not load settings: {loadErr}</p>
+        <Button className="mt-3" variant="outline" onClick={() => void load()}>
+          Retry
+        </Button>
+      </div>
+    );
+  }
+
   if (!settings) {
-    return <div className="p-8 text-sm text-muted-foreground">Loading…</div>;
+    return <PageSkeleton rows={2} />;
   }
 
   return (
@@ -141,6 +162,14 @@ export default function SettingsPage() {
               );
             })}
           </div>
+        </div>
+        <div className="border-t border-border/50">
+          <Toggle
+            checked={settings.startHidden ?? false}
+            onChange={(v) => void patch({ startHidden: v })}
+            title="Start minimized to tray"
+            description="When launching at startup, open quietly in the tray instead of showing the window. The tray icon always stays reachable; opening it is one click."
+          />
         </div>
       </Section>
 

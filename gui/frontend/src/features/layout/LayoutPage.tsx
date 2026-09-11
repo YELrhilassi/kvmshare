@@ -5,6 +5,7 @@ import Canvas from "@/features/layout/canvas/Canvas";
 import ScreenInspector from "@/features/layout/inspector/ScreenInspector";
 import { useLayoutDocument } from "@/features/layout/useLayoutDocument";
 import { useCanvasView } from "@/features/layout/useCanvasView";
+import { PageSkeleton } from "@/components/PageSkeleton";
 
 export default function LayoutPage() {
   const [config, setConfig] = useState<LayoutConfig | null>(null);
@@ -34,11 +35,7 @@ export default function LayoutPage() {
   }
 
   if (!config) {
-    return (
-      <div className="flex h-full items-center justify-center">
-        <p className="text-sm text-muted-foreground">Loading layout…</p>
-      </div>
-    );
+    return <PageSkeleton rows={2} />;
   }
 
   return <Editor config={config} />;

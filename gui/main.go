@@ -110,7 +110,7 @@ func main() {
 	core.attachEvents(app.Event)
 	core.stateLoop()
 
-	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
+	windowOpts := application.WebviewWindowOptions{
 		Name:             "main",
 		Title:            "kvmshare",
 		Width:            1200,
@@ -120,7 +120,14 @@ func main() {
 		URL:              "/",
 		Linux:            application.LinuxWindow{Icon: windowIcon},
 		BackgroundColour: application.NewRGBA(10, 10, 12, 255),
-	})
+	}
+	// Start quietly when the operator asked for it — but only when a
+	// tray host exists to keep the app reachable; the same guard as
+	// close-to-tray, so a hidden start can never strand the app.
+	if core.StartHiddenToTray() {
+		windowOpts.Hidden = true
+	}
+	window := app.Window.NewWithOptions(windowOpts)
 
 	// A second launch asks us to come forward (see SingleInstance). On
 	// Windows the ask arrives on a named event scoped to this install.

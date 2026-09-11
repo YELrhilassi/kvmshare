@@ -17,6 +17,7 @@ export default function ClientPage() {
   const [name, setName] = useState("");
   const [trustInput, setTrustInput] = useState("");
   const [error, setError] = useState("");
+  const [loadErr, setLoadErr] = useState("");
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
@@ -27,7 +28,7 @@ export default function ClientPage() {
         setAddr(s.clientAddr);
         setName(s.clientName);
       })
-      .catch(() => {});
+      .catch((e) => setLoadErr(String(e)));
   }, []);
 
   const save = async () => {
@@ -112,6 +113,11 @@ export default function ClientPage() {
             </Button>
             {saved && <span className="text-xs text-emerald-600">saved</span>}
             {error && <span className="text-xs text-destructive">{error}</span>}
+            {loadErr && (
+              <span className="text-xs text-amber-600">
+                Could not load saved settings ({loadErr}) — the form starts empty; saving here overwrites.
+              </span>
+            )}
           </div>
         </Section>
 

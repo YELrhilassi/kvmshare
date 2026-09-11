@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Section } from "@/components/Section";
+import { PageSkeleton } from "@/components/PageSkeleton";
 import { shortID } from "@/lib/utils";
 
 // Server settings: how this machine shares its keyboard and mouse, and
@@ -24,25 +25,34 @@ export default function ServerPage() {
   const [trustInput, setTrustInput] = useState("");
   const [revokeInput, setRevokeInput] = useState("");
   const [error, setError] = useState("");
+  const [loadErr, setLoadErr] = useState("");
   const [saved, setSaved] = useState(false);
 
+  const load = async () => {
+    setLoadErr("");
+    try {
+      const c = await api().LoadConfig();
+      setConfig(c);
+      setPort(String(c.port));
+      setNetwork(c.network ?? { allowlist: true, localOnly: true, trustedIds: [], revokedIds: [] });
+    } catch (e) {
+      setLoadErr(String(e));
+    }
+    try {
+      setPaths(await api().GetPaths());
+    } catch {
+      /* paths are informational (footer); the page works without them */
+    }
+    try {
+      setMachineId(await api().GetMachineId());
+    } catch {
+      /* same — the id is also on the Home page */
+    }
+  };
+
   useEffect(() => {
-    void api()
-      .LoadConfig()
-      .then((c) => {
-        setConfig(c);
-        setPort(String(c.port));
-        setNetwork(c.network ?? { allowlist: true, localOnly: true, trustedIds: [], revokedIds: [] });
-      })
-      .catch(() => {});
-    void api()
-      .GetPaths()
-      .then(setPaths)
-      .catch(() => {});
-    void api()
-      .GetMachineId()
-      .then(setMachineId)
-      .catch(() => {});
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const patchNetwork = (patch: Partial<Network>) => setNetwork((n) => ({ ...n, ...patch }));
@@ -72,6 +82,34 @@ export default function ServerPage() {
     network.localOnly !== (config?.network?.localOnly ?? true) ||
     JSON.stringify(network.trustedIds) !== JSON.stringify(config?.network?.trustedIds ?? []) ||
     JSON.stringify(network.revokedIds) !== JSON.stringify(config?.network?.revokedIds ?? []);
+
+  // Config load failure is a real state (not "still loading"): show it
+  // with a retry. Before the config arrives — or if only the
+  // informational calls failed — the page renders from defaults.
+  if (!config) {
+    if (loadErr) {
+      return (
+        <div className="h-full overflow-y-auto">
+          <div className="mx-auto max-w-3xl px-10 py-16">
+            <header className="mb-10 space-y-2">
+              <h1 className="text-2xl font-semibold tracking-tight">Server settings</h1>
+            </header>
+            <p className="text-sm text-destructive">Could not load the config: {loadErr}</p>
+            <Button className="mt-3" variant="outline" onClick={() => void load()}>
+              Retry
+            </Button>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className="h-full overflow-y-auto">
+        <div className="mx-auto max-w-3xl px-10 py-16">
+          <PageSkeleton rows={2} />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="h-full overflow-y-auto">
