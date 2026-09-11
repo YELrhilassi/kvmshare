@@ -124,7 +124,7 @@ test:
 
 ## Build the portable release archives (Linux tarball + Windows zip, the
 ## standalone installers, and SHA256SUMS) into dist/.
-release:
+release: winres
 	$(CARGO) build --release
 	cd gui/frontend && npm install --no-audit --no-fund >/dev/null && npm run build
 	cd gui && $(GO_ENV) $(GO) build -tags production -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-gui .
@@ -181,7 +181,8 @@ publish: release
 winres:
 	cd gui && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres/winres.json --arch amd64
 	cd gui/installer && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres.json --arch amd64
-	@echo "  regenerated gui/rsrc_windows_amd64.syso + gui/installer/rsrc_windows_amd64.syso"
+	cd gui/cmd/kvmshare-install && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres.json --arch amd64
+	@echo "  regenerated gui/rsrc_windows_amd64.syso + gui/installer/rsrc_windows_amd64.syso + gui/cmd/kvmshare-install/rsrc_windows_amd64.syso"
 
 ## Remove build artifacts.
 clean:
