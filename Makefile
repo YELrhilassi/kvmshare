@@ -178,11 +178,16 @@ publish: release
 ## time. The generated .syso files are committed, so normal builds don't
 ## need this. Both must be bumped on every release — the installer's
 ## resource is what Explorer's Properties dialog and Add/Remove show.
+winres: VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$tag" ]; then echo "$$tag"; else echo v0.0.0-dev; fi)
 winres:
+	@v=$$(echo $(VERSION) | sed 's/^v//'); \
+	for f in gui/winres/winres.json gui/installer/winres.json gui/cmd/kvmshare-install/winres.json; do \
+		sed -i "s/\"[0-9]*\.[0-9]*\.[0-9]*\"/\"$$v\"/g; s/\"[0-9]*\.[0-9]*\.[0-9]*\.0\"/\"$$v.0\"/g" $$f; \
+	done
 	cd gui && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres/winres.json --arch amd64
 	cd gui/installer && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres.json --arch amd64
 	cd gui/cmd/kvmshare-install && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres.json --arch amd64
-	@echo "  regenerated gui/rsrc_windows_amd64.syso + gui/installer/rsrc_windows_amd64.syso + gui/cmd/kvmshare-install/rsrc_windows_amd64.syso"
+	@echo "  regenerated all .syso files at $(VERSION)"
 
 ## Remove build artifacts.
 clean:
