@@ -200,43 +200,75 @@ const $ = id => document.getElementById(id);
 let busy = false;
 let done = false;
 
-function render(s) {
-  busy = s.Busy;
-  $("latest").textContent = s.Latest ? s.Latest : "unknown";
+// The backend field names: the pushed event carries the Go JSON tags
+// (lowercase), the polled Snapshot historically came back capitalized.
+// Normalize once so render has a single shape to deal with.
+function normalize(s) {
+  if (s && s.Busy !== undefined) {
+    return {
+      latest: s.Latest, installed: s.Installed, busy: s.Busy, phase: s.Phase,
+      progress: s.Progress, log: s.Log, error: s.Error, done: s.Done,
+    };
+  }
+  return s;
+}
+
+function render(s0) {
+  const s = normalize(s0);
+  busy = s.busy;
+  $("latest").textContent = s.latest ? s.latest : "unknown";
   $("dir").textContent = "…"; // filled by dir() below
-  $("status").textContent = s.Busy ? s.Phase : (s.Installed ? "installed" : "not installed");
+  $("status").textContent = s.busy ? s.phase : (s.installed ? "installed" : "not installed");
 
   const btn = $("installBtn");
   btn.disabled = busy;
-  btn.textContent = s.Busy ? "Working…" : (s.Installed ? "Update to " + (s.Latest || "latest") : "Install kvmshare");
+  btn.textContent = s.busy ? "Working…" : (s.installed ? "Update to " + (s.latest || "latest") : "Install kvmshare");
 
-  $("launchBtn").disabled = busy || !s.Installed;
-  $("uninstallBtn").disabled = busy || !s.Installed;
+  $("launchBtn").disabled = busy || !s.installed;
+  $("uninstallBtn").disabled = busy || !s.installed;
 
-  $("progressCard").style.display = s.Busy ? "block" : "none";
-  if (s.Busy) {
-    $("phase").textContent = s.Phase || "Working…";
-    $("pct").textContent = Math.round((s.Progress || 0) * 100) + "%";
-    $("fill").style.width = (s.Progress || 0) * 100 + "%";
+  $("progressCard").style.display = s.busy ? "block" : "none";
+  if (s.busy) {
+    $("phase").textContent = s.phase || "Working…";
+    $("pct").textContent = Math.round((s.progress || 0) * 100) + "%";
+    $("fill").style.width = (s.progress || 0) * 100 + "%";
   }
 
   const banner = $("banner");
   banner.className = "";
   banner.textContent = "";
-  if (s.Error) {
+  if (s.error) {
     banner.className = "error";
-    banner.textContent = s.Error;
-  } else if (s.Done && !s.Busy) {
+    banner.textContent = s.error;
+  } else if (s.done && !s.busy) {
     banner.className = "done";
     banner.textContent = "kvmshare installed. You're all set.";
   }
 
-  if (s.Log && s.Log.length) {
+  if (s.log && s.log.length) {
     $("logCard").classList.add("visible");
     const log = $("log");
     log.textContent = s.Log.join("\n");
     log.scrollTop = log.scrollHeight;
   }
+}
+
+// The backend pushes a snapshot on every state change (events are not
+// throttled by WebView2 when the window is unfocused — timers are, which
+// is what used to freeze the window at its last frame). A slow poll
+// stays as a fallback only: it catches state set before this page
+// subscribed, and covers an event bus hiccup. It no longer drives the
+// progress bar during a run — render is idempotent, so late fallback
+// renders of older state are harmless.
+async function subscribeEvents() {
+  try {
+    await runtime();
+    const ev = window.wails?.Events;
+    if (!ev?.On) return;
+    ev.On("installer:state", (e) => {
+      if (e?.data) render(e.data);
+    });
+  } catch (e) {}
 }
 
 async function poll() {
@@ -245,7 +277,7 @@ async function poll() {
   } catch (e) {
     $("status").textContent = "connecting…";
   }
-  setTimeout(poll, 220);
+  setTimeout(poll, 1500);
 }
 
 async function boot() {
@@ -254,6 +286,7 @@ async function boot() {
     $("footer").textContent = "kvmshare installer · " + (v === "dev" ? "development build" : v) + " · " + p;
     $("dir").textContent = await call("InstallDir");
   } catch (e) {}
+  await subscribeEvents();
   poll();
 }
 

@@ -40,6 +40,9 @@ func main() {
 		Logger:   logger,
 		LogLevel: slog.LevelWarn,
 	})
+	// Push, don't poll: from here on every state change is emitted as an
+	// event (see app.go — WebView2 throttles page timers, not events).
+	core.attachEvents(app.Event)
 
 	app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             "installer",

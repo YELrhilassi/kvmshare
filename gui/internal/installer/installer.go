@@ -202,15 +202,16 @@ func installRelease(tag string, rel *selfupdate.Release, opts Options) error {
 	// The download owns the whole 0.05-0.50 stretch of the bar. The
 	// total, when the server sends Content-Length, comes from the asset
 	// metadata — a live byte count replaces the old frozen "5%" that
-	// read as a hang.
+	// read as a hang. The phase label stays stable ("Downloading") so
+	// consumers can detect phase *changes*; the MB detail goes to the
+	// throttled log lines only.
 	var lastLog time.Time
 	err = selfupdate.Download(asset.URL, archive, func(done, total int64) {
 		if total <= 0 {
 			total = int64(asset.Size)
 		}
 		frac := 0.05 + 0.45*min(1.0, float64(done)/float64(total))
-		phasef(opts.Phase, fmt.Sprintf("Downloading %s (%.1f/%.1f MB)", tag,
-			float64(done)/(1<<20), float64(total)/(1<<20)), frac)
+		phasef(opts.Phase, "Downloading "+tag, frac)
 		// One line a second keeps a terminal log readable.
 		if opts.Log != nil && time.Since(lastLog) >= time.Second {
 			lastLog = time.Now()
