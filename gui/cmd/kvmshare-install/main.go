@@ -38,6 +38,13 @@ func main() {
 	)
 	flag.Parse()
 
+	// A bare double-click on Windows (no console behind it) shows a
+	// frozen black box for the whole download — hand off to the GUI
+	// installer instead, which is the same engine with a visible bar.
+	// A terminal launch (arguments, or a shared console) is untouched.
+	if doubleClicked() && launchGUIInstaller() {
+		return
+	}
 	// Privileged subcommand: invoked by this same binary through pkexec
 	// after a normal install (see platform_linux.go on Linux). Grant-
 	// only-if-missing so callers (install, update, GUI startup, make

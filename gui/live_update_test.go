@@ -34,7 +34,7 @@ func TestLiveInstallPipeline(t *testing.T) {
 		t.Fatalf("asset for platform: %v", err)
 	}
 	archive := filepath.Join(dir, asset.Name)
-	if err := selfupdate.Download(asset.URL, archive); err != nil {
+	if err := selfupdate.Download(asset.URL, archive, nil); err != nil {
 		t.Fatalf("download: %v", err)
 	}
 	sums, err := selfupdate.FetchChecksums(rel)

@@ -170,13 +170,25 @@ func assetNames(as []Asset) string {
 }
 
 // Download streams `url` into `dest` (a temp file the caller owns).
-func Download(url, dest string) error {
+// progress, when non-nil, receives (bytesDone, bytesTotal) as the body
+// arrives — total is -1 when the server sends no Content-Length. The
+// callback must be cheap (it runs once per read chunk); throttling to a
+// human rate is the caller's business.
+//
+// A dead network used to hang this for the full 15-minute client
+// timeout with the caller's UI frozen at its start value: the response
+// header often arrives fine (a proxy answers) while the body stalls
+// forever. ResponseHeaderTimeout bounds that wait instead.
+func Download(url, dest string, progress func(done, total int64)) error {
 	out, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	client := &http.Client{Timeout: 15 * time.Minute}
+	client := &http.Client{
+		Timeout:   15 * time.Minute,
+		Transport: &http.Transport{ResponseHeaderTimeout: 20 * time.Second},
+	}
 	resp, err := client.Get(url)
 	if err != nil {
 		return err
@@ -185,8 +197,29 @@ func Download(url, dest string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download %s: %s", url, resp.Status)
 	}
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return err
+	var total int64 = -1
+	if resp.ContentLength > 0 {
+		total = resp.ContentLength
+	}
+	var written int64
+	buf := make([]byte, 256<<10)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			written += int64(n)
+			if progress != nil {
+				progress(written, total)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
 	}
 	return out.Sync()
 }
@@ -209,7 +242,7 @@ func FetchChecksums(rel *Release) (map[string]string, error) {
 	}
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
-	if err := Download(asset.URL, tmp.Name()); err != nil {
+	if err := Download(asset.URL, tmp.Name(), nil); err != nil {
 		return nil, err
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {

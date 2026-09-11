@@ -108,7 +108,7 @@ func (a *App) ApplyUpdate() UpdateResult {
 		return UpdateResult{Error: err.Error()}
 	}
 	archive := filepath.Join(dir, asset.Name)
-	if err := selfupdate.Download(asset.URL, archive); err != nil {
+	if err := selfupdate.Download(asset.URL, archive, nil); err != nil {
 		clean()
 		return UpdateResult{Error: fmt.Sprintf("download: %v", err)}
 	}
