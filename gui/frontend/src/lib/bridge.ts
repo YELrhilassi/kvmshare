@@ -55,6 +55,9 @@ export interface Settings {
   // start role is what the machine runs at GUI launch ("" = nothing).
   launchAtStartup: boolean;
   startRole: "" | "server" | "client";
+  // Open minimized to the tray on launch (only honored when a tray host
+  // exists — the backend enforces that, the flag is just the wish).
+  startHidden?: boolean;
 }
 
 export interface ConnectedClient {
@@ -282,4 +285,7 @@ export const api = (): GoApp => ({
   ConnectToServer: (addr) => call<void>("ConnectToServer", addr),
   SendConnectRequest: (peerId) => call<void>("SendConnectRequest", peerId),
   ClientStatus: () => call<ClientState>("ClientStatus"),
+  EnableLaunchAtStartup: () => call<void>("EnableLaunchAtStartup"),
+  DisableLaunchAtStartup: () => call<void>("DisableLaunchAtStartup"),
+  LaunchAtStartupEnabled: () => call<boolean>("LaunchAtStartupEnabled"),
 });
