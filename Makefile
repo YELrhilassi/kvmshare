@@ -172,19 +172,23 @@ publish: release
 		--notes "Portable kvmshare release. Download the installer for your platform (or the full archive) and run it — it fetches and verifies everything itself."
 	@echo "published $(VERSION): https://github.com/YELrhilassi/kvmshare/releases/tag/$(VERSION)"
 
-## Regenerate the Windows icon/version resource (gui/rsrc_windows_amd64.syso)
-## from gui/winres/winres.json + gui/assets/kvmshare.ico. Needs network for
-## the go-winres tool the first time. The generated .syso is committed, so
-## normal builds don't need this.
+## Regenerate the Windows icon/version resources (gui/rsrc_windows_amd64.syso
+## and gui/installer/rsrc_windows_amd64.syso) from their winres.json +
+## gui/assets/kvmshare.ico. Needs network for the go-winres tool the first
+## time. The generated .syso files are committed, so normal builds don't
+## need this. Both must be bumped on every release — the installer's
+## resource is what Explorer's Properties dialog and Add/Remove show.
 winres:
 	cd gui && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres/winres.json --arch amd64
-	@echo "  regenerated gui/rsrc_windows_amd64.syso"
+	cd gui/installer && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres.json --arch amd64
+	@echo "  regenerated gui/rsrc_windows_amd64.syso + gui/installer/rsrc_windows_amd64.syso"
 
 ## Remove build artifacts.
 clean:
 	$(CARGO) clean
 	rm -f $(GUI_BIN) gui/kvmshare-gui.exe gui/kvmshare-install gui/kvmshare-install.exe
 	rm -rf dist
+	find gui -name 'rsrc_windows_amd64.syso' -delete
 
 ## Remove installed files (keeps $(CONFIG_DIR)).
 uninstall:
