@@ -270,8 +270,17 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
               </Button>
               <select
                 className="h-8 rounded-md border border-border/70 bg-muted/40 px-2 text-xs text-foreground outline-none focus:border-primary"
-                value={pendingAction?.action ?? "cycle"}
-                onChange={(e) => setPendingAction({ action: e.target.value, screen: "" })}
+                value={pendingAction ? `${pendingAction.action}${pendingAction.screen ? `:${pendingAction.screen}` : ""}` : "cycle"}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  // "switch:<screen>" encodes a screen-targeted action.
+                  const sep = v.indexOf(":");
+                  setPendingAction(
+                    sep === -1
+                      ? { action: v, screen: "" }
+                      : { action: v.slice(0, sep), screen: v.slice(sep + 1) },
+                  );
+                }}
                 aria-label="Action for the next recorded shortcut"
               >
                 {ACTIONS.filter((a) => !a.needsScreen).map((a) => (
