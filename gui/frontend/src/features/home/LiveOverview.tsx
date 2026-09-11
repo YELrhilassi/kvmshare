@@ -7,21 +7,23 @@ import { Section } from "@/components/Section";
 import { cn, shortID } from "@/lib/utils";
 import { RotateCw } from "lucide-react";
 
-// Every machine on the network that can work with this one, in one
-// list, each with its own state. A machine only counts as "nearby"
-// when its role is actually running: a GUI that is open but sharing
-// nothing is not a live machine (it used to linger as "nearby" forever
-// after you stopped every service on it). An idle machine stays
-// visible as "idle" (or "trusted" when trusted) so it can still be
-// trusted and asked to connect — hiding it entirely would make it
-// impossible to ever set up a first connection.
+// Every machine on the network that can work with this one, in one list.
+// A machine only counts as live when its role is actually running: a GUI
+// that is open but sharing nothing is not nearby (it used to linger as
+// "nearby" forever after you stopped every service on it).
 //
-// Trust and revoke live here, next to the machine they concern. They are
-// *independent* actions, not one toggle: a machine can be trusted and
-// revoked at the same time (the two lists are separate), and a revoked
-// machine is always refused — it can never connect, and if it is
-// connected right now it is disconnected.
-type RowState = "connected" | "nearby" | "trusted" | "idle" | "revoked";
+// One decision per machine, in plain words:
+//   Connect   — ask it to work with this machine (a running peer) or wait
+//               for a trusted one to come online. Connecting implies
+//               trust — there is no separate verb to learn.
+//   Disconnect — end the session that is running right now.
+//   Block     — refuse this machine until you unblock it: it can never
+//               connect, and a live session ends immediately.
+//   Unblock   — lift the block. (Behind the scenes Block/Unblock manage
+//               both the trusted and the refused lists; the Home page
+//               never makes the user think about the difference. Fine
+//               control by machine id stays on the Server page.)
+type RowState = "connected" | "blocked" | "ready" | "nearby" | "offline";
 
 // Same prefix contract as the backend (ids.Trusted): an entry matches a
 // machine id when either is a prefix of the other, and entries shorter
@@ -44,28 +46,30 @@ export default function LiveOverview() {
   // Every discovered machine stays listed. A strict role filter made
   // rows vanish whenever either machine changed role — which read as
   // the whole list flapping. Rows that can work with this machine (a
-  // server lists clients, a client lists servers) get connect actions;
-  // a same-role machine is still shown, muted, with its real role.
+  // server lists clients, a client lists servers) get actions; a
+  // same-role machine is still shown, muted, with its real role.
   const usable = (p: Peer) => (isServer ? p.role === "client" : p.role === "server");
 
   const stateOf = (p: Peer): RowState => {
-    // Revocation outranks everything: the machine is refused, so its
-    // "trusted"/"nearby" state is beside the point.
-    if (matchesID(revoked, p.id)) return "revoked";
+    // A block outranks everything: the machine is refused, so its
+    // trust or liveness is beside the point.
+    if (matchesID(revoked, p.id)) return "blocked";
     if (isServer) {
       if (clients.some((c) => c.id === p.id)) return "connected";
     } else {
       const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
       if (clientState.status === "connected" && clientState.server === addr) return "connected";
     }
-    if (!p.active) return matchesID(trusted, p.id) ? "trusted" : "idle";
-    return "nearby";
+    if (matchesID(trusted, p.id)) return "ready";
+    if (p.active) return "nearby";
+    return "offline";
   };
 
   const act = async (fn: () => Promise<unknown>) => {
     setErr("");
     try {
       await fn();
+      await refresh();
     } catch (e) {
       setErr(String(e));
     }
@@ -95,19 +99,48 @@ export default function LiveOverview() {
     }
   };
 
-  // Trust and revoke are separate, idempotent membership changes — never
-  // one "toggle" that implies they are opposites.
-  const setTrusted = (p: Peer, on: boolean) =>
-    act(() => (isServer ? api().TrustClient(p.id, on) : api().TrustServer(p.id, on)));
+  // Block is one action that refuses the machine everywhere: it leaves
+  // the trusted list and joins the refused list (the backend refuses a
+  // revoked machine even when trusted, so this is belt and braces).
+  // Unblock only lifts the refusal; whether the machine is still
+  // trusted is the Server page's business.
+  const setBlocked = (p: Peer, blocked: boolean) => {
+    if (blocked) {
+      return act(async () => {
+        await (isServer ? api().RevokeClient(p.id, true) : api().RevokeServer(p.id, true));
+        await (isServer ? api().TrustClient(p.id, false) : api().TrustServer(p.id, false));
+      });
+    }
+    return act(() => (isServer ? api().RevokeClient(p.id, false) : api().RevokeServer(p.id, false)));
+  };
 
-  const setRevoked = (p: Peer, on: boolean) =>
-    act(() => (isServer ? api().RevokeClient(p.id, on) : api().RevokeServer(p.id, on)));
+  const connect = (p: Peer) =>
+    act(() => (isServer ? api().SendConnectRequest(p.id) : api().ConnectToServer(`${p.addr}:${p.port || DEFAULT_PORT}`)));
 
-  // Rows render each peer's advertised role — never this machine's
-  // mode, which mislabeled every row whenever the two disagreed.
-  // Every discovered machine is actionable (trust, connect); there is
-  // nothing to filter out. The empty message only covers "nothing on
-  // the network at all".
+  // Chip label and tint per state — the row's single source of truth.
+  const chip: Record<RowState, { label: string; className: string }> = {
+    connected: { label: isServer ? "connected" : "in control", className: "bg-emerald-500/10 text-emerald-500" },
+    blocked: { label: "blocked", className: "bg-destructive/10 text-destructive" },
+    ready: { label: "ready", className: "bg-sky-500/10 text-sky-400" },
+    nearby: { label: "nearby", className: "bg-amber-500/10 text-amber-500" },
+    offline: { label: "offline", className: "bg-muted/40 text-muted-foreground" },
+  };
+
+  // One-line hint only where the chip alone leaves a question open.
+  const hintFor = (state: RowState): string | undefined => {
+    switch (state) {
+      case "blocked":
+        return "refused until you unblock it";
+      case "ready":
+        return "waiting for it to come online";
+      case "offline":
+        return "not running";
+      default:
+        return undefined;
+    }
+  };
+
+  // The empty message only covers "nothing on the network at all".
   const empty =
     "No other machines found yet. They show up here automatically once they're running — or connect by address from the Client page.";
 
@@ -135,9 +168,7 @@ export default function LiveOverview() {
           {peers.map((p) => {
             const state = stateOf(p);
             const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
-            const connected = state === "connected";
-            const trustedPeer = matchesID(trusted, p.id);
-            const revokedPeer = matchesID(revoked, p.id);
+            const c = chip[state];
             return (
               <div key={p.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3">
                 <div className="min-w-0">
@@ -146,39 +177,10 @@ export default function LiveOverview() {
                     <span className="rounded-full border border-border/60 px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground/70">
                       {p.role}
                     </span>
-                    <span
-                      className={cn(
-                        "rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide",
-                        state === "revoked"
-                          ? "bg-destructive/10 text-destructive"
-                          : connected
-                            ? "bg-emerald-500/10 text-emerald-500"
-                            : state === "trusted"
-                              ? "bg-sky-500/10 text-sky-400"
-                              : state === "nearby"
-                                ? "bg-amber-500/10 text-amber-500"
-                                : "bg-muted/40 text-muted-foreground",
-                      )}
-                    >
-                      {state === "revoked"
-                        ? "revoked"
-                        : connected
-                          ? isServer
-                            ? "connected to you"
-                            : "in control"
-                          : state === "trusted"
-                            ? "trusted"
-                            : state === "nearby"
-                              ? "nearby"
-                              : "idle"}
+                    <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide", c.className)}>
+                      {c.label}
                     </span>
-                    {state === "revoked" && (
-                      <span className="text-[10px] text-muted-foreground/50">refused — can never connect</span>
-                    )}
-                    {state === "trusted" && (
-                      <span className="text-[10px] text-muted-foreground/50">not running — ask it to connect</span>
-                    )}
-                    {state === "idle" && <span className="text-[10px] text-muted-foreground/50">not running</span>}
+                    {hintFor(state) && <span className="text-[10px] text-muted-foreground/50">{hintFor(state)}</span>}
                   </div>
                   <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-muted-foreground/60">
                     <span>{addr}</span>
@@ -195,64 +197,38 @@ export default function LiveOverview() {
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
-                  {/* Role actions first: only a machine that can work with
-                      this one has any. Same-role machines stay muted. */}
-                  {usable(p) && isServer && connected && (
-                    <>
-                      <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "disconnect"))}>
-                        Disconnect
-                      </Button>
-                      <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "restart"))}>
-                        Restart
-                      </Button>
-                    </>
-                  )}
-                  {usable(p) && isServer && !connected && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={revokedPeer}
-                      title={revokedPeer ? "This machine is revoked — un-revoke it to allow a connection" : undefined}
-                      onClick={() => void act(() => api().SendConnectRequest(p.id))}
-                    >
-                      Connect here
-                    </Button>
-                  )}
-                  {usable(p) && !isServer && !connected && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={revokedPeer}
-                      title={revokedPeer ? "This machine is revoked — un-revoke it to allow a connection" : undefined}
-                      onClick={() => void act(() => api().ConnectToServer(addr))}
-                    >
-                      Connect
-                    </Button>
-                  )}
-                  {/* Trust and revoke are always offered side by side and
-                      are independent: both may be set, revoke wins. */}
-                  {usable(p) && (
-                    <>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className={cn("text-muted-foreground", trustedPeer && "text-sky-400")}
-                        onClick={() => void setTrusted(p, !trustedPeer)}
-                      >
-                        {trustedPeer ? "Untrust" : "Trust"}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className={cn("text-muted-foreground", revokedPeer && "text-destructive")}
-                        onClick={() => void setRevoked(p, !revokedPeer)}
-                      >
-                        {revokedPeer ? "Un-revoke" : "Revoke"}
-                      </Button>
-                    </>
-                  )}
-                  {!usable(p) && (
+                  {!usable(p) ? (
                     <span className="text-[10px] text-muted-foreground/50">same role as this machine</span>
+                  ) : state === "connected" ? (
+                    isServer && (
+                      <>
+                        <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "disconnect"))}>
+                          Disconnect
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={() => void act(() => api().ClientCommand(p.name, "restart"))}>
+                          Restart
+                        </Button>
+                      </>
+                    )
+                  ) : state === "blocked" ? (
+                    <Button variant="outline" size="sm" onClick={() => void setBlocked(p, false)}>
+                      Unblock
+                    </Button>
+                  ) : (
+                    <>
+                      <Button variant="outline" size="sm" onClick={() => void connect(p)}>
+                        Connect
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-muted-foreground hover:text-destructive"
+                        onClick={() => void setBlocked(p, true)}
+                        title="Refuse this machine until you unblock it"
+                      >
+                        Block
+                      </Button>
+                    </>
                   )}
                 </div>
               </div>

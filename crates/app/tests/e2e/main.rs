@@ -14,19 +14,33 @@ use std::time::Duration;
 
 use kvmshare_core::client::{Clipboard, Client, Injector};
 use kvmshare_core::layout::Layout;
-use kvmshare_core::server::{Control, Engine, Options, Policy, Server};
+use kvmshare_core::server::{Control, Engine, Options, Policy, Server, ServerEvent};
 use kvmshare_core::session::Session;
 use kvmshare_core::transport::{RecvResult, Transport};
 use kvmshare_core::udp;
 use kvmshare_protocol::message::{KeyKind, Message, Rect, Screen, ScreenInfo};
 use kvmshare_protocol::VERSION;
 
+/// The mock machines' geometry. There is no display here — the injector
+/// is a recorder — so the fixture declares one deliberately, and every
+/// assertion that involves positions derives from these constants (a
+/// change to one is a change to all). The *real* binaries never see these
+/// values: the client reports its actual screen via
+/// `injector.screen_info()` and the server measures its own display.
+pub const SCREEN_W: i32 = 1920;
+pub const SCREEN_H: i32 = 1080;
+
+/// The fixture `ScreenInfo` a mock client reports.
+pub fn screen_info() -> ScreenInfo {
+    ScreenInfo { width: SCREEN_W as u32, height: SCREEN_H as u32, scale: 1.0 }
+}
+
 /// The classic layout from the deskflow debugging sessions: pc (server)
 /// on the right, hp (client) to its left.
 fn two_screen_layout() -> Layout {
     Layout::new(vec![
-        Screen { id: 0, name: "pc".into(), rect: Rect { x: 0, y: 0, w: 1920, h: 1080 } },
-        Screen { id: 1, name: "hp".into(), rect: Rect { x: -1920, y: 0, w: 1920, h: 1080 } },
+        Screen { id: 0, name: "pc".into(), rect: Rect { x: 0, y: 0, w: SCREEN_W, h: SCREEN_H } },
+        Screen { id: 1, name: "hp".into(), rect: Rect { x: -SCREEN_W, y: 0, w: SCREEN_W, h: SCREEN_H } },
     ])
 }
 
@@ -106,6 +120,10 @@ struct Harness {
     input_tx: mpsc::Sender<Message>,
     control_tx: mpsc::Sender<Control>,
     engine_calls: Arc<Mutex<Vec<String>>>,
+    /// The server's lifecycle events, exactly what the app layer's event
+    /// sink consumes to maintain `clients.json` (the GUI's connected
+    /// list). Tests read it to assert the GUI would see the truth.
+    events_rx: Mutex<mpsc::Receiver<ServerEvent>>,
     port: u16,
 }
 
@@ -120,11 +138,25 @@ impl Harness {
         }
         panic!("timed out waiting for {n} client(s)");
     }
+
+    /// Drain the buffered lifecycle events into a plain vec.
+    fn events(&self) -> Vec<String> {
+        let rx = self.events_rx.lock().unwrap();
+        let mut out = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            match evt {
+                ServerEvent::ClientConnected { name, .. } => out.push(format!("connected:{name}")),
+                ServerEvent::ClientDisconnected { name } => out.push(format!("disconnected:{name}")),
+            }
+        }
+        out
+    }
 }
 
 fn start_server() -> Harness {
     let session = Session::new(two_screen_layout(), 0);
     let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let (events_tx, events_rx) = mpsc::channel::<ServerEvent>();
     // The e2e harness keeps the legacy open behavior (allowlist off) so
     // every pre-existing scenario works unchanged; the allowlist itself
     // is exercised by its own dedicated test.
@@ -132,7 +164,12 @@ fn start_server() -> Harness {
         Server::with_options(
             session,
             0,
-            Options { control: Some(control_rx), policy: Policy { allowlist: false, ..Policy::default() }, events: None, server_id: "server-pc".into() },
+            Options {
+                control: Some(control_rx),
+                policy: Policy { allowlist: false, ..Policy::default() },
+                events: Some(events_tx),
+                server_id: "server-pc".into(),
+            },
         )
         .unwrap(),
     );
@@ -157,11 +194,11 @@ fn start_server() -> Harness {
         }
     });
 
-    Harness { server, input_tx, control_tx, engine_calls, port }
+    Harness { server, input_tx, control_tx, engine_calls, events_rx: Mutex::new(events_rx), port }
 }
 
 fn connect_client(port: u16) -> (Client, RecordingInjector, Arc<Mutex<Vec<String>>>, Receiver<Message>) {
-    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    let info = screen_info();
     let injector = RecordingInjector::new(info);
     let calls = injector.calls.clone();
     let client = Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info).unwrap();

@@ -172,11 +172,11 @@ export default function ServerPage() {
           </div>
         </Section>
 
-        <Section title="Revoked machines" className="mt-12">
+        <Section title="Blocked machines" className="mt-12">
           <p className="text-sm text-muted-foreground">
-            A revoked machine may never connect — even if it is in the layout or trusted above. Revoking
+            A blocked machine may never connect — even if it is in the layout or trusted above. Blocking
             wins over everything else, and a machine that is connected right now is disconnected
-            immediately. You can also revoke a machine from its row on the Home page.
+            immediately. You can also block a machine from its row on the Home page.
           </p>
           <div className="flex flex-wrap gap-1.5">
             {network.revokedIds.length === 0 && (
@@ -191,7 +191,7 @@ export default function ServerPage() {
                 <button
                   className="text-muted-foreground/60 hover:text-destructive"
                   onClick={() => patchNetwork({ revokedIds: network.revokedIds.filter((t) => t !== id) })}
-                  aria-label={`un-revoke ${id}`}
+                  aria-label={`unblock ${id}`}
                 >
                   ×
                 </button>
@@ -204,7 +204,7 @@ export default function ServerPage() {
               placeholder="paste a machine id (short form works)"
               value={revokeInput}
               onChange={(e) => setRevokeInput(e.target.value)}
-              aria-label="Machine id to revoke"
+              aria-label="Machine id to block"
             />
             <Button
               variant="outline"
@@ -217,7 +217,7 @@ export default function ServerPage() {
                 }
               }}
             >
-              Revoke
+              Block
             </Button>
           </div>
         </Section>

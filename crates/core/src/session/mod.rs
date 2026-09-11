@@ -297,6 +297,30 @@ impl Session {
         }
     }
 
+    /// A client was disconnected *by policy* (revoked, or its screen left
+    /// the layout): additionally remove its screen from the desktop.
+    ///
+    /// Why not leave the screen as a dead edge: a revoked machine must not
+    /// keep a place in the desktop it may no longer occupy — the operator
+    /// refused the machine, not just its current session. It also keeps a
+    /// re-admission clean: when the machine is un-revoked and returns, it
+    /// is admitted fresh (its own position, right of the desktop) instead
+    /// of silently re-inheriting a stale slot, and the GUI's layout view
+    /// stops showing a screen for a machine that cannot connect.
+    /// A screen the operator *pinned* in the config is unaffected: the
+    /// running session's copy goes, and the config still defines it — the
+    /// machine simply cannot connect while revoked.
+    pub fn on_client_removed(&mut self, id: u8) -> Action {
+        let action = self.on_client_disconnected(id);
+        if self.layout.screens.iter().any(|s| s.id == id) {
+            self.layout.screens.retain(|s| s.id != id);
+            self.dynamic.retain(|s| s.id != id);
+            self.layout = self.layout.normalized();
+            self.clear_boundary_state();
+        }
+        action
+    }
+
     /// May the cursor enter screen `id`? The local screen always; a
     /// remote screen only while its client is connected (see the
     /// [`Session::connected`] docs).

@@ -184,6 +184,12 @@ pub struct Server {
     clients: Arc<Mutex<HashMap<u8, Arc<Client>>>>,
     /// Id of the client the cursor is currently on (`None` = local).
     active: Arc<Mutex<Option<u8>>>,
+    /// The local engine, shared with the accept path's `ClientCtx`. Held
+    /// so a server-initiated disconnect (revoke, stale layout) can bring
+    /// the cursor home without waiting for the client's socket to die —
+    /// a revoked machine's socket may outlive the cleanup by seconds.
+    /// Set by `run`; `disconnect_client` treats it as best-effort.
+    engine: Arc<Mutex<Option<Arc<Mutex<Box<dyn Engine>>>>>>,
     /// Client id → UDP address, learned from each client's first
     /// datagram. The writers need it to route cursor-stream frames.
     udp_addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
@@ -262,6 +268,7 @@ impl Server {
             session: Arc::new(Mutex::new(session)),
             clients: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(None)),
+            engine: Arc::new(Mutex::new(None)),
             udp_addrs: Arc::new(Mutex::new(HashMap::new())),
             udp_seqs: Arc::new(Mutex::new(HashMap::new())),
             last_heard: Arc::new(Mutex::new(HashMap::new())),
@@ -313,6 +320,9 @@ impl Server {
                 .spawn(move || supervisor_loop(active, liveness))
                 .expect("cannot spawn server supervisor")
         };
+        // From here on, server-initiated disconnects can bring the cursor
+        // home themselves (see `disconnect_client`).
+        *self.engine.lock().unwrap() = Some(engine.clone());
         // Accept clients on a background thread.
         let listener = self.listener.try_clone()?;
         let ctx = Arc::new(ClientCtx {
@@ -487,38 +497,108 @@ impl Server {
     /// it may no longer open — otherwise "revoke" would only apply to the
     /// *next* connection, leaving a live cursor-sharing session running.
     fn apply_policy(&self, policy: Policy) {
-        let revoked: Vec<(u8, String)> = {
+        let revoked: Vec<u8> = {
             let mut current = self.policy.lock().unwrap();
             *current = policy;
             let clients = self.clients.lock().unwrap();
             clients
                 .values()
                 .filter(|c| current.is_revoked(&c.machine_id))
-                .map(|c| (c.id, c.name.clone()))
+                .map(|c| c.id)
                 .collect()
         };
-        for (id, name) in revoked {
-            log_info!("revoked: disconnecting client {name}");
-            client::enqueue(
-                &self.clients,
-                id,
-                Message::Control { command: kvmshare_protocol::id::control::DISCONNECT },
-            );
-            client::enqueue(&self.clients, id, Message::Leave { screen_id: id });
-            self.clients.lock().unwrap().remove(&id);
-            self.udp_addrs.lock().unwrap().remove(&id);
-            self.udp_seqs.lock().unwrap().remove(&id);
-            self.last_heard.lock().unwrap().remove(&id);
+        for id in revoked {
+            self.disconnect_client(id, "its machine id was revoked");
+        }
+    }
+
+    /// Disconnect one client and clean up everything its session held:
+    /// the wire commands (disconnect + leave), the registration maps, the
+    /// active-cursor state and the session (which may bring the cursor
+    /// home), plus the [`ServerEvent::ClientDisconnected`] that keeps the
+    /// app layer's `clients.json` — and therefore the GUI's connected
+    /// list — truthful.
+    ///
+    /// This is *the* disconnect path. Every server-initiated drop goes
+    /// through it; the three call sites used to each reimplement a subset,
+    /// and the subsets that skipped the event left the GUI showing
+    /// "connected to you" for a machine that was long gone.
+    ///
+    /// `remove_screen`: policy drops (revoke, stale layout) also remove
+    /// the client's screen from the running desktop (see
+    /// [`Session::on_client_removed`]) — the operator refused the machine,
+    /// not just its session.
+    fn disconnect_client(&self, id: u8, why: &str) {
+        self.disconnect_client_inner(id, why, true)
+    }
+
+    /// Plain disconnect: the session keeps the screen (a client that
+    /// merely dropped may reconnect into its slot).
+    fn disconnect_client_keep_screen(&self, id: u8, why: &str) {
+        self.disconnect_client_inner(id, why, false)
+    }
+
+    fn disconnect_client_inner(&self, id: u8, why: &str, remove_screen: bool) {
+        let name = {
+            let clients = self.clients.lock().unwrap();
+            match clients.get(&id) {
+                Some(c) => c.name.clone(),
+                None => return, // already gone; nothing to clean up
+            }
+        };
+        log_info!("disconnecting client {name}: {why}");
+
+        // Tell the client to end its session (stays stopped) and leave
+        // the desktop. Either command may hit a dead socket — the writer
+        // drops those.
+        client::enqueue(
+            &self.clients,
+            id,
+            Message::Control { command: kvmshare_protocol::id::control::DISCONNECT },
+        );
+        client::enqueue(&self.clients, id, Message::Leave { screen_id: id });
+
+        // The reader thread for this connection ends when its socket
+        // closes (or on these commands); teardown is identity-checked and
+        // idempotent, so its later cleanup is a no-op from here on.
+        self.clients.lock().unwrap().remove(&id);
+        self.udp_addrs.lock().unwrap().remove(&id);
+        self.udp_seqs.lock().unwrap().remove(&id);
+        self.last_heard.lock().unwrap().remove(&id);
+
+        // Session first: it decides whether the cursor must come home.
+        let action = if remove_screen {
+            self.session.lock().unwrap().on_client_removed(id)
+        } else {
+            self.session.lock().unwrap().on_client_disconnected(id)
+        };
+        {
             let mut act = self.active.lock().unwrap();
             if *act == Some(id) {
                 *act = None;
             }
         }
+        if let Action::SwitchToLocal { .. } = action {
+            let engine = self.engine.lock().unwrap().clone();
+            if let Some(engine) = engine {
+                if let Ok(mut engine) = engine.lock() {
+                    let _ = apply_action(action, &self.active, &self.clients, &self.last_heard, &mut engine);
+                }
+            }
+        }
+
+        // App layer last, so clients.json is rewritten after the maps
+        // settled (the event sink persists on every event).
+        if let Some(tx) = self.events.lock().unwrap().as_ref() {
+            let _ = tx.send(ServerEvent::ClientDisconnected { name });
+        }
     }
 
     /// Disconnect clients whose screen disappeared from the new layout
     /// (their id no longer maps to a screen with the same name), so no
-    /// ghost connections linger after a reload.
+    /// ghost connections linger after a reload. The session already
+    /// dropped those screens in `swap_layout`, so the disconnect keeps
+    /// whatever screen state the session decided.
     fn drop_stale_clients(&self) {
         let gone: Vec<u8> = {
             let session = self.session.lock().unwrap();
@@ -535,32 +615,38 @@ impl Server {
                 .map(|(id, _)| *id)
                 .collect()
         };
-        for id in &gone {
-            client::enqueue(&self.clients, *id, Message::Leave { screen_id: *id });
-            self.clients.lock().unwrap().remove(id);
-            self.udp_addrs.lock().unwrap().remove(id);
-            self.udp_seqs.lock().unwrap().remove(id);
-            let mut act = self.active.lock().unwrap();
-            if *act == Some(*id) {
-                *act = None;
-            }
-        }
-        if !gone.is_empty() {
-            log_info!("dropped {} stale client(s) after reload", gone.len());
+        for id in gone {
+            self.disconnect_client_keep_screen(id, "its screen left the layout");
         }
     }
 
     /// Send an operational command to one connected client by screen
-    /// name (see [`Control::ClientCommand`]). The client acts on it and
-    /// ends its session; the server side closes with the client's EOF.
+    /// name (see [`Control::ClientCommand`]).
+    ///
+    /// `disconnect` is routed through [`Server::disconnect_client`] so it
+    /// cleans up every map, the session and the app-layer event — the
+    /// old inline send left `clients.json` claiming the client was still
+    /// connected until the socket happened to die.
     fn apply_client_command(&self, name: &str, command: u8) {
-        let clients = self.clients.lock().unwrap();
-        let Some(client) = clients.values().find(|c| c.name == name).cloned() else {
-            log_warn!("client command: no connected client named {name:?}");
-            return;
+        let id = {
+            let clients = self.clients.lock().unwrap();
+            match clients.values().find(|c| c.name == name) {
+                Some(c) => c.id,
+                None => {
+                    log_warn!("client command: no connected client named {name:?}");
+                    return;
+                }
+            }
         };
-        log_info!("client command to {name}: control code {command}");
-        let _ = client.out.send(client::route(Message::Control { command }));
+        match command {
+            // The operator dismissed the machine; the screen goes too so a
+            // reconnect (reconnect/restart commands) is admitted fresh.
+            kvmshare_protocol::id::control::DISCONNECT => self.disconnect_client(id, "the operator asked it to disconnect"),
+            _ => {
+                log_info!("client command to {name}: control code {command}");
+                client::enqueue(&self.clients, id, Message::Control { command });
+            }
+        }
     }
 
     /// Send a message to every connected client (e.g. layout or

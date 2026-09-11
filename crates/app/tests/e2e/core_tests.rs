@@ -14,7 +14,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     // -- Cross from pc onto hp (left screen). --
     // The real cursor parks at the shared edge (beacon), then an outward
     // push crosses. (Deltas alone never cross — see core::session.)
-    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 });
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
     feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
 
     let cc = calls(&client_calls);
@@ -25,7 +25,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     // entry exactly on the wall makes the first beacon a park, which
     // re-crosses.)
     assert!(
-        cc.iter().any(|c| c == "move 1895,540"),
+        cc.iter().any(|c| c == &format!("move {},{}", SCREEN_W - 25, SCREEN_H / 2)),
         "client should move to entry point, got {cc:?}"
     );
 
@@ -63,7 +63,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     assert_eq!(rel_x, -100, "motion must deliver the full -100 px command, got {cc:?}");
     assert_eq!(rel_y, 0, "no motion outside the command axis, got {cc:?}");
     assert!(
-        cc.iter().all(|c| !c.starts_with("move ") || c == "move 1895,540"),
+        cc.iter().all(|c| !c.starts_with("move ") || c == &format!("move {},{}", SCREEN_W - 25, SCREEN_H / 2)),
         "only the entry move may be absolute, got {cc:?}"
     );
 
@@ -99,7 +99,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
 /// deafen a fresh peer).
 fn raw_beacon_client(port: u16, n: u32) {
     let mut tcp = Transport::new(TcpStream::connect(("127.0.0.1", port)).unwrap()).unwrap();
-    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    let info = screen_info();
     tcp.send(&Message::Hello { version: VERSION, id: "machine-hp".into(), name: "hp".into(), info }).unwrap();
     let id = match tcp.recv().unwrap() {
         RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => own_screen_id,
@@ -110,7 +110,7 @@ fn raw_beacon_client(port: u16, n: u32) {
     udp_sock.connect(("127.0.0.1", port)).unwrap();
     for seq in 1..=n {
         udp_sock
-            .send(&udp::pack(id, seq, &Message::CursorPos { x: 500, y: 540 }))
+            .send(&udp::pack(id, seq, &Message::CursorPos { x: SCREEN_W / 2, y: SCREEN_H / 2 }))
             .unwrap();
     }
     // Give the server a moment to drain the datagrams, then vanish.
@@ -141,7 +141,7 @@ fn client_reconnect_is_not_deafened_by_stale_udp_sequences() {
     h.wait_for_clients(1);
 
     // Cross onto hp.
-    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 });
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
     feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
     let cc = calls(&client_calls);
     assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
@@ -178,7 +178,7 @@ fn crossing_after_idle_is_not_dropped_by_the_beacon_watchdog() {
     // (On localhost a full client's immediate beacon can beat the check,
     // hiding the race this guards against.)
     let mut tcp = Transport::new(TcpStream::connect(("127.0.0.1", h.port)).unwrap()).unwrap();
-    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    let info = screen_info();
     tcp.send(&Message::Hello { version: VERSION, id: "machine-hp".into(), name: "hp".into(), info }).unwrap();
     let id = match tcp.recv().unwrap() {
         RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => own_screen_id,
@@ -198,7 +198,7 @@ fn crossing_after_idle_is_not_dropped_by_the_beacon_watchdog() {
     thread::sleep(Duration::from_millis(2000));
 
     // Cross onto hp.
-    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 });
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
     feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
     assert!(
         calls(&h.engine_calls).iter().any(|c| c == "cursor false"),
@@ -219,7 +219,7 @@ fn crossing_after_idle_is_not_dropped_by_the_beacon_watchdog() {
     // Now it beacons normally and must stay alive: a wedge drop would
     // restore the local cursor.
     for _ in 0..10 {
-        udp_sock.send(&udp::pack(id, 1, &Message::CursorPos { x: 1895, y: 540 })).unwrap();
+        udp_sock.send(&udp::pack(id, 1, &Message::CursorPos { x: SCREEN_W - 25, y: SCREEN_H / 2 })).unwrap();
         thread::sleep(Duration::from_millis(100));
     }
     assert!(
@@ -235,7 +235,7 @@ fn client_disconnect_returns_cursor_home() {
     // Connect but never run the loop: the socket stays open.
     let (client, _injector, _client_calls, _out_rx) = connect_client(h.port);
     h.wait_for_clients(1);
-    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 }); // beacon at the shared edge
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 }); // beacon at the shared edge
     feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 }); // outward push: on hp now
 
     // Dropping the client closes the TCP connection; the server notices
@@ -253,7 +253,7 @@ fn unknown_client_is_admitted_dynamically() {
     // (placed right of the desktop) instead of being rejected — a fresh
     // pair of machines works before either has been configured.
     let h = start_server(); // pc at origin, hp configured to the left
-    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    let info = screen_info();
     let client = Client::connect(&format!("127.0.0.1:{}", h.port), "not-in-layout", "machine-new", info).unwrap();
     // pc=0 and hp=1 are taken; the newcomer gets the next free id and
     // the server registered it.
@@ -298,7 +298,7 @@ fn allowlist_refuses_unknown_and_admits_trusted() {
         }
     });
 
-    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    let info = screen_info();
 
     // Untrusted and unnamed: refused with a NOT_ALLOWED error.
     let err = Client::connect(&format!("127.0.0.1:{port}"), "stranger", "machine-stranger", info.clone())
@@ -365,7 +365,7 @@ fn allowlist_admits_by_short_id_prefix() {
 
     // Full id starts with the trusted 8-char prefix → admitted even
     // though the name is not in the layout.
-    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    let info = screen_info();
     let client = Client::connect(&format!("127.0.0.1:{port}"), "short-id-peer", full, info).unwrap();
     assert_eq!(client.own_id(), 2);
     for _ in 0..100 {
@@ -396,7 +396,7 @@ fn config_hot_reload_returns_cursor_home_and_broadcasts() {
 
     // Move onto hp, then reload a layout that no longer has hp: the
     // cursor must come home and the client must be told to leave.
-    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 }); // beacon at the shared edge
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 }); // beacon at the shared edge
     feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 }); // outward push
     assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
 
@@ -467,7 +467,7 @@ fn duplicate_connection_replaces_stale_one_without_losing_the_live_client() {
 
     // The live (replacement) client must still be serviced: a crossing
     // reaches it and it reports home again.
-    feed(&h, Message::MouseMoveAbs { x: 0, y: 540 });
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
     feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
     let cc = calls(&client_calls2);
     assert!(cc.contains(&"enter".to_string()), "live client should still receive crossings, got {cc:?}");
@@ -537,7 +537,7 @@ fn revoked_machine_is_refused_even_when_named_in_the_layout() {
         }
     });
 
-    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    let info = screen_info();
     // "hp" IS the layout's screen 1 — named, matching, and still refused.
     let err = Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info)
         .unwrap_err()
@@ -569,4 +569,115 @@ fn hot_revoke_disconnects_a_connected_client() {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(h.server.client_count(), 0, "the revoked machine must be dropped at once");
+}
+
+/// The GUI's connected list is driven by `clients.json`, which the app
+/// layer rewrites per lifecycle event. A server-initiated drop (revoke,
+/// operator disconnect) must emit `ClientDisconnected` — the regression
+/// here was the GUI showing "connected to you" for a machine that had
+/// been dropped, until the client happened to reconnect.
+#[test]
+fn server_initiated_disconnect_updates_the_client_list() {
+    let h = start_server();
+    let (client, injector, _client_calls, out_rx) = connect_client(h.port);
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
+    h.wait_for_clients(1);
+
+    // The operator disconnects the machine from the GUI. The control
+    // channel is drained by the main loop's idle poll (CONTROL_POLL =
+    // 100 ms), so allow a few polls for the command to land.
+    h.control_tx
+        .send(Control::ClientCommand { name: "hp".into(), command: kvmshare_protocol::id::control::DISCONNECT })
+        .unwrap();
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(h.server.client_count(), 0);
+    // The GUI's list is driven by the disconnect event; without it,
+    // `clients.json` (and therefore the Home page) kept claiming the
+    // machine was connected. `Harness::events` drains the channel, so
+    // the vec must be captured once and asserted on — re-draining in
+    // the assert silently re-reads an empty channel.
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        events = h.events();
+        if events.iter().any(|e| e == "disconnected:hp") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        events.iter().any(|e| e == "disconnected:hp"),
+        "the operator disconnect must emit ClientDisconnected, got: {events:?}"
+    );
+}
+
+/// Un-revoking re-admits the machine fresh: the revoke removed its
+/// dynamically admitted screen, so when it returns it gets a new slot
+/// instead of silently re-inheriting a stale position.
+#[test]
+fn unrevoked_machine_is_readmitted_fresh() {
+    let session = Session::new(two_screen_layout(), 0);
+    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    // Start with the machine revoked but its screen pinned ("hp" IS in
+    // the layout): the pinned copy is what the operator configured, and
+    // it must survive a revoke/un-revoke cycle unchanged.
+    let policy = Policy {
+        allowlist: true,
+        local_only: false,
+        revoked_ids: vec!["machine-hp".into()],
+        ..Policy::default()
+    };
+    let server = Arc::new(
+        Server::with_options(
+            session,
+            0,
+            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+        )
+        .unwrap(),
+    );
+    let port = server.local_addr().unwrap().port();
+    // The input channel must stay open: the main loop exits when it
+    // closes, and a closed main loop never drains the control channel.
+    let (_input_tx, input_rx) = mpsc::channel::<Message>();
+    let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
+    let clipboard: kvmshare_core::server::ServerClipboard =
+        Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
+    thread::spawn({
+        let server = server.clone();
+        let engine = engine.clone();
+        let clipboard = clipboard.clone();
+        move || {
+            server
+                .run(input_rx, engine, clipboard, Arc::new(kvmshare_core::server::Liveness::default()))
+                .unwrap()
+        }
+    });
+
+    let info = screen_info();
+    // Revoked: refused.
+    assert!(Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info.clone()).is_err());
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(server.client_count(), 0);
+
+    // Un-revoked: admitted again (its screen was pinned in the config,
+    // so it lands back in the operator's slot, not a dynamic one). The
+    // policy is swapped through the control channel — the same hot path
+    // the GUI's trust toggle drives.
+    control_tx
+        .send(Control::SetPolicy(Policy { allowlist: true, local_only: false, ..Policy::default() }))
+        .unwrap();
+    thread::sleep(Duration::from_millis(150)); // let the main loop drain it
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info).unwrap();
+    assert_eq!(client.own_id(), 1, "the pinned screen slot is reused");
+    for _ in 0..100 {
+        if server.client_count() >= 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(server.client_count(), 1, "an un-revoked machine is admitted again");
 }
