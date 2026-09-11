@@ -267,11 +267,12 @@ fn unknown_client_is_admitted_dynamically() {
 #[test]
 fn allowlist_refuses_unknown_and_admits_trusted() {
     let session = Session::new(two_screen_layout(), 0);
-    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let (_control_tx, control_rx) = mpsc::channel::<Control>();
     let policy = Policy {
         allowlist: true,
         local_only: false, // localhost must pass the network check
         trusted_ids: vec!["machine-trusted".into()],
+        ..Policy::default()
     };
     let server = Arc::new(
         Server::with_options(
@@ -282,7 +283,7 @@ fn allowlist_refuses_unknown_and_admits_trusted() {
         .unwrap(),
     );
     let port = server.local_addr().unwrap().port();
-    let (input_tx, input_rx) = mpsc::channel::<Message>();
+    let (_input_tx, input_rx) = mpsc::channel::<Message>();
     let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
     let clipboard: kvmshare_core::server::ServerClipboard =
         Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
@@ -330,12 +331,13 @@ fn allowlist_refuses_unknown_and_admits_trusted() {
 #[test]
 fn allowlist_admits_by_short_id_prefix() {
     let session = Session::new(two_screen_layout(), 0);
-    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let (_control_tx, control_rx) = mpsc::channel::<Control>();
     let full = "70b97d38631dda4b8f6ef627d753022d";
     let policy = Policy {
         allowlist: true,
         local_only: false,
         trusted_ids: vec![full[..8].to_string()], // short form
+        ..Policy::default()
     };
     let server = Arc::new(
         Server::with_options(
@@ -346,7 +348,7 @@ fn allowlist_admits_by_short_id_prefix() {
         .unwrap(),
     );
     let port = server.local_addr().unwrap().port();
-    let (input_tx, input_rx) = mpsc::channel::<Message>();
+    let (_input_tx, input_rx) = mpsc::channel::<Message>();
     let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
     let clipboard: kvmshare_core::server::ServerClipboard =
         Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
@@ -493,4 +495,78 @@ fn duplicate_connection_replaces_stale_one_without_losing_the_live_client() {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(h.server.client_count(), 0);
+}
+
+/// A revoked machine id is refused **even though its name is in the
+/// layout** — revocation is a hard deny that outranks the allowlist and a
+/// pinned screen. (Previously "revoke" only removed the id from the
+/// trusted list, so a client whose screen was pinned — i.e. every machine
+/// after its first connect — kept being admitted.)
+#[test]
+fn revoked_machine_is_refused_even_when_named_in_the_layout() {
+    let session = Session::new(two_screen_layout(), 0);
+    let (_control_tx, control_rx) = mpsc::channel::<Control>();
+    let policy = Policy {
+        allowlist: true,
+        local_only: false, // localhost must pass the network check
+        revoked_ids: vec!["machine-hp".into()],
+        ..Policy::default()
+    };
+    let server = Arc::new(
+        Server::with_options(
+            session,
+            0,
+            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+        )
+        .unwrap(),
+    );
+    let port = server.local_addr().unwrap().port();
+    let (input_tx, input_rx) = mpsc::channel::<Message>();
+    drop(input_tx);
+    let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
+    let clipboard: kvmshare_core::server::ServerClipboard =
+        Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
+    thread::spawn({
+        let server = server.clone();
+        let engine = engine.clone();
+        let clipboard = clipboard.clone();
+        move || {
+            server
+                .run(input_rx, engine, clipboard, Arc::new(kvmshare_core::server::Liveness::default()))
+                .unwrap()
+        }
+    });
+
+    let info = ScreenInfo { width: 1920, height: 1080, scale: 1.0 };
+    // "hp" IS the layout's screen 1 — named, matching, and still refused.
+    let err = Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("rejected"), "revoked client must be refused, got: {err}");
+    assert!(err.contains("revoked"), "the refusal must say why, got: {err}");
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(server.client_count(), 0, "a revoked client must never be registered");
+}
+
+/// A hot policy change that revokes a *connected* machine drops it
+/// immediately: "revoke" must end the live session, not only the next
+/// connect.
+#[test]
+fn hot_revoke_disconnects_a_connected_client() {
+    let h = start_server();
+    let (client, injector, _client_calls, out_rx) = connect_client(h.port);
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
+    h.wait_for_clients(1);
+
+    // Revoke the machine that is connected right now.
+    h.control_tx
+        .send(Control::SetPolicy(Policy { revoked_ids: vec!["machine-hp".into()], ..Policy::default() }))
+        .unwrap();
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 0, "the revoked machine must be dropped at once");
 }

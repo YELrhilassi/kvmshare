@@ -43,6 +43,8 @@ type runningSnapshot struct {
 // Trusted are the machine ids this machine trusts (server config ids
 // for a server, trusted-server ids for a client) — the page uses them
 // to tell "nearby" machines from "trusted but not running" ones.
+// Revoked are the ids this machine refuses; the two lists are
+// independent (an id may be in both) and revoked wins.
 type LiveSnapshot struct {
 	Mode        Mode              `json:"mode"`
 	ClientName  string            `json:"clientName"`
@@ -51,6 +53,7 @@ type LiveSnapshot struct {
 	Peers       []discovery.Peer  `json:"peers"`
 	Clients     []ConnectedClient `json:"clients"`
 	Trusted     []string          `json:"trusted"`
+	Revoked     []string          `json:"revoked"`
 }
 
 // snapshot assembles the current picture. Locking is deliberately
@@ -79,10 +82,12 @@ func (a *App) snapshot() LiveSnapshot {
 	if mode == ModeServer {
 		if cfg, err := a.LoadConfig(); err == nil {
 			snap.Trusted = nonNilStrings(cfg.Network.TrustedIDs)
+			snap.Revoked = nonNilStrings(cfg.Network.RevokedIDs)
 		}
 	} else {
 		a.mu.Lock()
 		snap.Trusted = nonNilStrings(a.settings.TrustedServers)
+		snap.Revoked = nonNilStrings(a.settings.RevokedServers)
 		a.mu.Unlock()
 	}
 	return snap

@@ -9,7 +9,10 @@ use std::thread;
 use std::time::Duration;
 
 use kvmshare_app::guard::{self, RoleGuard};
-use kvmshare_app::{hostname, machine_id, parse_client_args, state_dir, with_default_port, write_client_state, write_client_state_stopped, DEFAULT_PORT};
+use kvmshare_app::{
+    hostname, machine_id, parse_client_args, revoked_policy_from_env, state_dir, with_default_port,
+    write_client_state, write_client_state_stopped, DEFAULT_PORT,
+};
 use kvmshare_core::client::{Client, SessionEnd};
 use kvmshare_log::{log_error, log_info, log_warn};
 use kvmshare_protocol::message::Message;
@@ -58,6 +61,10 @@ fn run() -> Result<(), String> {
     // (reconnect immediately).
     let mut warned = false;
     let mut prompt_warned = false;
+    // Servers this machine must not hold a session with (revoked in the
+    // GUI, handed to us at spawn). Enforced right after the handshake,
+    // once the server's id is known — see `kvmshare_app::trust`.
+    let revoked = revoked_policy_from_env();
     // The live state file the GUI reads (Home's connection panel): it
     // always says what this process is doing *right now* — connecting,
     // connected, or not connected. Written on every transition.
@@ -98,6 +105,18 @@ fn run() -> Result<(), String> {
         write_client_state(&state_dir, "connecting", &addr);
         match Client::connect(&addr, &name, &id, injector.screen_info()) {
             Ok(client) => {
+                // The server revealed its id in `Welcome`; if the operator
+                // revoked it on this machine, end the session now and do
+                // not reconnect. Written as a *requested stop* so the
+                // GUI's auto-connect does not immediately retry.
+                if revoked.is_revoked(client.server_id()) {
+                    log_warn!(
+                        "server {} is revoked on this machine — refusing the session",
+                        client.server_id()
+                    );
+                    write_client_state_stopped(&state_dir, &addr);
+                    return Ok(());
+                }
                 warned = false;
                 log_info!("connected, screen id {}", client.own_id());
                 write_client_state(&state_dir, "connected", &addr);

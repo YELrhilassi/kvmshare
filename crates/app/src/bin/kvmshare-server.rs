@@ -15,7 +15,7 @@ use kvmshare_app::{
     default_config_path, machine_id, parse_server_args, session_from_config, spawn_server_clipboard,
     state_dir, Config,
 };
-use kvmshare_core::server::{Control, Options, Policy, Server, ServerEvent};
+use kvmshare_core::server::{Control, Options, Server, ServerEvent};
 use kvmshare_log::{log_error, log_info, log_warn};
 use kvmshare_protocol::message::ScreenInfo;
 
@@ -96,11 +96,7 @@ fn run() -> Result<(), String> {
     // auto-config (screen sizes reported by clients).
     let (evt_tx, evt_rx) = mpsc::channel();
     let state = state_dir();
-    let policy = Policy {
-        allowlist: cfg.network.allowlist,
-        local_only: cfg.network.local_only,
-        trusted_ids: cfg.network.trusted_ids.clone(),
-    };
+    let policy = cfg.network_policy();
     let server = Arc::new(
         Server::with_options(
             session_from_config(&cfg),
@@ -332,7 +328,13 @@ fn spawn_config_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
             match Config::load(&path) {
                 Ok(cfg) => {
                     last = Some(sig);
-                    if tx.send(Control::Reload(cfg.to_layout())).is_err() {
+                    // Layout and policy travel separately: the layout edit
+                    // broadcasts the new screen map, while the policy edit
+                    // can disconnect a client that was just revoked (see
+                    // [`Control::SetPolicy`]).
+                    if tx.send(Control::Reload(cfg.to_layout())).is_err()
+                        || tx.send(Control::SetPolicy(cfg.network_policy())).is_err()
+                    {
                         return; // server gone
                     }
                 }

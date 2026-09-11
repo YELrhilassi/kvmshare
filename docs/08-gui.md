@@ -94,14 +94,25 @@ Key methods the frontend calls: `GetSettings`/`SetSettings`,
   (which marks `client.state` with `stopped=1`) — holds it off until an
   explicit Start. The decision and the start happen under one lock, so
   it can never preempt a role the operator just started.
-- **Revocation is sticky**: `RevokeServer` removes the id from
-  `trustedServers` and records it in `revokedServers`, which refuses
-  pairing outright and vetoes the last-used-address fallback. Trusting
-  an id again clears the revocation.
+- **Trust and revocation are independent**: `TrustServer`/
+  `RevokeServer` set membership in `trustedServers`/`revokedServers`
+  (idempotent, `false` removes). Both lists may name the same machine,
+  and **revoke always wins**. A revoked server is refused everywhere —
+  no pairing request is honored, no auto-connect selects it, the GUI
+  refuses to start a connect to it (`revokedPeerAtAddr`), and the client
+  process refuses the session after `Welcome` (the ids travel to it in
+  `KVMSHARE_REVOKED_IDS`). Only an explicit un-revoke re-opens it.
 - **Trusted ids make pairing headless**: add a machine's id (shown on
   its own Home page) to `trusted_ids`, or accept its connect when the
   server asks — the client is admitted dynamically on first connect
   with its real screen size, so no mouse-plug-in-first ritual.
+- **Revoked ids are a hard deny**: `[network] revoked_ids` is checked in
+  the handshake *before* the layout and before `trusted_ids`, so a
+  revoked machine cannot get in through a pinned screen (the case that
+  made "revoke" look like a no-op). Both the layout/policy change and a
+  fresh policy are hot-applied: `Control::SetPolicy` updates the shared
+  policy and disconnects a machine whose id was just revoked — revoke
+  ends a live session, not only the next connect.
 - Machine ids are shared with the Rust binaries via `machine.id` in the
   state dir (see [App §7.4](07-app.md#74-machine-id--hostname)).
 

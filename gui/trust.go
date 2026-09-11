@@ -21,12 +21,16 @@ import (
 	"kvmshare/gui/internal/ids"
 )
 
-// TrustClient adds a machine id to the server config's trusted_ids list
-// (persisted; the running server hot-reloads it). Idempotent. Accepts a
-// short (8-char) or full id. Deliberately does NOT hold a.mu while
-// saving: SaveConfig takes the lock itself, and holding it here would
-// deadlock.
-func (a *App) TrustClient(id string) error {
+// TrustClient sets whether a machine id is trusted on this server
+// (persisted; the running server hot-reloads policy changes live).
+// `false` removes the entry. Idempotent, accepts a short (8-char) or full
+// id. Trust and revocation are independent: trusting an id does NOT clear
+// a revocation — the two lists can name the same machine, and a revoked
+// id is always refused.
+//
+// Deliberately does NOT hold a.mu while saving: SaveConfig takes the lock
+// itself, and holding it here would deadlock.
+func (a *App) TrustClient(id string, trusted bool) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
 		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
@@ -35,58 +39,70 @@ func (a *App) TrustClient(id string) error {
 	if err != nil {
 		return err
 	}
-	for _, t := range cfg.Network.TrustedIDs {
-		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
-			return nil // already trusted (full or prefix)
-		}
-	}
-	cfg.Network.TrustedIDs = append(cfg.Network.TrustedIDs, id)
+	cfg.Network.TrustedIDs = setID(cfg.Network.TrustedIDs, id, trusted)
 	return a.SaveConfig(cfg)
 }
 
-// RevokeClient removes a machine id from the server config's trusted_ids
-// (the machine must be trusted by name/layout from now on, like any
-// other). Idempotent; accepts the short or full id. Like TrustClient it
-// avoids holding a.mu across SaveConfig (which locks it itself).
-func (a *App) RevokeClient(id string) error {
+// RevokeClient sets whether a machine id is revoked on this server. A
+// revoked id may never connect — the running server refuses it in the
+// handshake (before the layout and the trusted list) and drops it
+// immediately if it is connected right now. Idempotent; `false`
+// un-revokes. Accepts the short or full id. Like TrustClient it avoids
+// holding a.mu across SaveConfig (which locks it itself).
+func (a *App) RevokeClient(id string, revoked bool) error {
 	id = strings.TrimSpace(id)
+	if len(id) < 4 {
+		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
+	}
 	cfg, err := a.LoadConfig()
 	if err != nil {
 		return err
 	}
-	kept := cfg.Network.TrustedIDs[:0]
-	for _, t := range cfg.Network.TrustedIDs {
-		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
-			continue // this entry IS the id (full or prefix) — drop it
-		}
-		kept = append(kept, t)
-	}
-	cfg.Network.TrustedIDs = kept
+	cfg.Network.RevokedIDs = setID(cfg.Network.RevokedIDs, id, revoked)
 	return a.SaveConfig(cfg)
 }
 
-// RevokeServer refuses a server machine id on this machine. It is
-// removed from the trusted list AND added to the revoked list — the two
-// together mean "never accept this server again, not even by pairing"
-// and, critically, "never auto-connect to it, not even because its
-// address matches the last connection". If the client is currently
-// connected to that server, the session is stopped: revocation should
-// take effect now, not at the next restart.
+// setID adds `id` to (on=true) or removes it from (on=false) `list`,
+// matching by prefix the same way trust does. Returns a fresh slice so the
+// original backing array is never aliased.
+func setID(list []string, id string, on bool) []string {
+	kept := make([]string, 0, len(list)+1)
+	for _, t := range list {
+		if idTrusted([]string{t}, id) || idTrusted([]string{id}, t) {
+			continue // drop any existing form of this id first
+		}
+		kept = append(kept, t)
+	}
+	if on {
+		kept = append(kept, id)
+	}
+	return kept
+}
+
+// RevokeServer sets whether a server machine id is revoked on this
+// machine. A revoked server is refused outright: no pairing request is
+// honored, no auto-connect selects it, and the client itself refuses the
+// session (the server's id arrives in `Welcome`, which the client checks
+// against the list the GUI passes it).
 //
-// Idempotent; accepts short or full ids.
-func (a *App) RevokeServer(id string) error {
+// Trust and revocation are independent — the same id may be in both lists,
+// and revoke always wins — so this does not touch the trusted list. If the
+// client is currently connected to that server, the session is stopped:
+// revocation takes effect now, not at the next restart. Idempotent;
+// `false` un-revokes. Accepts short or full ids.
+func (a *App) RevokeServer(id string, revoked bool) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
 		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
 	}
 	a.mu.Lock()
-	a.settings.TrustedServers = dropID(a.settings.TrustedServers, id)
-	if !idRevoked(a.settings.RevokedServers, id) {
-		a.settings.RevokedServers = append(a.settings.RevokedServers, id)
-	}
+	a.settings.RevokedServers = setID(a.settings.RevokedServers, id, revoked)
 	a.saveSettingsLocked()
 	a.mu.Unlock()
 
+	if !revoked {
+		return nil // un-revoking never disturbs a running session
+	}
 	// If we are connected to the machine we just revoked, end it now.
 	if addr, ok := a.livePeerAddr(id); ok && a.clientTargets(addr) {
 		return a.ClientStop()
@@ -94,22 +110,19 @@ func (a *App) RevokeServer(id string) error {
 	return nil
 }
 
-// TrustServer adds a server machine id to this machine's trusted-servers
-// list (the client accepts connection requests from it). Trusting an id
-// is the explicit opposite of revoking it, so a revoked id is cleared —
-// otherwise a re-trust would be silently dead (the revoke check wins
-// everywhere). Idempotent; accepts short or full ids.
-func (a *App) TrustServer(id string) error {
+// TrustServer sets whether a server machine id is trusted on this machine
+// (the client accepts connection requests from it). Independent of
+// revocation, like TrustClient: trusting does not clear a revoke, so the
+// two can coexist and revoke still wins. Idempotent; `false` removes the
+// entry. Accepts short or full ids.
+func (a *App) TrustServer(id string, trusted bool) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
 		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.settings.RevokedServers = dropID(a.settings.RevokedServers, id)
-	if !idTrusted(a.settings.TrustedServers, id) {
-		a.settings.TrustedServers = append(a.settings.TrustedServers, id)
-	}
+	a.settings.TrustedServers = setID(a.settings.TrustedServers, id, trusted)
 	a.saveSettingsLocked()
 	return nil
 }
@@ -151,19 +164,7 @@ func (a *App) livePeerAddr(id string) (string, bool) {
 // clientTargets reports whether the client's configured server address
 // points at `addr` (same host, any port).
 func (a *App) clientTargets(addr string) bool {
-	host := a.settings.ClientAddr
-	if i := strings.LastIndex(host, ":"); i > 0 {
-		host = host[:i]
-	}
-	host = strings.TrimSpace(host)
-	if host == "" || addr == "" {
-		return false
-	}
-	want := addr
-	if i := strings.LastIndex(want, ":"); i > 0 {
-		want = want[:i]
-	}
-	return host == want
+	return addr != "" && sameHost(a.settings.ClientAddr, addr)
 }
 
 func portOrDefault(p int) int {

@@ -28,11 +28,14 @@ type Screen struct {
 }
 
 // Network is the `[network]` section the frontend edits: who may
-// connect to this server.
+// connect to this server. TrustedIDs and RevokedIDs are independent —
+// an id may appear in both, and a revoked id is always refused (a hard
+// deny that outranks the layout and the trusted list).
 type Network struct {
 	Allowlist  bool     `json:"allowlist"`
 	LocalOnly  bool     `json:"localOnly"`
 	TrustedIDs []string `json:"trustedIds"`
+	RevokedIDs []string `json:"revokedIds"`
 }
 
 // Config is the layout the frontend edits.
@@ -54,6 +57,7 @@ type networkFile struct {
 	Allowlist  bool     `toml:"allowlist"`
 	LocalOnly  bool     `toml:"local_only"`
 	TrustedIDs []string `toml:"trusted_ids"`
+	RevokedIDs []string `toml:"revoked_ids"`
 }
 
 type screenFile struct {
@@ -98,6 +102,7 @@ func (a *App) LoadConfig() (Config, error) {
 		Allowlist:  cf.Network.Allowlist,
 		LocalOnly:  cf.Network.LocalOnly,
 		TrustedIDs: nonNilStrings(cf.Network.TrustedIDs),
+		RevokedIDs: nonNilStrings(cf.Network.RevokedIDs),
 	}
 	// Old configs have no [network] section; default to secure.
 	if !cf.Network.Allowlist && !cf.Network.LocalOnly && len(cf.Network.TrustedIDs) == 0 {
@@ -144,12 +149,27 @@ func (a *App) SaveConfig(cfg Config) error {
 			return fmt.Errorf("screen %q has an invalid size", s.Name)
 		}
 	}
+	// Lists the caller omitted (nil) keep their on-disk values: editing the
+	// layout must never silently clear the trust/revoke policy. An explicit
+	// empty list (non-nil — JSON `[]` decodes that way) does clear it, which
+	// is how the Server page removes the last entry.
+	if cfg.Network.TrustedIDs == nil || cfg.Network.RevokedIDs == nil {
+		if current, err := a.LoadConfig(); err == nil {
+			if cfg.Network.TrustedIDs == nil {
+				cfg.Network.TrustedIDs = current.Network.TrustedIDs
+			}
+			if cfg.Network.RevokedIDs == nil {
+				cfg.Network.RevokedIDs = current.Network.RevokedIDs
+			}
+		}
+	}
 	cf := configFile{
 		Port: cfg.Port,
 		Network: networkFile{
 			Allowlist:  cfg.Network.Allowlist,
 			LocalOnly:  cfg.Network.LocalOnly,
 			TrustedIDs: cfg.Network.TrustedIDs,
+			RevokedIDs: cfg.Network.RevokedIDs,
 		},
 	}
 	for _, s := range cfg.Screens {

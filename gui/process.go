@@ -94,10 +94,12 @@ func stopProc(p *proc) *proc {
 }
 
 // spawn starts `bin` logging stdout+stderr to logPath, in its own process
-// group, with a reaper attached. The child is NOT tied to the GUI's life:
-// closing the GUI leaves it running in the background (flock keeps it
-// unique).
-func (a *App) spawn(bin, logPath string, args ...string) (*proc, error) {
+// group, with a reaper attached. `extraEnv` adds KEY=VALUE entries on top
+// of the inherited environment (role-specific policy the child cannot
+// read for itself — see the client's revoked-servers list). The child is
+// NOT tied to the GUI's life: closing the GUI leaves it running in the
+// background (flock keeps it unique).
+func (a *App) spawn(bin, logPath string, extraEnv []string, args ...string) (*proc, error) {
 	// O_TRUNC: each role start begins a fresh log, so an "exited
 	// immediately" message can never echo a stale line from a previous
 	// run (which made real failures look like old ones).
@@ -114,6 +116,7 @@ func (a *App) spawn(bin, logPath string, args ...string) (*proc, error) {
 	// "access is denied"). This guarantees GUI and binary always
 	// coordinate on the same lock/log files regardless of the child env.
 	cmd.Env = append(os.Environ(), "KVMSHARE_STATE="+a.stateDir)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.SysProcAttr = processGroupAttrs()
 	if err := cmd.Start(); err != nil {
 		log.Close()

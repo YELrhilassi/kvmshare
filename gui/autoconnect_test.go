@@ -14,27 +14,29 @@ import (
 // otherwise reconnect: it is checked before the pairing toggle and
 // before the last-used-address fallback, and a plain settings write
 // (which the frontend does for unrelated fields) must not clear it.
+// Trusting the same id does not clear it either — the lists are
+// independent, and revoke wins.
 func TestRevokeServerIsSticky(t *testing.T) {
 	a, _ := newTestApp(t)
 	full := "70b97d38631dda4b8f6ef627d753022d"
 	short := full[:8]
 
-	if err := a.TrustServer(short); err != nil {
+	if err := a.TrustServer(short, true); err != nil {
 		t.Fatal(err)
 	}
 	if !idTrusted(a.GetSettings().TrustedServers, full) {
 		t.Fatal("trust should record the id")
 	}
 
-	if err := a.RevokeServer(short); err != nil {
+	if err := a.RevokeServer(short, true); err != nil {
 		t.Fatal(err)
 	}
 	s := a.GetSettings()
-	if idTrusted(s.TrustedServers, full) {
-		t.Fatalf("revoke must drop the id from trusted: %v", s.TrustedServers)
-	}
 	if !idRevoked(s.RevokedServers, full) {
 		t.Fatalf("revoke must record the id as revoked: %v", s.RevokedServers)
+	}
+	if !idTrusted(s.TrustedServers, full) {
+		t.Fatalf("revoking must not untrust — the lists are independent: %v", s.TrustedServers)
 	}
 
 	// A settings write that knows nothing about revocation (as the
@@ -49,27 +51,52 @@ func TestRevokeServerIsSticky(t *testing.T) {
 		t.Fatal("revocation must survive an unrelated settings write")
 	}
 
-	// Trusting again is the explicit opposite and must clear it.
-	if err := a.TrustServer(full); err != nil {
+	// Trusting the revoked id again must NOT re-open it; only an explicit
+	// un-revoke does.
+	if err := a.TrustServer(full, true); err != nil {
+		t.Fatal(err)
+	}
+	if !idRevoked(a.GetSettings().RevokedServers, full) {
+		t.Fatal("trusting must not clear a revocation")
+	}
+	if err := a.RevokeServer(full, false); err != nil {
 		t.Fatal(err)
 	}
 	if idRevoked(a.GetSettings().RevokedServers, full) {
-		t.Fatal("trust must clear a previous revocation")
+		t.Fatal("un-revoking must clear it")
 	}
-	if !idTrusted(a.GetSettings().TrustedServers, full) {
-		t.Fatal("trust must record the id")
+}
+
+// The client process must receive the revoked-server list so it can
+// refuse a session the GUI never screened (a typed address, a
+// reconnect): the server's id only becomes known from its `Welcome`, so
+// the check has to live in the client too.
+func TestClientGetsRevokedListEnv(t *testing.T) {
+	a, _ := newTestApp(t)
+	if err := a.RevokeServer("70b97d38631dda4b8f6ef627d753022d", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RevokeServer("aabbccdd11223344", true); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	env := a.clientRevokedEnvLocked()
+	a.mu.Unlock()
+	if len(env) != 1 || env[0] != "KVMSHARE_REVOKED_IDS=70b97d38631dda4b8f6ef627d753022d,aabbccdd11223344" {
+		t.Fatalf("revoked env = %v", env)
 	}
 }
 
 // A pairing request from a revoked server must be refused even though
-// pairing is enabled by default — the client must not start.
+// pairing is enabled by default — the client must not start. Trusting it
+// does not re-open it; only un-revoking does.
 func TestRevokedServerPairingIsRefused(t *testing.T) {
 	a, _ := newTestApp(t)
 	full := "70b97d38631dda4b8f6ef627d753022d"
 	if !a.GetSettings().AcceptPairing {
 		t.Fatal("pairing should default to on for this test to be meaningful")
 	}
-	if err := a.RevokeServer(full); err != nil {
+	if err := a.RevokeServer(full, true); err != nil {
 		t.Fatal(err)
 	}
 	a.OnPairRequest(discovery.PairRequest{ID: full, Name: "hp", Addr: "127.0.0.1:24800"})
@@ -77,13 +104,22 @@ func TestRevokedServerPairingIsRefused(t *testing.T) {
 		t.Fatal("a revoked server must not be able to start the client by pairing")
 	}
 
-	// Trusting it again re-opens the door.
-	if err := a.TrustServer(full); err != nil {
+	// Trusting the revoked id does not help — revoke still wins.
+	if err := a.TrustServer(full, true); err != nil {
+		t.Fatal(err)
+	}
+	a.OnPairRequest(discovery.PairRequest{ID: full, Name: "hp", Addr: "127.0.0.1:24800"})
+	if a.ClientRunning() {
+		t.Fatal("trusting a revoked server must not re-open pairing")
+	}
+
+	// An explicit un-revoke re-opens the door.
+	if err := a.RevokeServer(full, false); err != nil {
 		t.Fatal(err)
 	}
 	a.OnPairRequest(discovery.PairRequest{ID: full, Name: "hp", Addr: "127.0.0.1:24800"})
 	if !a.ClientRunning() {
-		t.Fatal("a trusted server's pairing request should start the client")
+		t.Fatal("an un-revoked server's pairing request should start the client")
 	}
 }
 
@@ -147,6 +183,27 @@ func TestClientStoppedByServerMarker(t *testing.T) {
 	}
 	if !a.clientStoppedByServer() {
 		t.Fatal("the stopped marker must read as a requested stop")
+	}
+}
+
+// A revoked target is refused before anything is started, so a revoked
+// server can never even briefly hold a session.
+func TestConnectToRevokedPeerIsRefused(t *testing.T) {
+	a, _ := newTestApp(t)
+	// With nothing discovered there is nothing to resolve, so the guard
+	// is a no-op (the client-side check still covers the handshake).
+	if _, ok := a.revokedPeerAtAddr("192.168.1.72:24800"); ok {
+		t.Fatal("no peer is discovered, so nothing can match")
+	}
+
+	if !sameHost("192.168.1.72:24800", "192.168.1.72:9999") {
+		t.Fatal("same host, different port must match")
+	}
+	if sameHost("", "192.168.1.72:24800") || sameHost("192.168.1.72:24800", "") {
+		t.Fatal("an empty address must never match")
+	}
+	if sameHost("192.168.1.72:24800", "192.168.1.73:24800") {
+		t.Fatal("different hosts must not match")
 	}
 }
 

@@ -1,66 +1,125 @@
 package main
 
 import (
-	"kvmshare/gui/internal/discovery"
 	"testing"
+
+	"kvmshare/gui/internal/discovery"
 )
 
-// Trust and revoke must round-trip on both roles, by short or full id,
-// and revoke must not remove a *different* id that merely shares a
-// prefix longer than 4 chars with the target.
-func TestTrustAndRevoke(t *testing.T) {
+// Trust and revoke are independent memberships: each setter is
+// idempotent, works by short or full id, and touching one list must never
+// disturb the other. An id can be trusted *and* revoked at the same time —
+// revoke is the one that is enforced.
+func TestTrustAndRevokeAreIndependent(t *testing.T) {
 	a, _ := newTestApp(t)
 	full := "70b97d38631dda4b8f6ef627d753022d"
 	short := full[:8]
 
-	// Server side.
-	if err := a.TrustClient(short); err != nil {
+	// Server side: trust, then revoke, without untrusting.
+	if err := a.TrustClient(short, true); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := a.LoadConfig()
 	if !idTrusted(cfg.Network.TrustedIDs, full) {
 		t.Fatalf("TrustClient should record the id: %v", cfg.Network.TrustedIDs)
 	}
-	// Idempotent.
-	if err := a.TrustClient(full); err != nil {
+	// Idempotent: trusting the full form of an already-trusted short id
+	// does not add a duplicate entry.
+	if err := a.TrustClient(full, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.RevokeClient(full); err != nil {
+	if err := a.RevokeClient(full, true); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = a.LoadConfig()
+	if !idRevoked(cfg.Network.RevokedIDs, full) {
+		t.Fatalf("RevokeClient should record the revocation: %v", cfg.Network.RevokedIDs)
+	}
+	if !idTrusted(cfg.Network.TrustedIDs, full) {
+		t.Fatalf("revoking must NOT untrust — the lists are independent: %v", cfg.Network.TrustedIDs)
+	}
+	// Un-revoking leaves trust alone too.
+	if err := a.RevokeClient(full, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = a.LoadConfig()
+	if idRevoked(cfg.Network.RevokedIDs, full) {
+		t.Fatalf("RevokeClient(false) should clear the revocation: %v", cfg.Network.RevokedIDs)
+	}
+	if !idTrusted(cfg.Network.TrustedIDs, full) {
+		t.Fatal("un-revoking must not untrust")
+	}
+	// Untrusting leaves the (cleared) revocation list untouched.
+	if err := a.TrustClient(full, false); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ = a.LoadConfig()
 	if idTrusted(cfg.Network.TrustedIDs, full) {
-		t.Fatalf("RevokeClient should remove the id: %v", cfg.Network.TrustedIDs)
+		t.Fatalf("TrustClient(false) should remove the trust: %v", cfg.Network.TrustedIDs)
 	}
 
-	// Client side.
-	if err := a.TrustServer(short); err != nil {
+	// Client side: same independence.
+	if err := a.TrustServer(short, true); err != nil {
 		t.Fatal(err)
 	}
 	if !idTrusted(a.GetSettings().TrustedServers, full) {
 		t.Fatalf("TrustServer should record the id: %v", a.GetSettings().TrustedServers)
 	}
-	if err := a.RevokeServer(short); err != nil {
+	if err := a.RevokeServer(short, true); err != nil {
 		t.Fatal(err)
 	}
-	if idTrusted(a.GetSettings().TrustedServers, full) {
-		t.Fatalf("RevokeServer should remove the id: %v", a.GetSettings().TrustedServers)
+	s := a.GetSettings()
+	if !idRevoked(s.RevokedServers, full) {
+		t.Fatalf("RevokeServer should record the revocation: %v", s.RevokedServers)
 	}
+	if !idTrusted(s.TrustedServers, full) {
+		t.Fatalf("revoking a server must not untrust it: %v", s.TrustedServers)
+	}
+	if err := a.RevokeServer(full, false); err != nil {
+		t.Fatal(err)
+	}
+	if idRevoked(a.GetSettings().RevokedServers, full) {
+		t.Fatal("RevokeServer(false) should clear the revocation")
+	}
+}
 
-	// Revoking by a short prefix must only remove entries matching THAT
-	// id — never a different trusted entry.
-	if err := a.TrustClient(full); err != nil {
+// Revoking by a short prefix must match THAT id only — never a different
+// entry that merely shares no overlap.
+func TestRevokeMatchesOnlyItsID(t *testing.T) {
+	a, _ := newTestApp(t)
+	full := "70b97d38631dda4b8f6ef627d753022d"
+
+	if err := a.TrustClient(full, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.TrustClient("aaaaaaaa11111111"); err != nil {
+	if err := a.TrustClient("aaaaaaaa11111111", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.RevokeClient(full[:6]); err != nil {
+	if err := a.RevokeClient(full[:6], true); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ = a.LoadConfig()
-	if len(cfg.Network.TrustedIDs) != 1 || cfg.Network.TrustedIDs[0] != "aaaaaaaa11111111" {
-		t.Fatalf("revoke must only remove the matching id: %v", cfg.Network.TrustedIDs)
+	cfg, _ := a.LoadConfig()
+	if !idRevoked(cfg.Network.RevokedIDs, full) {
+		t.Fatal("the revoked prefix must cover the full id")
+	}
+	if idRevoked(cfg.Network.RevokedIDs, "aaaaaaaa11111111") {
+		t.Fatal("revoke must not touch a different id")
+	}
+	// Revocation is additive: both machine ids stay trusted.
+	if len(cfg.Network.TrustedIDs) != 2 {
+		t.Fatalf("revoking must not remove trust entries: %v", cfg.Network.TrustedIDs)
+	}
+}
+
+// A too-short id is refused outright: a 3-char entry would match far too
+// much to be safe.
+func TestRevokeServerRejectsShortID(t *testing.T) {
+	a, _ := newTestApp(t)
+	if err := a.RevokeServer("abc", true); err == nil {
+		t.Fatal("a 3-char id should be refused")
+	}
+	if err := a.RevokeClient("abc", true); err == nil {
+		t.Fatal("a 3-char id should be refused")
 	}
 }
 

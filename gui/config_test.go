@@ -116,3 +116,59 @@ func TestSaveConfigDoesNotStartServer(t *testing.T) {
 		t.Fatal("saving config must not start the server (the running server picks the file up itself)")
 	}
 }
+
+// The trust/revoke lists survive a save that does not mention them (a
+// layout edit), while an explicit empty list still clears them. Without
+// the nil-means-keep rule, editing a screen would silently wipe the
+// server's revocation policy.
+func TestSaveConfigPreservesOmittedPolicyLists(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	base := Config{
+		Port:    defaultPort,
+		Screens: []Screen{{Name: "pc", Width: 1920, Height: 1080, X: 0, Y: 0}},
+		Network: Network{
+			Allowlist:  true,
+			LocalOnly:  true,
+			TrustedIDs: []string{"70b97d38"},
+			RevokedIDs: []string{"aabbccdd11223344"},
+		},
+	}
+	if err := a.SaveConfig(base); err != nil {
+		t.Fatal(err)
+	}
+
+	// A layout edit that omits the network lists (nil) keeps them.
+	layoutOnly := base
+	layoutOnly.Screens = append(layoutOnly.Screens, Screen{Name: "hp", Width: 1920, Height: 1080, X: -1920, Y: 0})
+	layoutOnly.Network.TrustedIDs = nil
+	layoutOnly.Network.RevokedIDs = nil
+	if err := a.SaveConfig(layoutOnly); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := a.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !idTrusted(cfg.Network.TrustedIDs, "70b97d38") {
+		t.Fatalf("trusted ids were wiped by a layout save: %v", cfg.Network.TrustedIDs)
+	}
+	if !idRevoked(cfg.Network.RevokedIDs, "aabbccdd11223344") {
+		t.Fatalf("revoked ids were wiped by a layout save: %v", cfg.Network.RevokedIDs)
+	}
+
+	// An explicit empty list clears them.
+	cleared := cfg
+	cleared.Network.TrustedIDs = []string{}
+	cleared.Network.RevokedIDs = []string{}
+	if err := a.SaveConfig(cleared); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = a.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Network.TrustedIDs) != 0 || len(cfg.Network.RevokedIDs) != 0 {
+		t.Fatalf("an explicit empty list must clear the policy: %+v", cfg.Network)
+	}
+}

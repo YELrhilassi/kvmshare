@@ -12,9 +12,11 @@ mod config;
 mod hostname;
 mod machine_id;
 mod session;
+mod trust;
 
 pub use args::{parse_client_args, parse_server_args, with_default_port, ClientArgs, ServerArgs};
 pub use client_state::{write_client_state, write_client_state_stopped};
+pub use trust::{policy_from_revoked_list, revoked_policy_from_env, REVOKED_ENV};
 pub use clipboard::spawn_server_clipboard;
 pub use config::{
     default_config_path, Config, NetworkConfig, ScreenConfig, DEFAULT_PORT, DEFAULT_SCREEN_H,

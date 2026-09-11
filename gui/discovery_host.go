@@ -67,7 +67,7 @@ func (a *App) OnPairRequest(req discovery.PairRequest) {
 		return
 	}
 	if !ids.Trusted(a.GetSettings().TrustedServers, req.ID) {
-		_ = a.TrustServer(req.ID)
+		_ = a.TrustServer(req.ID, true)
 	}
 	_ = a.ConnectToServer(req.Addr)
 }

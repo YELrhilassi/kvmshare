@@ -21,6 +21,7 @@ port = 24800
 allowlist = true
 local_only = true
 trusted_ids = []
+revoked_ids = []
 
 [[screens]]
 name = "pc"        # the FIRST screen is always this server's own
@@ -57,6 +58,17 @@ Who may connect, enforced by the server at handshake time:
   dynamically** on first connect: it gets the next screen id and the
   new layout is broadcast to every client, so pairing a fresh machine
   is headless — no need to plug a mouse in first.
+- `revoked_ids` — machine ids that may **never** connect. Checked
+  **first**, before `local_only` and before the layout/allowlist, so a
+  revoked machine is refused even when its screen is pinned (which is
+  exactly the case a name-based allowlist made unstoppable). Refused
+  with code 7 (`REVOKED`). Trust and revocation are independent lists:
+  both may hold the same id, and revoke wins. Entries match like trust
+  (full or 8-char short form, prefix, 4-char minimum).
+- **Hot policy**: `[network]` is watched alongside the layout. A change
+  sends `Control::SetPolicy`, which swaps the shared policy (so the
+  next handshake sees it, no restart) and disconnects any *connected*
+  client whose id is now revoked — revoke ends a live session.
 
 The GUI edits the same `[network]` section live; the server hot-reloads
 it with the rest of the config.

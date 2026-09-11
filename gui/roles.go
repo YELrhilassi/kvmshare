@@ -227,7 +227,7 @@ func (a *App) spawnServerLocked() (*proc, error) {
 	// The log-control file sets the level/enabled the operator chose;
 	// the process polls it, so later changes apply without a restart.
 	a.writeLogCtlLocked(roleServer)
-	return a.spawn(a.serverPath, a.serverLogPath, "--config", a.configPath,
+	return a.spawn(a.serverPath, a.serverLogPath, nil, "--config", a.configPath,
 		"--logctl", filepath.Join(a.stateDir, roleServer+".logctl"))
 }
 
@@ -273,7 +273,11 @@ func (a *App) clientStartLocked() (bool, error) {
 	}
 	a.writeLogCtlLocked(roleClient)
 	args = append(args, "--logctl", filepath.Join(a.stateDir, roleClient+".logctl"))
-	p, err := a.spawn(a.clientPath, a.clientLogPath, args...)
+	// Hand the client this machine's revoked-servers list: the client
+	// refuses a session whose server id is on it, which covers connects
+	// the GUI never screened (a hand-typed address, a reconnect).
+	env := a.clientRevokedEnvLocked()
+	p, err := a.spawn(a.clientPath, a.clientLogPath, env, args...)
 	if err == nil {
 		err = a.checkStarted(p, a.clientLogPath, "client")
 	}
@@ -282,7 +286,7 @@ func (a *App) clientStartLocked() (bool, error) {
 	// into a confusing "exited immediately" error.
 	if conflictError(err) {
 		if stopErr := a.stopRoleLocked(roleServer); stopErr == nil {
-			p, err = a.spawn(a.clientPath, a.clientLogPath, args...)
+			p, err = a.spawn(a.clientPath, a.clientLogPath, env, args...)
 			if err == nil {
 				err = a.checkStarted(p, a.clientLogPath, "client")
 			}

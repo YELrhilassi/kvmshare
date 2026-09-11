@@ -25,6 +25,9 @@ export interface Network {
   allowlist: boolean;
   localOnly: boolean;
   trustedIds: string[];
+  // Ids that may never connect. Independent of trustedIds — the same id
+  // may be in both, and a revoked id always loses.
+  revokedIds: string[];
 }
 
 export interface LayoutConfig {
@@ -166,10 +169,11 @@ interface GoApp {
   RefreshDiscovery(): Promise<Peer[]>;
   ListClients(): Promise<ConnectedClient[]>;
   ClientCommand(name: string, action: string): Promise<void>;
-  TrustClient(id: string): Promise<void>;
-  RevokeClient(id: string): Promise<void>;
-  TrustServer(id: string): Promise<void>;
-  RevokeServer(id: string): Promise<void>;
+  // Each setter is idempotent: pass the desired membership, not a toggle.
+  TrustClient(id: string, trusted: boolean): Promise<void>;
+  RevokeClient(id: string, revoked: boolean): Promise<void>;
+  TrustServer(id: string, trusted: boolean): Promise<void>;
+  RevokeServer(id: string, revoked: boolean): Promise<void>;
   ConnectToServer(addr: string): Promise<void>;
   SendConnectRequest(peerId: string): Promise<void>;
   ClientStatus(): Promise<ClientState>;
@@ -261,10 +265,10 @@ export const api = (): GoApp => ({
   RefreshDiscovery: () => call<Peer[]>("RefreshDiscovery"),
   ListClients: () => call<ConnectedClient[]>("ListClients"),
   ClientCommand: (name, action) => call<void>("ClientCommand", name, action),
-  TrustClient: (id) => call<void>("TrustClient", id),
-  RevokeClient: (id) => call<void>("RevokeClient", id),
-  TrustServer: (id) => call<void>("TrustServer", id),
-  RevokeServer: (id) => call<void>("RevokeServer", id),
+  TrustClient: (id, trusted) => call<void>("TrustClient", id, trusted),
+  RevokeClient: (id, revoked) => call<void>("RevokeClient", id, revoked),
+  TrustServer: (id, trusted) => call<void>("TrustServer", id, trusted),
+  RevokeServer: (id, revoked) => call<void>("RevokeServer", id, revoked),
   ConnectToServer: (addr) => call<void>("ConnectToServer", addr),
   SendConnectRequest: (peerId) => call<void>("SendConnectRequest", peerId),
   ClientStatus: () => call<ClientState>("ClientStatus"),

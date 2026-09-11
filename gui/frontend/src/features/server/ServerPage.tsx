@@ -14,9 +14,15 @@ export default function ServerPage() {
   const [config, setConfig] = useState<LayoutConfig | null>(null);
   const [paths, setPaths] = useState<Paths | null>(null);
   const [port, setPort] = useState(String(DEFAULT_PORT));
-  const [network, setNetwork] = useState<Network>({ allowlist: true, localOnly: true, trustedIds: [] });
+  const [network, setNetwork] = useState<Network>({
+    allowlist: true,
+    localOnly: true,
+    trustedIds: [],
+    revokedIds: [],
+  });
   const [machineId, setMachineId] = useState("");
   const [trustInput, setTrustInput] = useState("");
+  const [revokeInput, setRevokeInput] = useState("");
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
 
@@ -26,7 +32,7 @@ export default function ServerPage() {
       .then((c) => {
         setConfig(c);
         setPort(String(c.port));
-        setNetwork(c.network ?? { allowlist: true, localOnly: true, trustedIds: [] });
+        setNetwork(c.network ?? { allowlist: true, localOnly: true, trustedIds: [], revokedIds: [] });
       })
       .catch(() => {});
     void api()
@@ -64,7 +70,8 @@ export default function ServerPage() {
     port !== String(config?.port ?? DEFAULT_PORT) ||
     network.allowlist !== (config?.network?.allowlist ?? true) ||
     network.localOnly !== (config?.network?.localOnly ?? true) ||
-    JSON.stringify(network.trustedIds) !== JSON.stringify(config?.network?.trustedIds ?? []);
+    JSON.stringify(network.trustedIds) !== JSON.stringify(config?.network?.trustedIds ?? []) ||
+    JSON.stringify(network.revokedIds) !== JSON.stringify(config?.network?.revokedIds ?? []);
 
   return (
     <div className="h-full overflow-y-auto">
@@ -161,6 +168,56 @@ export default function ServerPage() {
               }}
             >
               Add
+            </Button>
+          </div>
+        </Section>
+
+        <Section title="Revoked machines" className="mt-12">
+          <p className="text-sm text-muted-foreground">
+            A revoked machine may never connect — even if it is in the layout or trusted above. Revoking
+            wins over everything else, and a machine that is connected right now is disconnected
+            immediately. You can also revoke a machine from its row on the Home page.
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {network.revokedIds.length === 0 && (
+              <span className="text-xs text-muted-foreground/60">No revoked machines.</span>
+            )}
+            {network.revokedIds.map((id) => (
+              <span
+                key={id}
+                className="inline-flex items-center gap-1 rounded-full border border-destructive/50 bg-destructive/5 px-2 py-0.5 font-mono text-[11px]"
+              >
+                {shortID(id)}
+                <button
+                  className="text-muted-foreground/60 hover:text-destructive"
+                  onClick={() => patchNetwork({ revokedIds: network.revokedIds.filter((t) => t !== id) })}
+                  aria-label={`un-revoke ${id}`}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              className="w-64 font-mono"
+              placeholder="paste a machine id (short form works)"
+              value={revokeInput}
+              onChange={(e) => setRevokeInput(e.target.value)}
+              aria-label="Machine id to revoke"
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                const id = revokeInput.trim();
+                if (id) {
+                  patchNetwork({ revokedIds: [...network.revokedIds, id] });
+                  setRevokeInput("");
+                }
+              }}
+            >
+              Revoke
             </Button>
           </div>
         </Section>

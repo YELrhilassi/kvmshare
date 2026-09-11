@@ -161,6 +161,43 @@ func backoffDelay(failures int) time.Duration {
 	return d
 }
 
+// revokedPeerAtAddr resolves a target address (host:port) to a discovered
+// machine and reports its id when that machine is revoked. Used to refuse
+// a connect *before* starting anything: the client would refuse the
+// session after the handshake anyway (see the revoked-ids env it is
+// spawned with), but a moment-long session that appears and vanishes
+// reads as a bug rather than as a policy.
+func (a *App) revokedPeerAtAddr(addr string) (string, bool) {
+	if a.disc == nil {
+		return "", false
+	}
+	revoked := a.GetSettings().RevokedServers
+	for _, p := range a.disc.List() {
+		if !idRevoked(revoked, p.ID) {
+			continue
+		}
+		target := net.JoinHostPort(p.Addr, strconv.Itoa(portOrDefault(p.Port)))
+		if sameHost(target, addr) {
+			return p.ID, true
+		}
+	}
+	return "", false
+}
+
+// sameHost reports whether two host:port addresses name the same host
+// (port ignored: a server may be rediscovered on a different port).
+func sameHost(a, b string) bool {
+	host := func(s string) string {
+		s = strings.TrimSpace(s)
+		if i := strings.LastIndex(s, ":"); i > 0 {
+			return s[:i]
+		}
+		return s
+	}
+	ha, hb := host(a), host(b)
+	return ha != "" && ha == hb
+}
+
 // autoConnectTarget picks the server this machine should auto-connect
 // to, or reports none. Rules, in order:
 //
@@ -269,6 +306,15 @@ func (a *App) autoConnectBlockedLocked() bool {
 	// fight the operator.
 	return a.clientProc.running() || a.roleActive(roleClient) ||
 		a.serverProc.running() || a.roleActive(roleServer)
+}
+
+// clientRevokedEnvLocked is the environment for the client process: this
+// machine's revoked server ids, comma-separated. The client checks the
+// server id it receives in `Welcome` against it, so a revoked server is
+// refused even when the connect did not come through auto-connect or
+// pairing (a typed address, a reconnect). Callers hold a.mu.
+func (a *App) clientRevokedEnvLocked() []string {
+	return []string{"KVMSHARE_REVOKED_IDS=" + strings.Join(a.settings.RevokedServers, ",")}
 }
 
 // pauseAutoConnectLocked holds auto-connect off until the operator

@@ -69,6 +69,10 @@ pub mod errors {
     /// The peer is outside the allowed network (the server only accepts
     /// connections from its local network).
     pub const NOT_LOCAL: u8 = 6;
+    /// The peer's machine id has been explicitly revoked by this machine.
+    /// A hard deny: it outranks the allowlist, the trusted-ids list and a
+    /// matching layout screen, so revoking a machine always refuses it.
+    pub const REVOKED: u8 = 7;
 }
 
 /// Commands carried by the [`super::message::Message::Control`]

@@ -73,6 +73,13 @@ pub use liveness::{EXIT_RESTART, Liveness};
 pub enum Control {
     /// The config changed on disk — adopt this new desktop layout now.
     Reload(Desktop),
+    /// The `[network]` policy changed on disk — adopt it now. Separate
+    /// from [`Control::Reload`] because it has a side effect a layout edit
+    /// must never have: any *connected* client whose machine id is in the
+    /// new `revoked_ids` is disconnected on the spot. Without this the
+    /// policy was only read at startup, so trusting or revoking a machine
+    /// silently did nothing until the server restarted.
+    SetPolicy(Policy),
     /// Send an operational command to one connected client, looked up by
     /// its screen name. `command` is a [`kvmshare_protocol::id::control`]
     /// constant. The GUI writes these via the `server.cmd` control file.
@@ -93,12 +100,48 @@ pub struct Policy {
     /// Machine ids that may connect even when their name is not in the
     /// layout (they are admitted dynamically, like a fresh client).
     pub trusted_ids: Vec<String>,
+    /// Machine ids that may **never** connect. Checked before everything
+    /// else, including the layout and `trusted_ids`: revoking a machine is
+    /// a hard deny, so it is the one policy that cannot be bypassed by a
+    /// pinned layout screen. Both lists may hold the same id; revoke wins.
+    pub revoked_ids: Vec<String>,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        Self { allowlist: true, local_only: true, trusted_ids: Vec::new() }
+        Self {
+            allowlist: true,
+            local_only: true,
+            trusted_ids: Vec::new(),
+            revoked_ids: Vec::new(),
+        }
     }
+}
+
+impl Policy {
+    /// Is `machine_id` explicitly revoked? Same prefix matching as trust
+    /// (short or full ids work, in both directions), so revoking the short
+    /// id shown in the GUI also refuses the full one. Revocation is the
+    /// strongest rule: callers check this before anything else.
+    pub fn is_revoked(&self, machine_id: &str) -> bool {
+        self.revoked_ids.iter().any(|r| id_matches(machine_id, r))
+    }
+
+    /// Is `machine_id` trusted (admitted even without a layout screen)?
+    pub fn is_trusted(&self, machine_id: &str) -> bool {
+        self.trusted_ids.iter().any(|t| id_matches(machine_id, t))
+    }
+}
+
+/// Does a machine id match an id-list entry? An entry may be the full id
+/// or its 8-char short form (prefix match). Guards: empty entries never
+/// match; a short form must be at least 4 chars so a typo'd one-char
+/// "trust" cannot silently admit everything starting with it.
+pub(crate) fn id_matches(id: &str, entry: &str) -> bool {
+    if entry.is_empty() || entry.len() < 4 {
+        return false;
+    }
+    id == entry || id.starts_with(entry)
 }
 
 /// Lifecycle events the server emits for its app layer (and GUI). One
@@ -158,8 +201,11 @@ pub struct Server {
     /// App-layer control messages (hot reload). `None` disables them.
     /// In a `Mutex` so `Server` stays `Sync` (the channel itself is not).
     control: Mutex<Option<Receiver<Control>>>,
-    /// Connection policy (allowlist / local-only / trusted ids).
-    policy: Policy,
+    /// Connection policy (allowlist / local-only / trusted + revoked
+    /// ids). Shared with every cloned [`ClientCtx`] behind one lock so a
+    /// hot policy change ([`Control::SetPolicy`]) takes effect on the
+    /// very next handshake instead of at the next restart.
+    policy: Arc<Mutex<Policy>>,
     /// Lifecycle events out to the app layer (connected client list,
     /// auto-config). `None` disables them.
     events: Mutex<Option<Sender<ServerEvent>>>,
@@ -220,7 +266,7 @@ impl Server {
             udp_seqs: Arc::new(Mutex::new(HashMap::new())),
             last_heard: Arc::new(Mutex::new(HashMap::new())),
             control: Mutex::new(opts.control),
-            policy: opts.policy,
+            policy: Arc::new(Mutex::new(opts.policy)),
             events: Mutex::new(opts.events),
             server_id: opts.server_id,
             gain: Arc::new(std::sync::Mutex::new(crate::motion::GainTracker::new())),
@@ -278,7 +324,7 @@ impl Server {
             addrs: self.udp_addrs.clone(),
             seqs: self.udp_seqs.clone(),
             last_heard: self.last_heard.clone(),
-            policy: self.policy.clone(),
+            policy: self.policy.clone(), // shared: hot policy changes apply
             events: self.events.lock().unwrap().clone(),
             server_id: self.server_id.clone(),
         });
@@ -402,6 +448,10 @@ impl Server {
                 self.apply_client_command(&name, command);
                 return Ok(());
             }
+            Control::SetPolicy(policy) => {
+                self.apply_policy(policy);
+                return Ok(());
+            }
             Control::Reload(layout) => layout,
         };
         log_info!("layout reloaded: {} screens", layout.screens.len());
@@ -429,6 +479,41 @@ impl Server {
             Layout { screens: s.layout().screens.clone() }
         };
         self.broadcast(&Message::Layout { layout })
+    }
+
+    /// Adopt a hot `[network]` policy change and enforce its one immediate
+    /// consequence: a client whose machine id is now revoked is
+    /// disconnected on the spot. A revoked machine must not keep a session
+    /// it may no longer open — otherwise "revoke" would only apply to the
+    /// *next* connection, leaving a live cursor-sharing session running.
+    fn apply_policy(&self, policy: Policy) {
+        let revoked: Vec<(u8, String)> = {
+            let mut current = self.policy.lock().unwrap();
+            *current = policy;
+            let clients = self.clients.lock().unwrap();
+            clients
+                .values()
+                .filter(|c| current.is_revoked(&c.machine_id))
+                .map(|c| (c.id, c.name.clone()))
+                .collect()
+        };
+        for (id, name) in revoked {
+            log_info!("revoked: disconnecting client {name}");
+            client::enqueue(
+                &self.clients,
+                id,
+                Message::Control { command: kvmshare_protocol::id::control::DISCONNECT },
+            );
+            client::enqueue(&self.clients, id, Message::Leave { screen_id: id });
+            self.clients.lock().unwrap().remove(&id);
+            self.udp_addrs.lock().unwrap().remove(&id);
+            self.udp_seqs.lock().unwrap().remove(&id);
+            self.last_heard.lock().unwrap().remove(&id);
+            let mut act = self.active.lock().unwrap();
+            if *act == Some(id) {
+                *act = None;
+            }
+        }
     }
 
     /// Disconnect clients whose screen disappeared from the new layout

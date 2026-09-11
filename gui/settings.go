@@ -124,6 +124,13 @@ func (a *App) GetSettings() Settings {
 // connect. Idempotent when a client is already running — an active
 // session is never disturbed, and its saved address is left alone.
 func (a *App) ConnectToServer(addr string) error {
+	// Refuse a revoked target up front. This covers the paths the
+	// auto-connect filter never sees — a typed address, a server asking
+	// this machine to connect — so a revoked server cannot even briefly
+	// hold a session.
+	if id, ok := a.revokedPeerAtAddr(addr); ok {
+		return fmt.Errorf("machine %s is revoked — un-revoke it before connecting", shortID(id))
+	}
 	a.mu.Lock()
 	if a.clientProc.running() || a.roleActive(roleClient) {
 		a.mu.Unlock()

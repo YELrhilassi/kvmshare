@@ -36,6 +36,10 @@ const CLIENT_SILENT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Client {
     pub id: u8,
     pub name: String,
+    /// The client's stable machine id, from its `Hello`. Kept so a hot
+    /// policy change can tell whether *this* connected client has just
+    /// been revoked and must be disconnected.
+    pub machine_id: String,
     /// Monotonic ms when the client connected (for the client list).
     pub since_ms: u64,
     /// Everything destined for this client: reliable control frames
@@ -89,8 +93,10 @@ pub struct ClientCtx {
     /// the signature of a wedged client — see the beacon watchdog in
     /// [`crate::server::udp::udp_receiver`].
     pub last_heard: Arc<Mutex<HashMap<u8, u64>>>,
-    /// Connection policy (allowlist / local-only / trusted ids).
-    pub policy: Policy,
+    /// Connection policy (allowlist / local-only / trusted + revoked
+    /// ids). Shared with the `Server` so a hot policy change applies to
+    /// the next handshake without a restart.
+    pub policy: Arc<Mutex<Policy>>,
     /// Lifecycle events out to the app layer (client list, auto-config).
     pub events: Option<Sender<ServerEvent>>,
     /// This machine's stable id, sent to clients in `Welcome`.
@@ -194,6 +200,7 @@ impl Client {
         let client = Arc::new(Client {
             id,
             name: name.clone(),
+            machine_id: machine_id.clone(),
             since_ms: crate::time::now_ms(),
             out: out_tx,
         });
@@ -256,10 +263,10 @@ impl Client {
 /// the connection policy (local-only, allowlist / trusted ids) and find
 /// the client a screen.
 ///
-/// Refusals: protocol version mismatch, a name colliding with the
-/// server's own screen, a peer outside the local network (when
-/// `local_only`), and a name absent from the layout whose machine id is
-/// not trusted (when `allowlist`).
+/// Refusals: protocol version mismatch, a revoked machine id (a hard
+/// deny, checked first), a name colliding with the server's own screen, a
+/// peer outside the local network (when `local_only`), and a name absent
+/// from the layout whose machine id is not trusted (when `allowlist`).
 fn exchange_hello(
     transport: &mut Transport,
     ctx: &ClientCtx,
@@ -285,10 +292,25 @@ fn exchange_hello(
         }
     };
 
+    // Revocation first: it is the strongest rule and the only one that
+    // beats a pinned layout screen. A machine the operator explicitly
+    // refused must never connect, whatever else would admit it.
+    if ctx.policy.lock().unwrap().is_revoked(&machine_id) {
+        let _ = transport.send(&Message::Error {
+            code: errors::REVOKED,
+            text: format!(
+                "this machine's id is revoked on this server — ask the server's operator to re-trust it"
+            ),
+        });
+        return Err(io::Error::other(format!(
+            "client {name} ({machine_id}) refused: machine id is revoked"
+        )));
+    }
+
     // Only accept connections from the local network (RFC1918 private
     // ranges, loopback, link-local). A bridged/WAN peer is refused
     // before any layout state is touched.
-    if ctx.policy.local_only && !is_local_addr(addr) {
+    if ctx.policy.lock().unwrap().local_only && !is_local_addr(addr) {
         let _ = transport.send(&Message::Error {
             code: errors::NOT_LOCAL,
             text: format!("connection from {addr} refused — only local-network peers are accepted"),
@@ -302,9 +324,9 @@ fn exchange_hello(
     // Trusted ids may be full 32-char hex or the 8-char short form
     // (matching by prefix), so a user can paste the short id shown in
     // the GUI instead of the whole string.
-    if ctx.policy.allowlist {
+    if ctx.policy.lock().unwrap().allowlist {
         let named = ctx.session.lock().unwrap().assign_screen_id(&name).is_some();
-        let trusted = ctx.policy.trusted_ids.iter().any(|t| id_matches(&machine_id, t));
+        let trusted = ctx.policy.lock().unwrap().is_trusted(&machine_id);
         if !named && !trusted {
             let _ = transport.send(&Message::Error {
                 code: errors::NOT_ALLOWED,
@@ -329,18 +351,6 @@ fn exchange_hello(
         }
     };
     Ok((id, machine_id, name, info, admitted))
-}
-
-/// Does a machine id match a trusted entry? A trusted entry may be the
-/// full id or its 8-char short form (prefix match). Guards: empty
-/// entries never match; a short form must be at least 4 chars so a
-/// typo'd one-char "trust" cannot silently admit everything starting
-/// with it.
-fn id_matches(id: &str, trusted: &str) -> bool {
-    if trusted.is_empty() || trusted.len() < 4 {
-        return false;
-    }
-    id == trusted || id.starts_with(trusted)
 }
 
 /// Is `addr` (a `peer_addr()` string, possibly with port) on the local

@@ -13,6 +13,8 @@ pub use io::default_config_path;
 
 use std::path::Path;
 
+use kvmshare_core::server::Policy;
+
 
 /// Default listen/connect port, used when a config or address omits one.
 pub const DEFAULT_PORT: u16 = 24800;
@@ -54,6 +56,10 @@ pub struct Config {
 /// * `trusted_ids` — machine ids allowed to connect even when their
 ///   name is not in the layout yet (they are admitted dynamically on
 ///   their first connect).
+/// * `revoked_ids` — machine ids that may **never** connect. A hard deny:
+///   it is checked before the layout and before `trusted_ids`, so a
+///   revoked machine cannot get in through a pinned screen. Both lists may
+///   name the same id; revoke wins.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NetworkConfig {
     #[serde(default = "default_true")]
@@ -62,11 +68,18 @@ pub struct NetworkConfig {
     pub local_only: bool,
     #[serde(default)]
     pub trusted_ids: Vec<String>,
+    #[serde(default)]
+    pub revoked_ids: Vec<String>,
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        Self { allowlist: true, local_only: true, trusted_ids: Vec::new() }
+        Self {
+            allowlist: true,
+            local_only: true,
+            trusted_ids: Vec::new(),
+            revoked_ids: Vec::new(),
+        }
     }
 }
 
@@ -126,6 +139,20 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The connection policy this config describes, in the form the
+    /// running server consumes. One place maps `[network]` → `Policy`, so
+    /// the startup path and the hot-reload path can never drift (they did:
+    /// the reload only sent the layout, so trust/revoke changes were
+    /// ignored until a restart).
+    pub fn network_policy(&self) -> Policy {
+        Policy {
+            allowlist: self.network.allowlist,
+            local_only: self.network.local_only,
+            trusted_ids: self.network.trusted_ids.clone(),
+            revoked_ids: self.network.revoked_ids.clone(),
+        }
     }
 
     /// A default config describing *this machine only*: the server's own
@@ -217,6 +244,34 @@ mod tests {
         assert!(!cfg.network.allowlist);
         assert!(!cfg.network.local_only);
         assert_eq!(cfg.network.trusted_ids, vec!["machine-1".to_string(), "machine-2".to_string()]);
+        assert!(cfg.network.revoked_ids.is_empty());
+    }
+
+    /// `revoked_ids` round-trips through the file and reaches the policy
+    /// exactly as written — the list the server enforces.
+    #[test]
+    fn config_parses_revoked_ids_and_maps_them_to_the_policy() {
+        let text = r#"
+            port = 24800
+            [[screens]]
+            name = "pc"
+            [network]
+            trusted_ids = ["machine-1"]
+            revoked_ids = ["machine-bad", "70b97d38"]
+        "#;
+        let path = std::env::temp_dir().join("kvmshare-test-revoked.toml");
+        std::fs::write(&path, text).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.network.revoked_ids, vec!["machine-bad".to_string(), "70b97d38".to_string()]);
+
+        let policy = cfg.network_policy();
+        assert!(policy.is_revoked("machine-bad"));
+        // Short form, prefix match: the full id of the same machine too.
+        assert!(policy.is_revoked("70b97d38631dda4b8f6ef627d753022d"));
+        assert!(!policy.is_revoked("machine-1"));
+        // Both lists coexist; trust is unaffected by revocation.
+        assert!(policy.is_trusted("machine-1"));
     }
 
     #[test]
@@ -232,6 +287,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(cfg.network.allowlist);
         assert!(cfg.network.local_only);
+        assert!(cfg.network.revoked_ids.is_empty(), "an old config has nothing revoked");
     }
 
     #[test]
