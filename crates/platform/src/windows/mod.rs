@@ -13,8 +13,13 @@
 //!   one mechanism that does both, because the hook procedures see
 //!   every event even when they swallow it.
 //! * [`engine::Win32Engine`] — the server's control of its own screen:
-//!   `SetCursorPos` warp, `ShowCursor` hide/show. Isolation is a plain
-//!   atomic flag shared with the capture (see its module docs).
+//!   `SetCursorPos` warp and the system-wide cursor hide (see
+//!   [`cursor_hide`] — `ShowCursor` is per-thread and honored only over
+//!   the calling thread's windows, which left the cursor visible over
+//!   real apps; the fix swaps the *system* cursor shapes for a
+//!   transparent one and restores the user's scheme on return).
+//!   Isolation is a plain atomic flag shared with the capture (see its
+//!   module docs).
 //! * [`injector::Win32Injector`] — the client's control of its own
 //!   screen: `SetCursorPos` moves, `SendInput` injection of
 //!   buttons/keys/wheel (scan-code mode — layout independent), clipboard.
@@ -27,6 +32,7 @@
 mod buttons;
 mod capture;
 pub(crate) mod clipboard;
+pub(crate) mod cursor_hide;
 mod engine;
 mod injector;
 mod isolation;

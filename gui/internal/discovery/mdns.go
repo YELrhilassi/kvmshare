@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/grandcat/zeroconf"
+	"github.com/grandcat/zeroconf" // patched via go.mod replace → libp2p/zeroconf
 )
 
 // Republish (re)advertises this machine over mDNS under the *current*

@@ -19,6 +19,23 @@
 //! The entry points are [`server`] (start local input capture + get the
 //! engine) and [`client`] (get an injector). `display` is honored by the
 //! X11 backend and ignored elsewhere (uniform signature).
+//!
+//! # Adding a backend (Wayland, macOS, …)
+//!
+//! 1. Create `src/<name>/` with a `Server::start` (capture + engine +
+//!    clipboard + liveness) and a `client_injector`, mirroring an
+//!    existing backend's structure. Implement the [`Engine`] and
+//!    [`Injector`] contracts — never bypass them; the session logic in
+//!    `kvmshare-core` is backend-agnostic and stays that way.
+//! 2. Reuse what is already platform-free: the evdev reader (Linux) is
+//!    X-free so Wayland reuses it unchanged; [`keys`] maps physical
+//!    keys to canonical HID usages identically everywhere.
+//! 3. Gate the module `#[cfg(target_os = …)]` (or a feature for a
+//!    second backend on the same OS, e.g. X11 vs Wayland chosen at
+//!    runtime by `XDG_SESSION_TYPE`), and add one dispatch arm in
+//!    [`server`] / [`client`].
+//! 4. Anything a backend cannot support should degrade, not panic:
+//!    follow [`unsupported`] for the stub pattern.
 
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;

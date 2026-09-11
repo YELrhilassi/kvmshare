@@ -32,18 +32,18 @@
     "#1": {
       "0000": {
         "fixed": {
-          "file_version": "0.6.5.0",
-          "product_version": "0.6.5.0"
+          "file_version": "0.6.6.0",
+          "product_version": "0.6.6.0"
         },
         "info": {
           "0000": {
             "CompanyName": "kvmshare",
             "FileDescription": "kvmshare GUI",
-            "FileVersion": "0.6.5",
+            "FileVersion": "0.6.6",
             "InternalName": "kvmshare-gui",
             "OriginalFilename": "kvmshare-gui.exe",
             "ProductName": "kvmshare",
-            "ProductVersion": "0.6.5"
+            "ProductVersion": "0.6.6"
           }
         }
       }

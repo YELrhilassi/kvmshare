@@ -163,6 +163,10 @@ func main() {
 	// machines (discovery + pairing + auto-connect).
 	core.StartDiscovery()
 	core.AutoConnectLoop()
+	// The saved start role runs after discovery: a client's auto-connect
+	// needs the engine up to see its server, and a server's advertisement
+	// should replace the idle one immediately.
+	core.applyStartRole()
 
 	if err := app.Run(); err != nil {
 		log.Fatal(err)

@@ -28,4 +28,4 @@ func launchGUI(string) error { return nil }
 
 // EnsureFirewall is a no-op outside Windows (Windows Firewall is the only
 // platform that needs explicit per-app inbound rules).
-func EnsureFirewall() error { return nil }
+func EnsureFirewall(int, int) error { return nil }

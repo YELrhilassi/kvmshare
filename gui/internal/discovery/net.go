@@ -20,6 +20,12 @@ const (
 	peerTTL        = 45 * time.Second
 )
 
+// listenRetry is how long listenLoop waits before rebuilding its socket
+// after a bind failure (port taken by another app). Long enough to let
+// the conflicting process exit, short enough that recovery feels
+// automatic.
+const listenRetry = 5 * time.Second
+
 // Pairing work runs on its own goroutine so the listener never blocks
 // on it. Depth covers a brief connect stall; overflow drops (senders
 // retry naturally with their next request), and each job carries a

@@ -50,6 +50,11 @@ export interface Settings {
   acceptPairing: boolean;
   autoConnect: boolean;
   autoConnectPaused: boolean;
+  // General settings (Settings page): the OS autostart entry is written
+  // by its own bound methods; this flag mirrors it for the toggle. The
+  // start role is what the machine runs at GUI launch ("" = nothing).
+  launchAtStartup: boolean;
+  startRole: "" | "server" | "client";
 }
 
 export interface ConnectedClient {
@@ -177,6 +182,11 @@ interface GoApp {
   ConnectToServer(addr: string): Promise<void>;
   SendConnectRequest(peerId: string): Promise<void>;
   ClientStatus(): Promise<ClientState>;
+  // Launch-at-startup: writes/removes the OS entry (XDG autostart file
+  // or the per-user Run key) and mirrors the flag into the settings.
+  EnableLaunchAtStartup(): Promise<void>;
+  DisableLaunchAtStartup(): Promise<void>;
+  LaunchAtStartupEnabled(): Promise<boolean>;
 }
 
 interface WailsCall {

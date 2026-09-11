@@ -249,7 +249,7 @@ func launchGUI(string) error { return nil }
 
 // EnsureFirewall is a no-op on Linux: inbound UDP is accepted without
 // per-app rules, and the installer already handles privileged steps.
-func EnsureFirewall() error { return nil }
+func EnsureFirewall(int, int) error { return nil }
 
 // integrateViaPkexec re-executes this installer as root with
 // --input-access, so the user consents through the desktop's standard

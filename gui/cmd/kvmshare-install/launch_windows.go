@@ -26,7 +26,7 @@ import (
 )
 
 var (
-	kernel32                 = windows.NewLazySystemDLL("kernel32.dll")
+	kernel32                  = windows.NewLazySystemDLL("kernel32.dll")
 	procGetConsoleProcessList = kernel32.NewProc("GetConsoleProcessList")
 )
 

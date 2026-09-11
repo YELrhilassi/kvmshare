@@ -8,6 +8,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -55,6 +56,23 @@ type Settings struct {
 	// the client a second later. Persisted so a GUI restart does not
 	// silently resume a session the operator ended.
 	AutoConnectPaused bool `json:"autoConnectPaused"`
+
+	// LaunchAtStartup records the operator's choice for starting the GUI
+	// at login. The OS entry (XDG autostart file / HKCU Run key) is the
+	// authority; this flag mirrors it so the Settings page can render
+	// the toggle without a platform round-trip, and the enable/disable
+	// methods keep the two in step.
+	LaunchAtStartup bool `json:"launchAtStartup"`
+	// StartRole is what the GUI does on launch, before any human input:
+	//   ""        — start nothing (the machine just opens the window)
+	//   "server"  — start the server role
+	//   "client"  — start the client role (needs ClientAddr; the client
+	//               page's own validation applies on start)
+	// This is the "default choice at startup of the machine": a headless
+	// KVM setup sets one role here and the machine does its job from the
+	// login screen onward, whether it boots into GNOME, KDE, i3 (XDG
+	// autostart-capable session tools) or Windows.
+	StartRole string `json:"startRole"`
 }
 
 // LogSettings is what the Logs page shows and edits: the logging
@@ -90,6 +108,11 @@ func (a *App) loadSettings() {
 	}
 	if !validLogLevel(s.LogLevel) {
 		s.LogLevel = "info"
+	}
+	// StartRole normalizes to server/client/empty; anything else (an old
+	// build's stray value, a hand edit) starts nothing.
+	if s.StartRole != string(ModeServer) && s.StartRole != string(ModeClient) {
+		s.StartRole = ""
 	}
 	if _, ok := present["logEnabled"]; !ok {
 		s.LogEnabled = true // logging defaults to ON
@@ -169,6 +192,13 @@ func (a *App) SetSettings(s Settings) error {
 	if s.AutoConnect && !a.settings.AutoConnect {
 		s.AutoConnectPaused = false
 	}
+	// The launch-at-startup toggle has its own bound methods (they must
+	// write the OS entry, not just the flag); a settings-form write can
+	// only carry the mirror value.
+	s.LaunchAtStartup = a.settings.LaunchAtStartup
+	if s.StartRole != string(ModeServer) && s.StartRole != string(ModeClient) {
+		s.StartRole = ""
+	}
 	a.settings = s
 	a.saveSettingsLocked()
 	// The level/enabled the user picked must apply to the running
@@ -197,6 +227,28 @@ func (a *App) SetSettings(s Settings) error {
 		a.ensureInputAccess()
 	}
 	return nil
+}
+
+// applyStartRole runs the saved StartRole at GUI launch — the machine's
+// "default choice at startup". Runs once from main.go, after discovery
+// is up (a client's auto-connect needs the engine listening). A start
+// failure is logged, never fatal: a headless box boots into the plain
+// window and the user fixes the cause (e.g. an empty client address)
+// in the UI.
+func (a *App) applyStartRole() {
+	a.mu.Lock()
+	role := a.settings.StartRole
+	a.mu.Unlock()
+	switch role {
+	case string(ModeServer):
+		if _, err := a.ServerStart(); err != nil {
+			slog.Warn("start-at-launch: server did not start", "err", err)
+		}
+	case string(ModeClient):
+		if _, err := a.ClientStart(); err != nil {
+			slog.Warn("start-at-launch: client did not start", "err", err)
+		}
+	}
 }
 
 // GetLogSettings returns the operator's logging configuration plus the

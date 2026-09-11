@@ -42,6 +42,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
 use kvmshare_core::server::Engine;
 
+use super::cursor_hide;
+
 /// One cursor-control command for the engine thread.
 enum EngineCmd {
     /// Hide (`false`) or show (`true`) the local cursor. `ShowCursor` is
@@ -66,6 +68,9 @@ pub struct Win32Engine {
 
 impl Win32Engine {
     pub fn new(isolate: Arc<AtomicBool>) -> Self {
+        // Whatever happens later — clean stop, supervisor abort, panic —
+        // the user's real cursor scheme comes back.
+        cursor_hide::install_exit_hook();
         let (cmd_tx, cmd_rx) = mpsc::channel();
         thread::Builder::new()
             .name("kvmshare-engine".into())
@@ -116,28 +121,24 @@ impl Engine for Win32Engine {
     }
 }
 
-/// The engine thread: the single owner of the thread-affine Windows
-/// cursor calls. Executes commands in order; best-effort throughout — a
-/// failed call just means a cosmetic hiccup, never a fatal error.
+/// The engine thread: the single owner of the cursor-state transitions.
+/// Executes commands in order; best-effort throughout — a failed call
+/// just means a cosmetic hiccup, never a fatal error.
+///
+/// The hide/show is the **system-wide** cursor swap (see
+/// [`super::cursor_hide`]), not `ShowCursor`: the per-thread count is
+/// honored only over the calling thread's windows, and this thread owns
+/// none — over every real application the cursor stayed visible.
 fn engine_loop(rx: mpsc::Receiver<EngineCmd>) {
-    // Whether the local cursor is currently hidden, as far as this
-    // thread's `ShowCursor` count is concerned.
-    let mut cursor_hidden = false;
-
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EngineCmd::CursorVisible(v) => {
-                // Act only on transitions so the per-thread display
-                // count stays balanced: hide when currently shown, show
-                // when currently hidden.
-                if v == cursor_hidden {
-                    // SAFETY: ShowCursor toggles the display count;
-                    // called only on transitions, always from this
-                    // thread, so the count stays balanced.
-                    unsafe {
-                        wm::ShowCursor(v as i32);
-                    }
-                    cursor_hidden = !v;
+                // Idempotent at the module level: repeated identical
+                // calls are no-ops (a state flag, not a count).
+                if v {
+                    cursor_hide::restore();
+                } else {
+                    cursor_hide::hide();
                 }
             }
             EngineCmd::Warp(x, y) => {

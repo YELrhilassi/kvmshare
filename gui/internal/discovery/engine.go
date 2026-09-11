@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"time"
 )
@@ -16,8 +17,7 @@ func (s *Service) beaconLoop() {
 			return
 		}
 		conn, err := net.ListenUDP("udp4", nil)
-		if err != nil {
-			s.warns.beacon.log("discovery: no UDP socket for beacons: ", err, 5*time.Minute)
+		if err != nil {				s.warns.beacon.log("discovery: no UDP socket for beacons: ", err, warnCooldown)
 			select {
 			case <-s.stop:
 				return
@@ -101,11 +101,11 @@ func (s *Service) listenLoop() {
 		}
 		conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: Port})
 		if err != nil {
-			s.warns.listen.log("discovery: cannot bind :24801 (another kvmshare GUI? a snap of this port?): ", err, 5*time.Minute)
+			s.warns.listen.log(fmt.Sprintf("discovery: cannot bind :%d (another kvmshare GUI? another app on this port?): ", Port), err, listenRetry)
 			select {
 			case <-s.stop:
 				return
-			case <-time.After(5 * time.Second):
+			case <-time.After(listenRetry):
 			}
 			continue
 		}

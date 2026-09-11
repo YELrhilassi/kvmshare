@@ -8,6 +8,7 @@ import ServerPage from "@/features/server/ServerPage";
 import ClientPage from "@/features/client/ClientPage";
 import LayoutPage from "@/features/layout/LayoutPage";
 import LogsPage from "@/features/logs/LogsPage";
+import SettingsPage from "@/features/settings/SettingsPage";
 
 // Plain-language label for the top-right status: what is happening right
 // now, not what the process is called. For the client this is the real
@@ -84,6 +85,7 @@ function Shell() {
           {effectivePage === "client" && <ClientPage />}
           {effectivePage === "layout" && <LayoutPage />}
           {effectivePage === "logs" && <LogsPage />}
+          {effectivePage === "settings" && <SettingsPage />}
         </main>
       </div>
     </TooltipProvider>
