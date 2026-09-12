@@ -225,10 +225,19 @@ func restoreUacPolicy() error {
 // usually earns a rule the first time the server runs, but the
 // discovery/pairing port is only touched by the GUI and Windows Firewall
 // often drops its inbound datagrams — which silently kills network
-// discovery and "connect here". Runs elevated (the GUI is), is
-// idempotent (netsh skips existing rules with a warning), and best-
-// effort: a locked-down network that refuses rule creation simply falls
-// back to manual addresses.
+// discovery and "connect here". Idempotent (rules are recreated so they
+// always match the current install), and best-effort: a locked-down
+// network that refuses rule creation simply falls back to manual
+// addresses.
+//
+// **Called by the installer, not the GUI.** Rule creation is a privileged
+// operation, and privileged GUIs cannot autostart (Windows skips
+// elevated Run-key entries at logon) — so elevation belongs to the
+// installer, which runs elevated once at install/update time, and the
+// GUI runs as the plain user. Callers that find the rules missing later
+// (a machine restore, a policy wipe) self-heal through
+// [`EnsureFirewallViaInstaller`], which relays through the elevated
+// installer CLI.
 func EnsureFirewall(sessionPort, discoveryPort int) error {
 	// netsh advfirewall firewall add rule ... is the standard, scriptable
 	// way; it works elevated without extra modules.
@@ -359,4 +368,55 @@ func runPS(script string) error {
 		return fmt.Errorf("powershell: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// FirewallRulesPresent reports whether kvmshare's inbound allow rules
+// exist for both ports. The GUI consults this at startup: present →
+// nothing to do (the common case, done by the installer); missing →
+// self-heal through [`EnsureFirewallViaInstaller`].
+func FirewallRulesPresent(sessionPort, discoveryPort int) bool {
+	for _, p := range []int{sessionPort, discoveryPort} {
+		rule := fmt.Sprintf("kvmshare UDP %d", p)
+		out, err := hiddenCmd("netsh", "advfirewall", "firewall", "show", "rule", "name="+rule).Output()
+		if err != nil || !strings.Contains(string(out), "Yes") {
+			return false
+		}
+	}
+	return true
+}
+
+// EnsureFirewallViaInstaller relays firewall setup through the installed
+// kvmshare-install CLI, re-running elevated. This is the GUI's self-heal
+// path: the GUI itself runs as the plain user (a privileged GUI cannot
+// autostart — Windows skips elevated Run-key entries at logon), so when
+// it finds the inbound rules missing it asks the elevated installer to
+// restore them instead of running privileged itself. One UAC prompt,
+// once, only when actually needed.
+func EnsureFirewallViaInstaller(sessionPort, discoveryPort int) error {
+	dir := selfupdate.InstallDir()
+	exe := filepath.Join(dir, "kvmshare-install.exe")
+	if _, err := os.Stat(exe); err != nil {
+		return fmt.Errorf("installer CLI not found at %s", exe)
+	}
+	// The CLI subcommand must exist before relaying (added together with
+	// this call site; an older install would loop silently otherwise).
+	if !firewallSubcommandAvailable(exe) {
+		return fmt.Errorf("installed kvmshare-install does not support firewall setup (update kvmshare)")
+	}
+	return SelfElevate([]string{
+		"--firewall",
+		"--session-port", strconv.Itoa(sessionPort),
+		"--discovery-port", strconv.Itoa(discoveryPort),
+	})
+}
+
+// firewallSubcommandAvailable reports whether the installed CLI
+// understands --firewall (parse its -h output). A cheap guard against a
+// mixed-version relay loop.
+func firewallSubcommandAvailable(exe string) bool {
+	out, err := hiddenCmd(exe, "-h").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "--firewall")
 }

@@ -34,7 +34,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/grandcat/zeroconf"
+	"kvmshare/gui/internal/discovery/zeroconf"
 
 	"kvmshare/gui/internal/ids"
 )

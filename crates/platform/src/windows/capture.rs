@@ -142,6 +142,76 @@ static KEYS_DOWN: LazyLock<Mutex<HashSet<(u16, bool)>>> =
 /// phantom key-up).
 static ESCAPE_CONSUMED: AtomicBool = AtomicBool::new(false);
 
+/// Bound-chord presses swallowed at the OS boundary while the cursor is
+/// at home: the key still flows to the session (the action engine fires
+/// it) but must never reach Windows, or the OS's own binding — Win+Tab,
+/// media keys — would race the user's kvmshare shortcut. The matching
+/// release is suppressed too, so the OS never sees a half chord.
+static CHORD_SWALLOWED: LazyLock<Mutex<HashSet<(u16, bool)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// The (mods, hid-key) pairs bound to kvmshare actions, published by
+/// the app layer after startup and on every config reload. While
+/// isolated (cursor on a client), a bound chord is swallowed here —
+/// BEFORE the OS dispatches it — and turned into a session-level
+/// [`Message::Key`] flow the action engine resolves. This is what lets
+/// a kvmshare shortcut win over the OS's own bindings (Win+Tab, media
+/// keys, …): the low-level hook runs before those decisions.
+static BOUND_CHORDS: OnceLock<Arc<Mutex<Vec<(u8, u32)>>>> = OnceLock::new();
+
+/// Live modifier state inside the hook (updated by every modifier
+/// transition the hook sees).
+static HOOK_MODS: Mutex<Mods> = Mutex::new(Mods::NONE);
+
+/// Copy of `crate::actions::Mods` — the platform crate cannot depend on
+/// kvmshare_core's actions module for a tiny bitset (circular crate
+/// layout); the mapping to the wire is identical.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Mods {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+}
+
+impl Mods {
+    fn bits(self) -> u8 {
+        (self.ctrl as u8) | ((self.alt as u8) << 1) | ((self.shift as u8) << 2) | ((self.meta as u8) << 3)
+    }
+}
+
+/// Publish the chords the hook should intercept (mods as a 4-bit mask:
+/// ctrl|alt|shift|meta).
+pub fn set_bound_chords(chords: Vec<(u8, u32)>) {
+    let slot = BOUND_CHORDS.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
+    *slot.lock().unwrap() = chords;
+}
+
+/// Does this (mods mask, key) pair match a bound chord?
+fn is_bound_chord(mods: u8, key: u32) -> bool {
+    BOUND_CHORDS
+        .get()
+        .map(|c| c.lock().unwrap().iter().any(|&(m, k)| k == key && m == mods))
+        .unwrap_or(false)
+}
+
+/// Fold one modifier transition into the hook's live mod mirror.
+///
+/// The HID usages of the eight modifiers are contiguous (0xE0–0xE7,
+/// ctrl/shift/alt/meta, left then right), so the range check here is
+/// the complete set — the same identity `crate::keys` maps from scan
+/// codes and the engine matches on.
+fn update_hook_mods(key: u32, down: bool) {
+    let mut mods = HOOK_MODS.lock().unwrap();
+    match key {
+        0xE0 | 0xE4 => mods.ctrl = down,
+        0xE1 | 0xE5 => mods.shift = down,
+        0xE2 | 0xE6 => mods.alt = down,
+        0xE3 | 0xE7 => mods.meta = down,
+        _ => {}
+    }
+}
+
 fn isolate() -> bool {
     ISOLATE.get().is_some_and(|f| f.load(Ordering::SeqCst))
 }
@@ -226,9 +296,31 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 let id = (info.scanCode as u16, extended);
                 let mut down = KEYS_DOWN.lock().unwrap();
                 let was_down = down.contains(&id);
+                // Suppression is decided on the press and remembered for
+                // the release; auto-repeats of a suppressed key are
+                // suppressed too (they never re-forward, but must also
+                // never reach the OS — or a held Win+Tab would fire the
+                // native binding mid-hold).
+                let mut suppress = false;
                 if is_down && !was_down {
                     down.insert(id);
                     if let Some(key) = crate::keys::hid_from_scancode(id.0, id.1) {
+                        // Keep the hook's modifier mirror current before
+                        // evaluating the chord: modifiers arrive on their
+                        // own presses, so by the time a non-modifier key
+                        // goes down the mirror already holds the chord.
+                        let is_modifier = key >= 0xE0 && key <= 0xE7;
+                        if is_modifier {
+                            update_hook_mods(key, true);
+                        } else if is_bound_chord(HOOK_MODS.lock().unwrap().bits(), key) {
+                            // Bound chord at the OS boundary: the OS
+                            // never sees it (its own binding — Win+Tab,
+                            // media keys — must not fire); the session
+                            // still gets it and the action engine owns
+                            // it from there.
+                            suppress = true;
+                            CHORD_SWALLOWED.lock().unwrap().insert(id);
+                        }
                         if isolate() && key == crate::keys::ESCAPE_KEY_HID {
                             // Scroll Lock while away: come home, consume
                             // the key (never forwarded).
@@ -253,11 +345,22 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         return 1;
                     }
                     if let Some(key) = crate::keys::hid_from_scancode(id.0, id.1) {
+                        if key >= 0xE0 && key <= 0xE7 {
+                            update_hook_mods(key, false);
+                        }
+                        if CHORD_SWALLOWED.lock().unwrap().remove(&id) {
+                            // Release of a suppressed chord press.
+                            suppress = true;
+                        }
                         hook_send(Message::Key {
                             kind: KeyKind::Up,
                             key,
                         });
                     }
+                }
+                drop(down);
+                if suppress {
+                    return 1;
                 }
             }
         }

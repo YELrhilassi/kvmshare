@@ -3,13 +3,17 @@
 package main
 
 // Discovery beacons and pairing ride a UDP socket that Windows Firewall
-// often silently drops even when the KVM session port was allowed by the
-// server's first-run prompt. Without inbound UDP the GUI never hears
-// other kvmshare machines, so discovery shows "nothing on this network"
-// and "connect here" requests go unanswered. This registers explicit
-// inbound allow rules for both ports at startup — the GUI is elevated,
-// the rules are idempotent, and a network that refuses rule creation
-// simply falls back to manual addresses.
+// often silently drops — without inbound UDP the GUI never hears other
+// kvmshare machines, so discovery shows "nothing on this network" and
+// "connect here" requests go unanswered.
+//
+// The inbound rules are created **by the installer**, which runs
+// elevated once at install/update time. This startup check verifies they
+// are still present and self-heals through the elevated installer CLI
+// when they are not (a machine restore, a policy wipe) — one UAC
+// prompt, only when actually needed. The GUI itself runs as the plain
+// user: a privileged GUI cannot autostart (Windows skips elevated
+// Run-key entries at logon), which is exactly the bug this split fixes.
 
 import (
 	"log/slog"
@@ -18,12 +22,16 @@ import (
 	"kvmshare/gui/internal/installer"
 )
 
-// ensureFirewall opens kvmshare's inbound ports: the KVM session port
-// (defaultPort, matching the Rust server's DEFAULT_PORT) and the
-// discovery/pairing port (discovery.Port). Idempotent and best-effort:
-// failures are logged, never fatal.
+// ensureFirewall verifies kvmshare's inbound port rules and restores
+// them via the elevated installer when missing. Best-effort: failures
+// are logged, never fatal (manual addresses still work).
 func (a *App) ensureFirewall() {
-	if err := installer.EnsureFirewall(defaultPort, discovery.Port); err != nil {
+	if installer.FirewallRulesPresent(defaultPort, discovery.Port) {
+		slog.Info("firewall: inbound rules present", "sessionPort", defaultPort, "discoveryPort", discovery.Port)
+		return
+	}
+	slog.Info("firewall: inbound rules missing — restoring via the elevated installer")
+	if err := installer.EnsureFirewallViaInstaller(defaultPort, discovery.Port); err != nil {
 		slog.Warn("firewall: could not open inbound ports (manual addresses still work)", "err", err)
 		return
 	}

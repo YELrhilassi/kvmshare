@@ -185,6 +185,35 @@ impl Session {
         self.prefs = prefs;
     }
 
+    /// The keyboard chords the capture layer must **intercept at the
+    /// OS level** (see [`Server::Engine::set_bound_chords`]): chords
+    /// bound to kvmshare actions must beat whatever the desktop would do
+    /// with them (Win+Tab, media keys, …). Each pair is `(mods, key)` —
+    /// `mods` is the packed 4-bit mask documented on the Engine method
+    /// (bit0 ctrl, bit1 alt, bit2 shift, bit3 meta); `key` is the
+    /// canonical HID usage.
+    pub fn bound_chords(&self) -> Vec<(u8, u32)> {
+        let cfg = self.actions.config();
+        if !cfg.enabled {
+            return Vec::new();
+        }
+        cfg.bindings
+            .iter()
+            .map(|b| {
+                let m = b.mods;
+                let packed =
+                    (m.ctrl as u8) | ((m.alt as u8) << 1) | ((m.shift as u8) << 2) | ((m.meta as u8) << 3);
+                (packed, b.key)
+            })
+            .collect()
+    }
+
+    /// The last chord-shaped press the engine saw (mods + HID key), for
+    /// the GUI's live key-detection display.
+    pub fn last_seen_chord(&self) -> Option<(crate::actions::Mods, u32)> {
+        self.actions.last_seen()
+    }
+
     /// The current input preferences (read-only view).
     pub fn prefs(&self) -> &InputPrefs {
         &self.prefs

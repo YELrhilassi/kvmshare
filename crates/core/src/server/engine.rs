@@ -24,6 +24,20 @@ pub trait Engine: Send {
 
     /// Hide/show the local cursor while away / at home.
     fn show_local_cursor(&mut self, visible: bool);
+
+    /// Publish the keyboard chords the capture layer must **intercept at
+    /// the OS level**: a chord bound to a kvmshare action has to beat
+    /// whatever the desktop would do with it (Win+Tab, media keys, …),
+    /// and only the platform capture sits early enough to guarantee
+    /// that. Each pair is `(mods, key)` — `key` is the chord's canonical
+    /// HID usage, `mods` a 4-bit mask: bit0 ctrl, bit1 alt, bit2 shift,
+    /// bit3 meta (the same order [`crate::actions::Mods`] serializes
+    /// in). Called once at startup and again on every config reload;
+    /// replaces the previous set. Best-effort: a platform without an
+    /// interception mechanism does nothing, and the chord still resolves
+    /// through the action engine when the event reaches the session —
+    /// it may just lose a race against an OS binding.
+    fn set_bound_chords(&mut self, _chords: Vec<(u8, u32)>) {}
 }
 
 /// A shared handle to the server's clipboard service.

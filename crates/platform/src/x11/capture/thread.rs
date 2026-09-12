@@ -117,6 +117,10 @@ pub(crate) struct InputCapture {
     /// input grab while remote, so its wedge is exactly what traps the
     /// machine's input — the supervisor must see it.
     pub(crate) capture_tick: Arc<AtomicU64>,
+    /// The chord set currently installed as passive grabs (sorted,
+    /// deduplicated, packed mods) — the diff baseline so a repeated
+    /// publish (an unrelated config reload) changes nothing.
+    pub(crate) grabbed_chords: Vec<(u8, u32)>,
 }
 
 /// Open the X display (`None` = `$DISPLAY`), select XI2 raw events on the
@@ -206,6 +210,7 @@ pub fn start(
         real_pos: real_pos.clone(),
         evdev,
         capture_tick: capture_tick.clone(),
+        grabbed_chords: Vec::new(),
     };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {

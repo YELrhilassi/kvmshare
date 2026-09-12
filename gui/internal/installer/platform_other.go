@@ -29,3 +29,11 @@ func launchGUI(string) error { return nil }
 // EnsureFirewall is a no-op outside Windows (Windows Firewall is the only
 // platform that needs explicit per-app inbound rules).
 func EnsureFirewall(int, int) error { return nil }
+
+// EnsureFirewallViaInstaller matches EnsureFirewall: no-op outside
+// Windows (see platform_windows.go for the relay's purpose).
+func EnsureFirewallViaInstaller(int, int) error { return nil }
+
+// FirewallRulesPresent matches EnsureFirewall: always true outside
+// Windows (no firewall rules to check).
+func FirewallRulesPresent(int, int) bool { return true }

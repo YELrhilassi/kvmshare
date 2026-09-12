@@ -5,116 +5,108 @@ import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import { Section } from "@/components/Section";
 import { PageSkeleton } from "@/components/PageSkeleton";
+import {
+  useChordRecorder,
+  keyName,
+  modLabels,
+  Kbd,
+  type Chord,
+} from "./ChordRecorder";
 import { cn } from "@/lib/utils";
 
 // Input & shortcuts: the sub-page of Layout that configures *how input
-// behaves* rather than where screens sit. Two concerns, one page:
+// behaves* rather than where screens sit. Three concerns, clearly
+// separated:
 //
 // * Shortcuts — chords (modifier set + key) bound to actions. Recorded
 //   as canonical HID key ids, so a binding means the same physical key
-//   on every platform pair. The recorder captures the next non-modifier
-//   key press; the chord list shows modifiers + a friendly key name.
-// * Input feel — pointer speed (multiplier on forwarded motion), wheel
-//   speed, natural scrolling. These are portable transforms applied at
-//   the shared-input level, so they affect every client identically.
+//   on every platform pair, and a bound chord **overrides** whatever
+//   the OS would do with it (Win+Tab, media keys): the capture layer
+//   swallows it before the desktop reacts.
+// * Mouse — pointer speed, wheel speed, natural scrolling. Portable
+//   transforms on the shared stream, applied identically for every
+//   client.
+// * Keyboard — forwarded by physical identity; only the bound chords
+//   above are intercepted.
 
-// HID usages for the modifier keys and a few named keys we render
-// nicely. The full tables live in the platform crate.
-const HID = {
-  CTRL_L: 0xe0, CTRL_R: 0xe4, SHIFT_L: 0xe1, SHIFT_R: 0xe5,
-  ALT_L: 0xe2, ALT_R: 0xe6, META_L: 0xe3, META_R: 0xe7,
-} as const;
-
-const MOD_ORDER = ["CTRL_L", "CTRL_R", "SHIFT_L", "SHIFT_R", "ALT_L", "ALT_R", "META_L", "META_R"] as const;
-
-const NAMED_KEYS: Record<number, string> = {
-  0x04: "A", 0x05: "B", 0x06: "C", 0x07: "D", 0x08: "E", 0x09: "F", 0x0a: "G", 0x0b: "H",
-  0x0c: "I", 0x0d: "J", 0x0e: "K", 0x0f: "L", 0x10: "M", 0x11: "N", 0x12: "O", 0x13: "P",
-  0x14: "Q", 0x15: "R", 0x16: "S", 0x17: "T", 0x18: "U", 0x19: "V", 0x1a: "W", 0x1b: "X",
-  0x1c: "Y", 0x1d: "Z", 0x1e: "1", 0x1f: "2", 0x20: "3", 0x21: "4", 0x22: "5", 0x23: "6",
-  0x24: "7", 0x25: "8", 0x26: "9", 0x27: "0", 0x28: "Enter", 0x29: "Esc", 0x2a: "Backspace",
-  0x2c: "Space", 0x39: "Caps Lock", 0x47: "Scroll Lock", 0x48: "Pause", 0x49: "Insert",
-  0x4a: "Home", 0x4b: "Page Up", 0x4c: "Delete", 0x4d: "End", 0x4e: "Page Down",
-  0x4f: "→", 0x50: "←", 0x51: "↓", 0x52: "↑", 0x53: "Num Lock",
-  0x3a: "F1", 0x3b: "F2", 0x3c: "F3", 0x3d: "F4", 0x3e: "F5", 0x3f: "F6",
-  0x40: "F7", 0x41: "F8", 0x42: "F9", 0x43: "F10", 0x44: "F11", 0x45: "F12",
-};
-
-function keyName(key: number): string {
-  return NAMED_KEYS[key] ?? `Key ${key}`;
-}
-
-function modName(hidKey: number): string {
-  switch (hidKey) {
-    case HID.CTRL_L: case HID.CTRL_R: return "Ctrl";
-    case HID.SHIFT_L: case HID.SHIFT_R: return "Shift";
-    case HID.ALT_L: case HID.ALT_R: return "Alt";
-    case HID.META_L: case HID.META_R: return "Super";
-    default: return "";
-  }
-}
-
-const ACTIONS: { value: string; label: string; needsScreen: boolean; hint: string }[] = [
-  { value: "switch", label: "Switch to screen", needsScreen: true, hint: "Jump the cursor straight to one machine" },
-  { value: "cycle", label: "Cycle screens", needsScreen: false, hint: "Move to the next reachable machine" },
-  { value: "lock", label: "Toggle wall lock", needsScreen: false, hint: "Freeze or release the screen edges" },
-  { value: "home", label: "Go home", needsScreen: false, hint: "Return control to this machine" },
+const ACTIONS: { value: string; label: string; hint: string }[] = [
+  { value: "cycle", label: "Cycle screens", hint: "Move to the next reachable machine" },
+  { value: "lock", label: "Toggle wall lock", hint: "Freeze or release the screen edges" },
+  { value: "home", label: "Go home", hint: "Return control to this machine" },
 ];
 
-interface Chord {
-  mods: number[]; // HID usages of held modifiers
-  key: number;    // HID usage of the non-modifier key
+function bindingToChord(b: Binding): Chord {
+  return { ctrl: b.mods.ctrl, alt: b.mods.alt, shift: b.mods.shift, meta: b.mods.meta, key: b.key };
 }
 
-// Live chord recorder: listens for the next non-modifier key press on
-// the window and reports it with the modifiers held at that moment.
-// Escape cancels. Returns null on cancel.
-function useChordRecorder(active: boolean, onDone: (chord: Chord) => void, onCancel: () => void) {
-  useEffect(() => {
-    if (!active) return;
-    const onKey = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.key === "Escape") {
-        onCancel();
-        return;
-      }
-      // Map the DOM event to HID: use code for letters/digits (layout-
-      // independent) and keyCode fallback for the rest. The recorder
-      // targets the common cases; unmapable keys simply do not record.
-      const code = e.code;
-      let hid = 0;
-      if (code.startsWith("Key")) {
-        hid = 0x04 + (code.charCodeAt(3) - "A".charCodeAt(0));
-      } else if (code.startsWith("Digit")) {
-        hid = 0x1e + (code.charCodeAt(5) - "1".charCodeAt(0));
-      } else if (code.startsWith("F") && /^F\d+$/.test(code)) {
-        hid = 0x3a + (parseInt(code.slice(1), 10) - 1);
-      } else if (code === "ScrollLock") hid = 0x47;
-      else if (code === "Pause") hid = 0x48;
-      else if (code === "Home") hid = 0x4a;
-      else if (code === "End") hid = 0x4d;
-      else if (code === "PageUp") hid = 0x4b;
-      else if (code === "PageDown") hid = 0x4e;
-      else if (code === "Insert") hid = 0x49;
-      else if (code === "ArrowRight") hid = 0x4f;
-      else if (code === "ArrowLeft") hid = 0x50;
-      else if (code === "ArrowDown") hid = 0x51;
-      else if (code === "ArrowUp") hid = 0x52;
-      if (hid === 0) return; // unmapped — keep listening
-      const mods = MOD_ORDER.filter((m) => {
-        switch (m) {
-          case "CTRL_L": case "CTRL_R": return e.ctrlKey;
-          case "SHIFT_L": case "SHIFT_R": return e.shiftKey;
-          case "ALT_L": case "ALT_R": return e.altKey;
-          case "META_L": case "META_R": return e.metaKey;
-        }
-      }) as unknown as number[];
-      onDone({ mods: mods.map((m) => HID[m as keyof typeof HID]), key: hid });
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [active, onDone, onCancel]);
+function chordMatches(a: Chord, b: Chord): boolean {
+  return a.key === b.key && a.ctrl === b.ctrl && a.alt === b.alt && a.shift === b.shift && a.meta === b.meta;
+}
+
+function chordEqualsMods(c: Chord, mods: Binding["mods"], key: number): boolean {
+  return chordMatches(c, { ctrl: mods.ctrl, alt: mods.alt, shift: mods.shift, meta: mods.meta, key });
+}
+
+/** The chord registry row: kbd chips for the chord, action, remove. */
+function BindingRow({
+  binding,
+  duplicate,
+  onRemove,
+}: {
+  binding: Binding;
+  duplicate: boolean;
+  onRemove: () => void;
+}) {
+  const mods = modLabels(binding.mods);
+  return (
+    <li className="flex items-center gap-3 rounded-lg border border-border/50 bg-card/40 px-3 py-2">
+      <span className="flex items-center gap-1">
+        {mods.map((m) => (
+          <Kbd key={m}>{m}</Kbd>
+        ))}
+        <Kbd>{keyName(binding.key)}</Kbd>
+      </span>
+      <span className="flex-1 truncate text-xs text-muted-foreground">
+        {binding.action === "switch" ? `Switch to ${binding.screen || "?"}` : binding.action}
+      </span>
+      {duplicate && (
+        <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
+          duplicate
+        </span>
+      )}
+      <button
+        className="text-muted-foreground/50 hover:text-destructive"
+        onClick={onRemove}
+        aria-label="remove shortcut"
+      >
+        ×
+      </button>
+    </li>
+  );
+}
+
+/** The live recorder panel: chips light up as modifiers are held. */
+function RecorderPanel({ live }: { live: Chord }) {
+  const mods = modLabels(live);
+  return (
+    <div className="mt-3 rounded-lg border border-dashed border-primary/50 bg-primary/5 px-3 py-3">
+      <div className="flex items-center gap-1.5">
+        {["Ctrl", "Alt", "Shift", "Super"].map((m) => {
+          const on = mods.includes(m);
+          return (
+            <Kbd key={m} dim={!on}>
+              {m}
+            </Kbd>
+          );
+        })}
+        <span className="mx-1 text-muted-foreground/40">+</span>
+        <Kbd dim>key…</Kbd>
+      </div>
+      <p className="mt-2 text-[11px] text-primary/80">
+        Hold modifiers, then tap the key. The chord overrides OS shortcuts (Win+Tab, media keys). Esc cancels.
+      </p>
+    </div>
+  );
 }
 
 export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }) {
@@ -124,6 +116,7 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
   const [saved, setSaved] = useState(false);
   const [recording, setRecording] = useState(false);
   const [pendingAction, setPendingAction] = useState<{ action: string; screen: string } | null>(null);
+  const [live, setLive] = useState<Chord>({ ctrl: false, alt: false, shift: false, meta: false, key: 0 });
 
   const load = async () => {
     setLoadErr("");
@@ -136,32 +129,6 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
   useEffect(() => {
     void load();
   }, []);
-
-  useChordRecorder(
-    recording,
-    (chord) => {
-      setRecording(false);
-      if (pendingAction && config) {
-        const binding: Binding = {
-          mods: {
-            ctrl: chord.mods.includes(HID.CTRL_L) || chord.mods.includes(HID.CTRL_R),
-            alt: chord.mods.includes(HID.ALT_L) || chord.mods.includes(HID.ALT_R),
-            shift: chord.mods.includes(HID.SHIFT_L) || chord.mods.includes(HID.SHIFT_R),
-            meta: chord.mods.includes(HID.META_L) || chord.mods.includes(HID.META_R),
-          },
-          key: chord.key,
-          action: pendingAction.action,
-          screen: pendingAction.screen,
-        };
-        save({ shortcuts: { ...(config.shortcuts ?? { enabled: true, bindings: [] }), bindings: [...(config.shortcuts?.bindings ?? []), binding] } });
-      }
-      setPendingAction(null);
-    },
-    () => {
-      setRecording(false);
-      setPendingAction(null);
-    },
-  );
 
   const save = async (patch: { shortcuts?: ShortcutSection; input?: InputSection }) => {
     if (!config) return;
@@ -178,6 +145,42 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
     }
   };
 
+  useChordRecorder(
+    recording,
+    (chord) => {
+      setLive({ ...chord, key: 0 });
+      setRecording(false);
+      if (pendingAction && config) {
+        const binding: Binding = {
+          mods: { ctrl: chord.ctrl, alt: chord.alt, shift: chord.shift, meta: chord.meta },
+          key: chord.key,
+          action: pendingAction.action,
+          screen: pendingAction.screen,
+        };
+        const shortcuts = config.shortcuts ?? { enabled: true, bindings: [] };
+        // A chord already bound (or the bare escape key, always
+        // reserved) is refused with a message instead of silently
+        // creating a dead or conflicting entry.
+        if (chord.key === 0x29) {
+          setErr("Esc is reserved for returning home — pick another key.");
+          setPendingAction(null);
+          return;
+        }
+        if (shortcuts.bindings.some((b) => chordEqualsMods(chord, b.mods, b.key))) {
+          setErr(`${[...modLabels(binding.mods), keyName(binding.key)].join(" + ")} is already bound.`);
+          setPendingAction(null);
+          return;
+        }
+        void save({ shortcuts: { ...shortcuts, bindings: [...shortcuts.bindings, binding] } });
+      }
+      setPendingAction(null);
+    },
+    () => {
+      setRecording(false);
+      setPendingAction(null);
+    },
+  );
+
   if (loadErr) {
     return (
       <div className="mx-auto w-full max-w-2xl px-8 py-8">
@@ -187,28 +190,21 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
       </div>
     );
   }
-  if (!config) return <PageSkeleton rows={2} />;
+  if (!config) return <PageSkeleton rows={3} />;
 
   const bindings = config.shortcuts?.bindings ?? [];
   const input = config.input ?? { pointerSpeed: 1, wheelSpeed: 1, swapScroll: false };
   const screens = config.screens ?? [];
 
+  const duplicates = new Set(
+    bindings
+      .map((b, i) => ({ sig: `${b.mods.ctrl}|${b.mods.alt}|${b.mods.shift}|${b.mods.meta}|${b.key}`, i }))
+      .filter((x, _, all) => all.filter((y) => y.sig === x.sig).length > 1)
+      .map((x) => x.i),
+  );
+
   const removeBinding = (i: number) => {
     save({ shortcuts: { ...(config.shortcuts ?? { enabled: true }), bindings: bindings.filter((_, j) => j !== i) } });
-  };
-
-  const chordLabel = (b: Binding) => {
-    const mods: string[] = [];
-    if (b.mods.ctrl) mods.push("Ctrl");
-    if (b.mods.alt) mods.push("Alt");
-    if (b.mods.shift) mods.push("Shift");
-    if (b.mods.meta) mods.push("Super");
-    return [...mods, keyName(b.key)].join(" + ");
-  };
-
-  const actionLabel = (b: Binding) => {
-    if (b.action === "switch") return `Switch to ${b.screen || "?"}`;
-    return ACTIONS.find((a) => a.value === b.action)?.label ?? b.action;
   };
 
   return (
@@ -239,30 +235,23 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
           )}
           <ul className="space-y-1.5">
             {bindings.map((b, i) => (
-              <li key={i} className="flex items-center justify-between gap-3 rounded-lg border border-border/50 px-3 py-2">
-                <span className="font-mono text-xs">{chordLabel(b)}</span>
-                <span className="flex-1 truncate text-xs text-muted-foreground">{actionLabel(b)}</span>
-                <button
-                  className="text-muted-foreground/50 hover:text-destructive"
-                  onClick={() => removeBinding(i)}
-                  aria-label="remove shortcut"
-                >
-                  ×
-                </button>
-              </li>
+              <BindingRow
+                key={i}
+                binding={b}
+                duplicate={duplicates.has(i)}
+                onRemove={() => removeBinding(i)}
+              />
             ))}
           </ul>
           {recording ? (
-            <p className="mt-3 rounded-lg border border-dashed border-primary/50 bg-primary/5 px-3 py-2 text-xs text-primary">
-              Press a key (with any modifiers). Esc cancels.
-            </p>
+            <RecorderPanel live={live} />
           ) : (
             <div className="mt-3 flex items-center gap-2">
               <Button
                 size="sm"
                 variant="outline"
                 onClick={() => {
-                  setPendingAction({ action: "cycle", screen: "" });
+                  setPendingAction((p) => p ?? { action: "cycle", screen: "" });
                   setRecording(true);
                 }}
               >
@@ -270,7 +259,11 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
               </Button>
               <select
                 className="h-8 rounded-md border border-border/70 bg-muted/40 px-2 text-xs text-foreground outline-none focus:border-primary"
-                value={pendingAction ? `${pendingAction.action}${pendingAction.screen ? `:${pendingAction.screen}` : ""}` : "cycle"}
+                value={
+                  pendingAction
+                    ? `${pendingAction.action}${pendingAction.screen ? `:${pendingAction.screen}` : ""}`
+                    : "cycle"
+                }
                 onChange={(e) => {
                   const v = e.target.value;
                   // "switch:<screen>" encodes a screen-targeted action.
@@ -283,7 +276,7 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
                 }}
                 aria-label="Action for the next recorded shortcut"
               >
-                {ACTIONS.filter((a) => !a.needsScreen).map((a) => (
+                {ACTIONS.map((a) => (
                   <option key={a.value} value={a.value}>{a.label}</option>
                 ))}
                 <optgroup label="Switch to screen">
@@ -294,9 +287,6 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
               </select>
             </div>
           )}
-          <p className="mt-2 text-[11px] text-muted-foreground/70">
-            Pick an action, press Add shortcut, then tap the chord. Scroll Lock alone cycles; the escape key is always reserved.
-          </p>
         </div>
       </Section>
 
@@ -349,8 +339,8 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
       <Section title="Keyboard" className="mt-6">
         <p className="py-3 text-xs text-muted-foreground">
           Keys are forwarded by their physical identity, so layout follows whichever machine is being controlled —
-          type as usual. Modifier chords you record above are intercepted before forwarding; everything else reaches
-          the controlled machine untouched.
+          type as usual. Only the chords recorded above are intercepted (before the controlled machine — and this
+          machine's own shortcuts — see them); everything else passes through untouched.
         </p>
       </Section>
 

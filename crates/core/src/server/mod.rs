@@ -324,6 +324,17 @@ impl Server {
         // From here on, server-initiated disconnects can bring the cursor
         // home themselves (see `disconnect_client`).
         *self.engine.lock().unwrap() = Some(engine.clone());
+        // Publish the configured chords to the capture layer: a bound
+        // chord must beat the OS's own binding (Win+Tab, media keys)
+        // from the first keystroke, not only after the first reload.
+        {
+            let chords = self.session.lock().unwrap().bound_chords();
+            if let Some(e) = self.engine.lock().unwrap().as_ref() {
+                if let Ok(mut e) = e.lock() {
+                    e.set_bound_chords(chords);
+                }
+            }
+        }
         // Accept clients on a background thread.
         let listener = self.listener.try_clone()?;
         let ctx = Arc::new(ClientCtx {
@@ -467,7 +478,15 @@ impl Server {
                 let mut session = self.session.lock().unwrap();
                 session.set_bindings(bindings);
                 session.set_prefs(prefs);
+                // The capture layer re-arms its interception around the
+                // new bindings in the same step: a chord the user just
+                // bound starts beating OS shortcuts immediately, and a
+                // chord they unbound stops being swallowed.
+                let chords = session.bound_chords();
                 drop(session);
+                if let Ok(mut e) = engine.lock() {
+                    e.set_bound_chords(chords);
+                }
                 layout
             }
         };

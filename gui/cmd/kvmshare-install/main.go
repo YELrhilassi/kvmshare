@@ -30,11 +30,14 @@ import (
 
 func main() {
 	var (
-		version     = flag.String("version", "", "install this exact version (default: latest)")
-		local       = flag.String("local", "", "install from a local directory of built binaries (no network)")
-		check       = flag.Bool("check", false, "print the latest published version and exit")
-		uninstall   = flag.Bool("uninstall", false, "remove installed binaries + shortcuts")
-		inputAccess = flag.Bool("input-access", false, "(Linux) grant input-device access; run as root via pkexec")
+		version          = flag.String("version", "", "install this exact version (default: latest)")
+		local            = flag.String("local", "", "install from a local directory of built binaries (no network)")
+		check            = flag.Bool("check", false, "print the latest published version and exit")
+		uninstall        = flag.Bool("uninstall", false, "remove installed binaries + shortcuts")
+		inputAccess      = flag.Bool("input-access", false, "(Linux) grant input-device access; run as root via pkexec")
+		firewall         = flag.Bool("firewall", false, "(Windows) open kvmshare's inbound firewall ports; run elevated")
+		firewallSession  = flag.Int("session-port", 0, "session port for --firewall")
+		firewallDiscovery = flag.Int("discovery-port", 0, "discovery port for --firewall")
 	)
 	flag.Parse()
 
@@ -54,6 +57,20 @@ func main() {
 		if err := installer.EnsureInputAccess(); err != nil {
 			fatal(err)
 		}
+		return
+	}
+	// Privileged subcommand: invoked by the GUI through ShellExecute
+	// run-as (see installer.EnsureFirewallViaInstaller) to restore the
+	// inbound firewall rules — one UAC prompt, only when the rules are
+	// actually missing.
+	if *firewall {
+		if *firewallSession <= 0 || *firewallDiscovery <= 0 {
+			fatal(fmt.Errorf("--firewall needs --session-port and --discovery-port"))
+		}
+		if err := installer.EnsureFirewall(*firewallSession, *firewallDiscovery); err != nil {
+			fatal(err)
+		}
+		fmt.Println("firewall: inbound rules ready")
 		return
 	}
 

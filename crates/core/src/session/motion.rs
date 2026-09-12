@@ -69,7 +69,7 @@ impl Session {
         let at_home = matches!(self.cursor.mode, Mode::Local);
         match kind {
             KeyKind::Down => {
-                if let Some(action) = self.actions.key_down(key, self.mods_snapshot(), at_home) {
+                if let Some(action) = self.actions.key_down(key, crate::actions::Mods::NONE, at_home) {
                     return self.execute_user_action(action);
                 }
             }
@@ -81,17 +81,6 @@ impl Session {
             KeyKind::Repeat => {}
         }
         self.forward_while_remote(Message::Key { kind, key })
-    }
-
-    /// Modifier state for the action engine. The capture layer reports
-    /// modifier presses as ordinary key events; the engine accumulates
-    /// them into a chord's mod set itself, so a fresh event needs only
-    /// the empty set unless a chord is mid-flight — the engine's own
-    /// bookkeeping is authoritative between events. (Full mod tracking
-    /// arrives with the customizable-binding UI; the default chords are
-    /// modifier-free.)
-    fn mods_snapshot(&self) -> crate::actions::Mods {
-        crate::actions::Mods::NONE
     }
 
     /// Run one user action from the engine. Anything it cannot do in

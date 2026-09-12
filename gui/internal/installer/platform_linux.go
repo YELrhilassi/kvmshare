@@ -251,6 +251,15 @@ func launchGUI(string) error { return nil }
 // per-app rules, and the installer already handles privileged steps.
 func EnsureFirewall(int, int) error { return nil }
 
+// EnsureFirewallViaInstaller matches EnsureFirewall: no-op on Linux
+// (inbound UDP is accepted; see platform_windows.go for the relay's
+// purpose on Windows).
+func EnsureFirewallViaInstaller(int, int) error { return nil }
+
+// FirewallRulesPresent matches EnsureFirewall: always true on Linux
+// (no firewall rules to check).
+func FirewallRulesPresent(int, int) bool { return true }
+
 // integrateViaPkexec re-executes this installer as root with
 // --input-access, so the user consents through the desktop's standard
 // privilege prompt instead of a shell command.

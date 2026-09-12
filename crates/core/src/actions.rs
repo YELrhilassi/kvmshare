@@ -135,10 +135,36 @@ impl Default for BindSection {
 /// an unrelated later key forever.
 const CHORD_LINGER: Duration = Duration::from_secs(5);
 
+impl Mods {
+    /// Update the mod set from one key transition. Modifier keys are
+    /// tracked by the engine itself (the session feeds it every key
+    /// event), so the state is authoritative even when apps change
+    /// focus mid-chord. `down` distinguishes press from release.
+    pub fn apply_key(&mut self, key: u32, down: bool) {
+        let bit: Option<&mut bool> = match key {
+            hid::CTRL_L | hid::CTRL_R => Some(&mut self.ctrl),
+            hid::SHIFT_L | hid::SHIFT_R => Some(&mut self.shift),
+            hid::ALT_L | hid::ALT_R => Some(&mut self.alt),
+            hid::META_L | hid::META_R => Some(&mut self.meta),
+            _ => None,
+        };
+        if let Some(flag) = bit {
+            *flag = down;
+        }
+    }
+
+    /// Is any modifier in this set held?
+    pub fn any(&self) -> bool {
+        self.ctrl || self.alt || self.shift || self.meta
+    }
+}
+
 /// The engine: owns bindings and the chord-in-progress state.
 #[derive(Debug)]
 pub struct ActionEngine {
     cfg: BindSection,
+    /// Live modifier state, maintained from the key stream itself.
+    mods: Mods,
     /// Chord in progress: the pending non-modifier key and the mods
     /// held when it went down. `None` = idle.
     pending: Option<PendingChord>,
@@ -148,6 +174,9 @@ pub struct ActionEngine {
     /// their releases are still the engine's (a consumed press must
     /// always own its release, or the client sees a stuck key).
     owned: Vec<u32>,
+    /// The last chord-shaped key press seen (mods + key), bound or not
+    /// — powers the GUI's live key detection display.
+    last_seen: Option<(Mods, u32)>,
 }
 
 #[derive(Debug)]
@@ -161,7 +190,14 @@ struct PendingChord {
 
 impl ActionEngine {
     pub fn new(cfg: BindSection) -> Self {
-        Self { cfg, pending: None, fired: None, owned: Vec::new() }
+        Self {
+            cfg,
+            mods: Mods::NONE,
+            pending: None,
+            fired: None,
+            owned: Vec::new(),
+            last_seen: None,
+        }
     }
 
     pub fn config(&self) -> &BindSection {
@@ -185,16 +221,22 @@ impl ActionEngine {
     /// is on the server screen — some actions only mean something away —
     /// but consumption rules are identical in both states, so a chord
     /// never half-leaks to a client.
+    ///
+    /// Modifier state is tracked internally from the key stream; the
+    /// caller's `mods` argument is only a hint for backends that deliver
+    /// a chord as one event with no modifier history (an empty hint is
+    /// always safe).
     pub fn key_down(&mut self, key: u32, mods: Mods, at_home: bool) -> Option<UserAction> {
         if !self.cfg.enabled {
             return None;
         }
         self.tick();
-        // Modifiers only refresh a pending chord's mod set; they never
-        // fire or start chords, and always pass through.
+        // Modifiers only update the live set; they never fire or start
+        // chords, and always pass through.
         if hid::is_modifier(key) {
+            self.mods.apply_key(key, true);
             if let Some(p) = &mut self.pending {
-                p.mods = mods;
+                p.mods = self.mods;
             }
             return None;
         }
@@ -202,7 +244,13 @@ impl ActionEngine {
         // abandon the old chord, then evaluate this key normally.
         self.pending = None;
 
-        if let Some(b) = self.cfg.bindings.iter().find(|b| b.key == key && b.mods == mods) {
+        // The effective chord: the engine's tracked modifiers, or the
+        // caller's hint when the engine saw nothing (a backend that
+        // delivers one event with mods pre-resolved).
+        let effective = if self.mods.any() { self.mods } else { mods };
+        self.last_seen = Some((effective, key));
+
+        if let Some(b) = self.cfg.bindings.iter().find(|b| b.key == key && b.mods == effective) {
             self.fired = Some(key);
             return self.fire(b, at_home);
         }
@@ -210,7 +258,7 @@ impl ActionEngine {
         // remember — its modifiers may still complete it, and its
         // release must not leak to the client.
         if self.cfg.bindings.iter().any(|b| b.key == key) {
-            self.pending = Some(PendingChord { key, mods, at: Instant::now() });
+            self.pending = Some(PendingChord { key, mods: effective, at: Instant::now() });
             self.owned.push(key);
         }
         None
@@ -220,6 +268,10 @@ impl ActionEngine {
     /// engine (a fired chord or a pending one) — the caller must not
     /// forward that release, or the client would see a key stuck down.
     pub fn key_up(&mut self, key: u32) -> Option<u32> {
+        if hid::is_modifier(key) {
+            self.mods.apply_key(key, false);
+            return None;
+        }
         if self.fired == Some(key) {
             self.fired = None;
             return Some(key);
@@ -234,6 +286,17 @@ impl ActionEngine {
             }
         }
         None
+    }
+
+    /// The last chord-shaped key press (mods + HID key), bound or not —
+    /// live key detection for the GUI.
+    pub fn last_seen(&self) -> Option<(Mods, u32)> {
+        self.last_seen
+    }
+
+    /// Would this (mods, key) pair fire a binding right now?
+    pub fn is_bound(&self, mods: Mods, key: u32) -> bool {
+        self.cfg.bindings.iter().any(|b| b.key == key && b.mods == mods)
     }
 
     /// Expire a half-typed chord that outlived its window.

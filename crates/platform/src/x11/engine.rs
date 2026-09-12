@@ -71,4 +71,11 @@ impl Engine for X11Engine {
         // Also executed on the capture connection (same reason as warp).
         self.send(CaptureCommand::CursorVisible(visible));
     }
+
+    fn set_bound_chords(&mut self, chords: Vec<(u8, u32)>) {
+        // Passive chord grabs live on the capture connection, like every
+        // other cursor/input control — see
+        // `CaptureCommand::BindChords` for the mechanism.
+        self.send(CaptureCommand::BindChords(chords));
+    }
 }

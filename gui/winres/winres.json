@@ -13,7 +13,7 @@
         },
         "description": "Share one keyboard and mouse across your machines.",
         "minimum-os": "win7",
-        "execution-level": "requireAdministrator",
+        "execution-level": "asInvoker",
         "ui-access": false,
         "dpi-awareness": "permonitorv2",
         "disable-theming": false,

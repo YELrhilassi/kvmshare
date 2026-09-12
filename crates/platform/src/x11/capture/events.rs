@@ -30,7 +30,7 @@ pub(crate) const REPEAT_INTERVAL: Duration = Duration::from_millis(33); // ≈ 3
 /// connection. That single-connection rule is what lets the same client
 /// grab the pointer and still warp it (warps from a different client are
 /// not honored while another client holds the grab).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum CaptureCommand {
     /// Grab (or release) the pointer and keyboard so local windows do not
     /// act on physical input while the cursor is on a client.
@@ -47,6 +47,13 @@ pub enum CaptureCommand {
     Warp(i32, i32),
     /// Hide/show the local cursor (XFixes).
     CursorVisible(bool),
+    /// Replace the set of **passively grabbed chords**: keyboard chords
+    /// bound to kvmshare actions, grabbed on the root window so the
+    /// desktop never acts on them (Win+Tab, media keys, …) — the same
+    /// mechanism every window manager uses for its own shortcuts.
+    /// `(mods, key)` pairs; `key` is a canonical HID usage, `mods` the
+    /// 4-bit ctrl|alt|shift|meta mask. An empty list releases everything.
+    BindChords(Vec<(u8, u32)>),
 }
 
 /// Select XI2 raw events on `root`.

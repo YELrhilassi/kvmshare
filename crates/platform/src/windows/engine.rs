@@ -119,6 +119,15 @@ impl Engine for Win32Engine {
     fn show_local_cursor(&mut self, visible: bool) {
         self.send(EngineCmd::CursorVisible(visible));
     }
+
+    fn set_bound_chords(&mut self, chords: Vec<(u8, u32)>) {
+        // The low-level keyboard hook reads this set on every key event;
+        // publishing here arms OS-level interception (a bound chord —
+        // Win+Tab, a media key — is swallowed at the hook and resolved
+        // by the action engine before Windows can act on it). See
+        // `super::capture::set_bound_chords`.
+        super::capture::set_bound_chords(chords);
+    }
 }
 
 /// The engine thread: the single owner of the cursor-state transitions.
