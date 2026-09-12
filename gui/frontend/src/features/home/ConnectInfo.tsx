@@ -54,8 +54,9 @@ export default function ConnectInfo() {
           <div className="space-y-1">
             <div className="text-xs uppercase tracking-wide text-muted-foreground/60">Other machines connect to</div>
             {ips.map((ip) => (
-              <div key={ip} className="font-mono text-lg">
-                {ip}:{port}
+              <div key={ip} className="font-mono text-lg tracking-tight">
+                <span className="text-muted-foreground">{ip}:</span>
+                <span className="text-foreground">{port}</span>
               </div>
             ))}
             {ips.length === 0 && <div className="font-mono text-lg text-muted-foreground">no network address found</div>}

@@ -1,18 +1,16 @@
 import { useState } from "react";
 import { useApp } from "@/app/AppProvider";
-import { api, copyText, type Peer } from "@/lib/bridge";
-import { DEFAULT_PORT } from "@/lib/constants";
+import { api, copyText } from "@/lib/bridge";
 import { Button } from "@/components/ui/button";
 import { Section } from "@/components/Section";
+import { matchesID, peerAddr, peerState, peerUsable, type PeerState } from "@/features/home/peerState";
 import { cn, shortID } from "@/lib/utils";
 import { RotateCw } from "lucide-react";
 
-// Every machine on the network that can work with this one, in one list.
-// A machine only counts as live when its role is actually running: a GUI
-// that is open but sharing nothing is not nearby (it used to linger as
-// "nearby" forever after you stopped every service on it).
-//
-// One decision per machine, in plain words:
+// Every machine on the network that can work with this one, in one
+// list, speaking the shared peer-state vocabulary (peerState.ts):
+// connected · ready · nearby · blocked · offline — one decision per
+// machine, in plain words:
 //   Connect   — ask it to work with this machine (a running peer) or wait
 //               for a trusted one to come online. Connecting implies
 //               trust — there is no separate verb to learn.
@@ -23,18 +21,6 @@ import { RotateCw } from "lucide-react";
 //               both the trusted and the refused lists; the Home page
 //               never makes the user think about the difference. Fine
 //               control by machine id stays on the Server page.)
-type RowState = "connected" | "blocked" | "ready" | "nearby" | "offline";
-
-// Same prefix contract as the backend (ids.Trusted): an entry matches a
-// machine id when either is a prefix of the other, and entries shorter
-// than 4 chars are ignored.
-function matchesID(list: string[], id: string): boolean {
-  return list.some((t) => {
-    const entry = t.trim();
-    if (entry.length < 4) return false;
-    return id === entry || id.startsWith(entry) || entry.startsWith(id);
-  });
-}
 
 export default function LiveOverview() {
   const { mode, clients, peers, trusted, revoked, clientState, refresh } = useApp();
@@ -43,27 +29,9 @@ export default function LiveOverview() {
   const [sweeping, setSweeping] = useState(false);
 
   const isServer = mode === "server";
-  // Every discovered machine stays listed. A strict role filter made
-  // rows vanish whenever either machine changed role — which read as
-  // the whole list flapping. Rows that can work with this machine (a
-  // server lists clients, a client lists servers) get actions; a
-  // same-role machine is still shown, muted, with its real role.
-  const usable = (p: Peer) => (isServer ? p.role === "client" : p.role === "server");
 
-  const stateOf = (p: Peer): RowState => {
-    // A block outranks everything: the machine is refused, so its
-    // trust or liveness is beside the point.
-    if (matchesID(revoked, p.id)) return "blocked";
-    if (isServer) {
-      if (clients.some((c) => c.id === p.id)) return "connected";
-    } else {
-      const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
-      if (clientState.status === "connected" && clientState.server === addr) return "connected";
-    }
-    if (matchesID(trusted, p.id)) return "ready";
-    if (p.active) return "nearby";
-    return "offline";
-  };
+  const stateOf = (p: Parameters<typeof peerState>[1]): PeerState =>
+    peerState(isServer, p, clients, clientState, trusted, revoked);
 
   const act = async (fn: () => Promise<unknown>) => {
     setErr("");
@@ -118,7 +86,7 @@ export default function LiveOverview() {
     act(() => (isServer ? api().SendConnectRequest(p.id) : api().ConnectToServer(`${p.addr}:${p.port || DEFAULT_PORT}`)));
 
   // Chip label and tint per state — the row's single source of truth.
-  const chip: Record<RowState, { label: string; className: string }> = {
+  const chip: Record<PeerState, { label: string; className: string }> = {
     connected: { label: isServer ? "connected" : "in control", className: "bg-emerald-500/10 text-emerald-500" },
     blocked: { label: "blocked", className: "bg-destructive/10 text-destructive" },
     ready: { label: "ready", className: "bg-sky-500/10 text-sky-400" },
@@ -127,7 +95,7 @@ export default function LiveOverview() {
   };
 
   // One-line hint only where the chip alone leaves a question open.
-  const hintFor = (state: RowState): string | undefined => {
+  const hintFor = (state: PeerState): string | undefined => {
     switch (state) {
       case "blocked":
         return "refused until you unblock it";
@@ -167,10 +135,29 @@ export default function LiveOverview() {
         <div className="divide-y divide-border/50">
           {peers.map((p) => {
             const state = stateOf(p);
-            const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
+            const addr = peerAddr(p);
             const c = chip[state];
             return (
-              <div key={p.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3">
+              <div key={p.id} className="relative flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3 pl-3.5">
+                {/* The state rail: a colored bar whose tint is the row's
+                    state at a glance, so scanning the list needs no
+                    reading. */}
+                <span
+                  aria-hidden
+                  className={cn(
+                    "absolute left-0 top-3 bottom-3 w-[3px] rounded-full transition-colors",
+                    state === "connected"
+                      ? "bg-emerald-500"
+                      : state === "blocked"
+                        ? "bg-destructive/80"
+                        : state === "ready"
+                          ? "bg-sky-400/80"
+                          : state === "nearby"
+                            ? "bg-amber-500/80"
+                            : "bg-border",
+                  )
+                  }
+                />
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium">{p.name}</span>
@@ -197,7 +184,7 @@ export default function LiveOverview() {
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-1.5">
-                  {!usable(p) ? (
+                  {!peerUsable(isServer, p) ? (
                     <span className="text-[10px] text-muted-foreground/50">same role as this machine</span>
                   ) : state === "connected" ? (
                     isServer && (

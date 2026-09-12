@@ -66,11 +66,21 @@ function Shell() {
             ))}
           </nav>
 
-          <div className="ml-auto flex items-center gap-2 text-xs">
+          <div className="ml-auto flex items-center gap-2.5 text-xs">
+            {/* The header's live dot: solid when a session is on, pulsing
+                while connecting — mirroring the hero card. */}
             <span
               className={cn(
                 "h-2 w-2 rounded-full",
-                mode === "server" ? (running.server ? "bg-emerald-500" : "bg-muted-foreground/40") : clientState.status === "connected" ? "bg-emerald-500" : clientState.status === "connecting" ? "bg-amber-500" : "bg-muted-foreground/40",
+                mode === "server"
+                  ? running.server
+                    ? "bg-emerald-500"
+                    : "bg-muted-foreground/40"
+                  : clientState.status === "connected"
+                    ? "bg-emerald-500"
+                    : clientState.status === "connecting"
+                      ? "animate-pulse bg-amber-500"
+                      : "bg-muted-foreground/40",
               )}
             />
             <span className="font-medium text-foreground/80">

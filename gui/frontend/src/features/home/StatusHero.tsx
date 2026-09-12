@@ -2,15 +2,15 @@ import { useEffect, useState } from "react";
 import { useApp } from "@/app/AppProvider";
 import { api } from "@/lib/bridge";
 import { Button } from "@/components/ui/button";
-import { Section } from "@/components/Section";
+import DeskMap from "@/features/home/DeskMap";
 import { cn } from "@/lib/utils";
-import { DEFAULT_PORT } from "@/lib/constants";
 
-// The single status + control for this machine, written as a sentence
-// about direction: a server shares with machines that connect TO it; a
-// client is connected TO exactly one server (by name when discovery
-// knows it). Bare "Connected" never appears without a "to whom".
-export default function ShareStatus() {
+/**
+ * The hero: one glance answers "what is happening right now" — a big
+ * status sentence, the single control that changes it, and the live
+ * desk map beside it. Everything else on the page is detail.
+ */
+export default function StatusHero() {
   const { mode, running, clientState, clientName, peers, refresh } = useApp();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -38,13 +38,6 @@ export default function ShareStatus() {
     clientState.connectingSinceMs > 0 &&
     now - clientState.connectingSinceMs > 8_000;
 
-  // Name the server this client talks to, when discovery knows it —
-  // otherwise fall back to its address.
-  const serverPeer = peers.find(
-    (p) => p.role === "server" && `${p.addr}:${p.port || DEFAULT_PORT}` === clientState.server,
-  );
-  const serverLabel = serverPeer?.name || clientState.server || "a server";
-
   const toggle = async () => {
     setBusy(true);
     setError("");
@@ -65,7 +58,7 @@ export default function ShareStatus() {
       ? "Sharing"
       : "Not sharing"
     : connected
-      ? `Connected to ${serverLabel}`
+      ? "In use by your server"
       : connecting
         ? stuckConnecting
           ? "Server unreachable"
@@ -77,10 +70,10 @@ export default function ShareStatus() {
       ? "Your keyboard and mouse are shared — other machines can use them."
       : "Nothing is shared right now. Start to let other machines use your keyboard and mouse."
     : connected
-      ? `${serverLabel} is using this machine's keyboard and mouse${clientName ? ` (as ${clientName})` : ""}.`
+      ? `Your server is using this machine's keyboard and mouse${clientName ? ` (as ${clientName})` : ""}.`
       : connecting
         ? stuckConnecting
-          ? `Can't reach ${serverLabel} — retrying every few seconds.`
+          ? `Can't reach the server — retrying every few seconds.`
           : "Connecting to the server — nothing is shared yet."
         : "No one is controlling this machine right now. Pick a machine below to connect.";
 
@@ -95,18 +88,26 @@ export default function ShareStatus() {
         : "Connect";
 
   return (
-    <Section title="Status">
-      <div className="flex items-center gap-3">
-        <span className={cn("h-2.5 w-2.5 rounded-full", dot ? "bg-emerald-500" : "bg-muted-foreground/40")} />
-        <span className="text-xl font-semibold tracking-tight">{title}</span>
+    <section className="overflow-hidden rounded-xl border border-border/70 bg-muted/20">
+      <div className="grid gap-8 p-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)] lg:gap-10 lg:p-10">
+        <div className="flex min-w-0 flex-col items-start gap-4">
+          <div className="flex items-center gap-3">
+            <span className={cn("h-3 w-3 rounded-full", dot ? "bg-emerald-500" : connecting ? "animate-pulse bg-amber-500" : "bg-muted-foreground/40")} />
+            <h1 className="text-3xl font-semibold tracking-tight">{title}</h1>
+          </div>
+          <p className="max-w-md text-sm leading-relaxed text-muted-foreground">{blurb}</p>
+          <div className="flex flex-wrap items-center gap-3 pt-1">
+            <Button onClick={toggle} disabled={busy} variant={dot ? "outline" : "default"} className="w-44">
+              {busy ? "Working…" : verb}
+            </Button>
+            {error && <p className="text-xs text-destructive">{error}</p>}
+          </div>
+        </div>
+
+        <div className="min-w-0 self-center" aria-hidden={peers.length === 0 && !running.client && !running.server}>
+          <DeskMap />
+        </div>
       </div>
-      <p className="max-w-md text-sm text-muted-foreground">{blurb}</p>
-      <div className="space-y-2">
-        <Button onClick={toggle} disabled={busy} variant={dot ? "outline" : "default"} className="w-44">
-          {busy ? "Working…" : verb}
-        </Button>
-        {error && <p className="text-xs text-destructive">{error}</p>}
-      </div>
-    </Section>
+    </section>
   );
 }

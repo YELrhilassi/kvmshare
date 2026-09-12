@@ -87,3 +87,20 @@
   filter: drop-shadow(0 24px 40px rgba(0, 0, 0, 0.5));
   opacity: 0.9;
 }
+
+/* The desk map's "connecting" link: marching dashes toward the server
+   being dialed. Disabled for users who ask for reduced motion — the
+   link simply stays a dashed line there. */
+@keyframes deskmap-dash {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+.deskmap-dash {
+  animation: deskmap-dash 1s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .deskmap-dash {
+    animation: none;
+  }
+}
