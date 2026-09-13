@@ -78,6 +78,37 @@ function codeToHid(code: string): number {
   return 0;
 }
 
+// DOM legacy `keyCode` → HID, used only when `code` is empty. Linux
+// WebKitGTK reports no `code` at all for some keys — Pause and Scroll
+// Lock among them — so without this fallback those keys could never be
+// recorded there. Only keys with a stable, unambiguous legacy code are
+// mapped; anything else keeps listening rather than guessing.
+const KEYCODE_TO_HID: Record<number, number> = {
+  19: 0x48, // Pause
+  145: 0x47, // Scroll Lock
+  45: 0x49, // Insert
+  36: 0x4a, // Home
+  33: 0x4b, // Page Up
+  46: 0x4c, // Delete
+  35: 0x4d, // End
+  34: 0x4e, // Page Down
+  39: 0x4f, // ArrowRight
+  37: 0x50, // ArrowLeft
+  40: 0x51, // ArrowDown
+  38: 0x52, // ArrowUp
+  144: 0x53, // Num Lock
+  65: 0x04, // A … Z block
+};
+
+function eventToHid(e: KeyboardEvent): number {
+  if (e.code) return codeToHid(e.code);
+  const kc = e.keyCode;
+  if (kc >= 65 && kc <= 90) return HID_LETTER + (kc - 65);
+  if (kc >= 48 && kc <= 57) return HID_DIGIT_ONE + (kc - 49);
+  if (kc >= 112 && kc <= 123) return HID_F1 + (kc - 112);
+  return KEYCODE_TO_HID[kc] ?? 0;
+}
+
 // Friendly name for a recorded key (the registry renders these).
 const KEY_NAMES: Record<number, string> = {
   0x28: "Enter", 0x29: "Esc", 0x2a: "Backspace", 0x2b: "Tab", 0x2c: "Space",
@@ -153,8 +184,27 @@ export function useChordRecorder(
       setLive(NO_MODS);
       return;
     }
-    const sync = (e: KeyboardEvent) =>
-      setLive({ ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey });
+    // Keys seen down since the chord started. Scroll Lock / Pause are
+    // reported on keyup (not keydown) by some browsers, and an OS may
+    // swallow the whole chord after keydown — both handled below.
+    let seenDown = new Set<number>();
+    // The live modifier state, tracked synchronously (React state lags
+    // one render — the blur handler below needs it *now*).
+    let modsNow: LiveMods = { ...NO_MODS };
+    // The last bindable key held: if the OS steals focus mid-chord
+    // (Win+Tab opens the task switcher), the window blurs and the
+    // keyup never arrives. The chord collected so far is still what
+    // the user meant — complete it on blur instead of dropping it.
+    let lastKey = 0;
+    const sync = (e: KeyboardEvent) => {
+      modsNow = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
+      setLive(modsNow);
+    };
+    const complete = (mods: LiveMods, hid: number) => {
+      lastKey = 0;
+      seenDown = new Set();
+      doneRef.current({ ...mods, key: hid });
+    };
     const onKey = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
@@ -168,18 +218,29 @@ export function useChordRecorder(
       if (["Control", "Alt", "Shift", "Meta", "AltGraph", "CapsLock", "NumLock", "ScrollLock"].includes(e.key) && !isBindableLock(e)) {
         return;
       }
-      const hid = codeToHid(e.code);
+      const hid = eventToHid(e);
       if (hid === 0) return; // unmapped — keep listening, never guess
-      doneRef.current({
-        ctrl: e.ctrlKey,
-        alt: e.altKey,
-        shift: e.shiftKey,
-        meta: e.metaKey,
-        key: hid,
-      });
+      if (!e.repeat) seenDown.add(e.keyCode);
+      lastKey = hid;
+      complete(modsNow, hid);
     };
-    const onKeyUp = (e: KeyboardEvent) => sync(e);
-    const onBlur = () => setLive(NO_MODS);
+    const onKeyUp = (e: KeyboardEvent) => {
+      sync(e);
+      if (!seenDown.has(e.keyCode) && isBindableLock(e)) {
+        // The keydown never reached us (browser reports these on keyup
+        // only) — the release *is* the press: record the chord now.
+        const hid = eventToHid(e);
+        if (hid !== 0) complete(modsNow, hid);
+      }
+      seenDown.delete(e.keyCode);
+    };
+    const onBlur = () => {
+      if (lastKey !== 0) {
+        complete(modsNow, lastKey);
+        return;
+      }
+      setLive(NO_MODS);
+    };
     window.addEventListener("keydown", onKey, true);
     window.addEventListener("keyup", onKeyUp, true);
     window.addEventListener("blur", onBlur, true);

@@ -110,6 +110,34 @@ fn default_section_serializes_round_trip() {
 }
 
 #[test]
+fn integral_float_key_deserializes() {
+    // The GUI round-trips this file through JavaScript, where every
+    // number is an f64: an old writer could emit `key = 71.0`. Strict
+    // rejection dropped the whole [shortcuts] section, so bindings
+    // silently never registered.
+    let s = r#"
+        enabled = true
+        [[bindings]]
+        mods = { ctrl = true }
+        key = 71.0
+        action = "switch"
+        screen = "hp"
+    "#;
+    let back: BindSection = toml::from_str(s).unwrap();
+    assert_eq!(back.bindings[0].key, 71);
+    // A real fraction is corruption, not a writer quirk — still an error.
+    assert!(toml::from_str::<BindSection>(
+        r#"
+        enabled = true
+        [[bindings]]
+        key = 71.5
+        action = "cycle"
+    "#
+    )
+    .is_err());
+}
+
+#[test]
 fn config_reload_drops_pending_chords() {
     let mut e = engine();
     e.key_down(hid::SCROLL_LOCK, Mods::NONE, true);

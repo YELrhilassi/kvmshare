@@ -38,7 +38,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [mode, setModeState] = useState<Mode>("server");
   const [clientName, setClientName] = useState("");
   const [running, setRunning] = useState<RunningStatus>({ server: false, client: false });
-  const [clientState, setClientState] = useState<ClientState>({ status: "disconnected", server: "" });
+  const [clientState, setClientState] = useState<ClientState>({ status: "disconnected", server: "", connectingSinceMs: 0 });
   const [clients, setClients] = useState<ConnectedClient[]>([]);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [trusted, setTrusted] = useState<string[]>([]);

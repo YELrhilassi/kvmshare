@@ -98,6 +98,8 @@ export interface Peer {
   addr: string;
   port: number;
   source: string;
+  /** The peer's advertised role is actually running there (a GUI up but idle shows inactive). */
+  active: boolean;
 }
 
 export interface LogSettings {
@@ -147,6 +149,8 @@ export interface LiveSnapshot {
   clients: ConnectedClient[];
   /** Machine ids this machine trusts (config ids on a server, trusted-server ids on a client). */
   trusted: string[];
+  /** Machine ids this machine refuses (revoked wins over trusted). */
+  revoked: string[];
 }
 
 /** The Wails event object delivered to `Events.On` callbacks. */

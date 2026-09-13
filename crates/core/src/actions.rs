@@ -54,9 +54,13 @@ pub enum UserAction {
 /// modifier keys arrive here as the same HID usages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Mods {
+    #[serde(default)]
     pub ctrl: bool,
+    #[serde(default)]
     pub alt: bool,
+    #[serde(default)]
     pub shift: bool,
+    #[serde(default)]
     pub meta: bool,
 }
 
@@ -95,12 +99,45 @@ pub struct Binding {
     #[serde(default)]
     pub mods: Mods,
     /// Canonical HID usage id of the non-modifier key.
+    ///
+    /// Also accepts an *integral* float (`71.0`): the GUI round-trips
+    /// this file through JavaScript, where every number is an f64, and
+    /// a naive writer can emit `key = 71.0`. Strictly rejecting that
+    /// made serde drop the **entire** `[shortcuts]` section — every
+    /// binding silently vanished. A genuinely fractional value is
+    /// still an error.
+    #[serde(deserialize_with = "u32_or_integral_float")]
     pub key: u32,
     /// `switch` (needs `screen`) | `cycle` | `lock` | `home`
     pub action: String,
     /// Target screen name for `switch` (ignored otherwise).
     #[serde(default)]
     pub screen: String,
+}
+
+/// Deserialize a `u32` from any integral number encoding.
+fn u32_or_integral_float<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = u32;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an integer HID usage id (an integral float is accepted)")
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u32, E> {
+            u32::try_from(v).map_err(|_| serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<u32, E> {
+            u32::try_from(v).map_err(|_| serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self))
+        }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<u32, E> {
+            if v.is_finite() && v >= 0.0 && v.fract() == 0.0 && v <= f64::from(u32::MAX) {
+                Ok(v as u32)
+            } else {
+                Err(serde::de::Error::invalid_value(serde::de::Unexpected::Float(v), &self))
+            }
+        }
+    }
+    de.deserialize_u32(V)
 }
 
 /// The `[shortcuts]` config section.

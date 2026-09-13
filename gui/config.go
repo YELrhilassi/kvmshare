@@ -43,26 +43,74 @@ type Config struct {
 	Port    int      `json:"port"`
 	Screens []Screen `json:"screens"`
 	Network Network  `json:"network"`
-	// Sections the GUI does not edit directly but must preserve across
-	// saves (dropping them would silently reset the user's shortcuts
-	// and input feel every time the layout was saved). They travel as
-	// parsed key/value maps so the frontend can display them; the Rust
-	// server owns their schema and re-validates on load.
-	Shortcuts map[string]any `json:"shortcuts,omitempty"`
-	Input     map[string]any `json:"input,omitempty"`
+	// Sections the GUI does not invent but edits precisely: their on-disk
+	// shape is owned by the Rust server, so these are typed structs with
+	// tags matching its schema exactly. They used to travel as generic
+	// key/value maps — through JavaScript every number became a float64,
+	// so the file gained `key = 71.0` and camelCase input names, and the
+	// Rust server rejected the whole sections. Bindings then silently
+	// never registered.
+	Shortcuts *ShortcutSection `json:"shortcuts,omitempty"`
+	Input     *InputSection    `json:"input,omitempty"`
+}
+
+// ShortcutSection is the `[shortcuts]` TOML section (schema owned by
+// kvmshare_core::actions::BindSection).
+type ShortcutSection struct {
+	Enabled  bool              `json:"enabled" toml:"enabled"`
+	Bindings []ShortcutBinding `json:"bindings" toml:"bindings"`
+}
+
+// ShortcutBinding is one chord → action entry.
+type ShortcutBinding struct {
+	Mods   ShortcutMods `json:"mods" toml:"mods"`
+	Key    uint32       `json:"key" toml:"key"`
+	Action string       `json:"action" toml:"action"`
+	Screen string       `json:"screen,omitempty" toml:"screen,omitempty"`
+}
+
+// ShortcutMods is the modifier set of a chord.
+type ShortcutMods struct {
+	Ctrl  bool `json:"ctrl" toml:"ctrl"`
+	Alt   bool `json:"alt" toml:"alt"`
+	Shift bool `json:"shift" toml:"shift"`
+	Meta  bool `json:"meta" toml:"meta"`
+}
+
+// InputSection is the `[input]` feel section. The file uses the Rust
+// server's snake_case names; the frontend JSON uses camelCase.
+type InputSection struct {
+	PointerSpeed float64 `json:"pointerSpeed" toml:"-"`
+	WheelSpeed   float64 `json:"wheelSpeed" toml:"-"`
+	SwapScroll   bool    `json:"swapScroll" toml:"-"`
 }
 
 // configFile is the on-disk TOML shape. Kept separate from the JSON shape
-// so the two formats can evolve independently. The [shortcuts] and
-// [input] sections use generic key/value maps: the Rust server owns
-// their schema and validates on load, so the Go side must only carry
-// them faithfully, not understand them.
+// so the two formats can evolve independently.
 type configFile struct {
-	Port      int            `toml:"port"`
-	Screens   []screenFile   `toml:"screens"`
-	Network   networkFile    `toml:"network"`
-	Shortcuts map[string]any `toml:"shortcuts,omitempty"`
-	Input     map[string]any `toml:"input,omitempty"`
+	Port      int              `toml:"port"`
+	Screens   []screenFile     `toml:"screens"`
+	Network   networkFile      `toml:"network"`
+	Shortcuts *ShortcutSection `toml:"shortcuts,omitempty"`
+	Input     *inputFile       `toml:"input,omitempty"`
+}
+
+// inputFile is the on-disk `[input]` shape: snake_case, as the Rust
+// server's serde schema writes and reads it.
+type inputFile struct {
+	PointerSpeed float64 `toml:"pointer_speed"`
+	WheelSpeed   float64 `toml:"wheel_speed"`
+	SwapScroll   bool    `toml:"swap_scroll"`
+}
+
+// jsonInput converts the file shape to the frontend shape.
+func (f *inputFile) jsonInput() *InputSection {
+	return &InputSection{PointerSpeed: f.PointerSpeed, WheelSpeed: f.WheelSpeed, SwapScroll: f.SwapScroll}
+}
+
+// fileInput converts the frontend shape to the file shape.
+func (s *InputSection) fileInput() *inputFile {
+	return &inputFile{PointerSpeed: s.PointerSpeed, WheelSpeed: s.WheelSpeed, SwapScroll: s.SwapScroll}
 }
 
 type networkFile struct {
@@ -94,7 +142,19 @@ func (a *App) LoadConfig() (Config, error) {
 
 	var cf configFile
 	if err := toml.Unmarshal(raw, &cf); err != nil {
-		return Config{}, fmt.Errorf("parse config %s: %w", a.configPath, err)
+		// Older GUI releases wrote integral numbers as floats (`key =
+		// 71.0`) — JavaScript's only number type leaking into the file —
+		// which strict decoding rejects. Heal the file once instead of
+		// leaving the user with a page that can never load.
+		healed, herr := healConfigText(raw)
+		if herr != nil {
+			return Config{}, fmt.Errorf("parse config %s: %w", a.configPath, err)
+		}
+		if err := toml.Unmarshal(healed, &cf); err != nil {
+			return Config{}, fmt.Errorf("parse config %s: %w", a.configPath, err)
+		}
+		// Persist the healed shape so the next start parses strictly.
+		_ = fileutil.Write(a.configPath, healed, 0o644)
 	}
 	if cf.Port == 0 {
 		cf.Port = defaultPort // the Rust server applies the same default
@@ -116,8 +176,12 @@ func (a *App) LoadConfig() (Config, error) {
 		TrustedIDs: nonNilStrings(cf.Network.TrustedIDs),
 		RevokedIDs: nonNilStrings(cf.Network.RevokedIDs),
 	}
-	cfg.Shortcuts = cf.Shortcuts
-	cfg.Input = cf.Input
+	if cf.Shortcuts != nil {
+		cfg.Shortcuts = cf.Shortcuts
+	}
+	if cf.Input != nil {
+		cfg.Input = cf.Input.jsonInput()
+	}
 	// Old configs have no [network] section; default to secure.
 	if !cf.Network.Allowlist && !cf.Network.LocalOnly && len(cf.Network.TrustedIDs) == 0 {
 		cfg.Network.Allowlist = true
@@ -197,7 +261,10 @@ func (a *App) SaveConfig(cfg Config) error {
 			RevokedIDs: cfg.Network.RevokedIDs,
 		},
 		Shortcuts: cfg.Shortcuts,
-		Input:     cfg.Input,
+		Input:     nil,
+	}
+	if cfg.Input != nil {
+		cf.Input = cfg.Input.fileInput()
 	}
 	for _, s := range cfg.Screens {
 		cf.Screens = append(cf.Screens, screenFile{
@@ -209,7 +276,6 @@ func (a *App) SaveConfig(cfg Config) error {
 			Scale:  1.0,
 		})
 	}
-
 	raw, err := toml.Marshal(cf)
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)

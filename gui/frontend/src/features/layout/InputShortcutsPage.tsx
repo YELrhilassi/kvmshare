@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type InputSection, type ShortcutSection, type Binding } from "@/lib/bridge";
+import { api, type LayoutConfig, type Binding } from "@/lib/bridge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
@@ -34,10 +34,6 @@ const ACTIONS: { value: string; label: string; hint: string }[] = [
   { value: "lock", label: "Toggle wall lock", hint: "Freeze or release the screen edges" },
   { value: "home", label: "Go home", hint: "Return control to this machine" },
 ];
-
-function bindingToChord(b: Binding): Chord {
-  return { ctrl: b.mods.ctrl, alt: b.mods.alt, shift: b.mods.shift, meta: b.mods.meta, key: b.key };
-}
 
 function chordMatches(a: Chord, b: Chord): boolean {
   return a.key === b.key && a.ctrl === b.ctrl && a.alt === b.alt && a.shift === b.shift && a.meta === b.meta;
@@ -86,19 +82,17 @@ function BindingRow({
 }
 
 /** The live recorder panel: chips light up as modifiers are held. */
-function RecorderPanel({ live }: { live: Chord }) {
-  const mods = modLabels(live);
+function RecorderPanel({ live }: { live: { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean } }) {
+  const on = (m: string) =>
+    (m === "Ctrl" && live.ctrl) || (m === "Alt" && live.alt) || (m === "Shift" && live.shift) || (m === "Super" && live.meta);
   return (
     <div className="mt-3 rounded-lg border border-dashed border-primary/50 bg-primary/5 px-3 py-3">
       <div className="flex items-center gap-1.5">
-        {["Ctrl", "Alt", "Shift", "Super"].map((m) => {
-          const on = mods.includes(m);
-          return (
-            <Kbd key={m} dim={!on}>
-              {m}
-            </Kbd>
-          );
-        })}
+        {["Ctrl", "Alt", "Shift", "Super"].map((m) => (
+          <Kbd key={m} dim={!on(m)}>
+            {m}
+          </Kbd>
+        ))}
         <span className="mx-1 text-muted-foreground/40">+</span>
         <Kbd dim>key…</Kbd>
       </div>
@@ -110,13 +104,12 @@ function RecorderPanel({ live }: { live: Chord }) {
 }
 
 export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }) {
-  const [config, setConfig] = useState<{ shortcuts?: ShortcutSection; input?: InputSection } | null>(null);
+  const [config, setConfig] = useState<LayoutConfig | null>(null);
   const [loadErr, setLoadErr] = useState("");
   const [err, setErr] = useState("");
   const [saved, setSaved] = useState(false);
   const [recording, setRecording] = useState(false);
   const [pendingAction, setPendingAction] = useState<{ action: string; screen: string } | null>(null);
-  const [live, setLive] = useState<Chord>({ ctrl: false, alt: false, shift: false, meta: false, key: 0 });
 
   const load = async () => {
     setLoadErr("");
@@ -130,7 +123,7 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
     void load();
   }, []);
 
-  const save = async (patch: { shortcuts?: ShortcutSection; input?: InputSection }) => {
+  const save = async (patch: Partial<Pick<LayoutConfig, "shortcuts" | "input">>) => {
     if (!config) return;
     setErr("");
     try {
@@ -145,10 +138,12 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
     }
   };
 
-  useChordRecorder(
+  // The recorder's live modifier state is the source of truth for the
+  // chips — a local copy here lagged a render behind and the "live"
+  // display never actually moved.
+  const { live } = useChordRecorder(
     recording,
     (chord) => {
-      setLive({ ...chord, key: 0 });
       setRecording(false);
       if (pendingAction && config) {
         const binding: Binding = {
