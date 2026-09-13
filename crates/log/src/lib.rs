@@ -151,8 +151,7 @@ fn sink() -> Option<mpsc::SyncSender<String>> {
     // KiB worst case, and a full queue drops the newest line rather
     // than growing memory (see [`SINK`]).
     let (tx, rx) = mpsc::sync_channel(4_096);
-    match SINK.set(tx.clone()) {
-        Ok(()) => {
+    if let Ok(()) = SINK.set(tx.clone()) {
             std::thread::Builder::new()
                 .name("kvmshare-log-writer".into())
                 .spawn(move || {
@@ -166,10 +165,9 @@ fn sink() -> Option<mpsc::SyncSender<String>> {
                     }
                 })
                 .ok();
-        }
-        // Another thread won the race and installed its own channel.
-        Err(_) => {}
     }
+    // Another thread won the race and installed its own channel: the
+    // clone above still feeds it, so both callers keep logging.
     Some(tx)
 }
 
@@ -186,7 +184,7 @@ pub fn write_line(lvl: Level, args: std::fmt::Arguments<'_>) {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let ms = dur.as_millis();
-    let (h, m, s) = ((ms / 3600_000) % 24, (ms / 60_000) % 60, (ms / 1000) % 60);
+    let (h, m, s) = ((ms / 3_600_000) % 24, (ms / 60_000) % 60, (ms / 1000) % 60);
     let ms = ms % 1000;
     let component = COMPONENT.get().map(String::as_str).unwrap_or("kvmshare");
     let line = format!("{h:02}:{m:02}:{s:02}.{ms:03} {} {component}: {}", lvl.label(), args);

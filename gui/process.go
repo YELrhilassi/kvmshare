@@ -14,31 +14,48 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"kvmshare/gui/internal/selfupdate"
 )
 
 // verifyBinary refuses to spawn a binary that is not part of a
-// consistent install (see selfupdate/manifest.go): the dir the binary
-// lives in must carry a manifest and the binary must match it. A
-// manifest-less dir (old install) fails closed with a reinstall
-// message — the mixed-version cursor bugs this prevents are far more
-// expensive than one forced reinstall. KVMSHARE_SKIP_MANIFEST=1 is the
-// dev escape hatch for hand-built binaries (make install still writes
-// a manifest; a bare cargo build + copy does not).
+// consistent install (see selfupdate/manifest.go and buildid.go): the
+// dir the binary lives in must carry a manifest and the binary must
+// match it — **unless the binaries themselves vouch otherwise**. Every
+// role binary stamps a build id, so a mismatch between the binaries
+// and a stale manifest (a deploy that replaced files without rewriting
+// the sidecar — the exact bug that once blocked every launch) is
+// detected and *repaired* when the binaries still agree with each
+// other; only a genuinely mixed set fails closed. A manifest-less dir
+// (an ancient install) gets the same repair-or-refuse treatment.
+// KVMSHARE_SKIP_MANIFEST=1 is the dev escape hatch for hand-built
+// binaries (make install still writes a manifest; a bare cargo build
+// + copy does not).
 func (a *App) verifyBinary(path string) error {
 	if os.Getenv("KVMSHARE_SKIP_MANIFEST") == "1" {
 		return nil
 	}
 	dir := filepath.Dir(path)
-	if err := selfupdate.VerifyBinaries(dir); err != nil {
-		if errors.Is(err, selfupdate.ErrNoManifest) {
-			return fmt.Errorf("%s has no %s — reinstall kvmshare (kvmshare-install --local or make install) so all binaries are from one build", dir, selfupdate.ManifestName)
-		}
-		return err
+	err := selfupdate.VerifyBinaries(dir)
+	if err == nil {
+		return nil
 	}
-	return nil
+	// Stale manifest or no manifest: the binaries are the truth. When
+	// they were built together, rewrite the manifest from them and go.
+	if errors.Is(err, selfupdate.ErrNoManifest) || strings.Contains(err.Error(), "does not match the install manifest") || strings.Contains(err.Error(), "is missing (manifest lists it)") {
+		if selfupdate.BuildsConsistent(dir) {
+			if rErr := selfupdate.RepairManifest(dir); rErr != nil {
+				return fmt.Errorf("install manifest is stale and could not be repaired (%v): %w", rErr, err)
+			}
+			return nil
+		}
+		// Mixed set: name the ids so the message says *which* binary is
+		// the odd one out instead of a generic reinstall demand.
+		return fmt.Errorf("the kvmshare binaries in %s are from different builds — reinstall (server/client/GUI report different build ids; run each with --version to compare)", dir)
+	}
+	return err
 }
 
 // proc wraps a managed child process with a reaper goroutine.

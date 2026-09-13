@@ -2,8 +2,9 @@
 Type=Application
 Name=kvmshare
 GenericName=KVM sharer
-Comment=Share keyboard, mouse and clipboard across machines
+Comment=Share one keyboard and mouse across your machines
 Exec=kvmshare-gui
 Terminal=false
 Categories=Utility;Network;
 Keywords=KVM;Synergy;Barrier;Deskflow;mouse;keyboard;share;
+Icon=kvmshare

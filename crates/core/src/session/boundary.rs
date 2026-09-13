@@ -140,7 +140,7 @@ pub fn pulls_inward(dir: Direction, dx: i32, dy: i32) -> bool {
 pub(super) fn wall_bits(rect: &Rect, x: i32, y: i32) -> u8 {
     let mut bits = 0;
     if rect.w > 2 * EDGE_BAND {
-        if x <= EDGE_BAND - 1 {
+        if x < EDGE_BAND {
             bits |= BIT_LEFT;
         }
         if x >= rect.w - EDGE_BAND {
@@ -148,7 +148,7 @@ pub(super) fn wall_bits(rect: &Rect, x: i32, y: i32) -> u8 {
         }
     }
     if rect.h > 2 * EDGE_BAND {
-        if y <= EDGE_BAND - 1 {
+        if y < EDGE_BAND {
             bits |= BIT_TOP;
         }
         if y >= rect.h - EDGE_BAND {

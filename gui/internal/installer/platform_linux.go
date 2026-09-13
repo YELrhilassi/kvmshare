@@ -35,7 +35,9 @@ package installer
 // and reports it clearly.
 
 import (
+	_ "embed"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -45,6 +47,12 @@ import (
 	"syscall"
 	"time"
 )
+
+// The GUI's icon, embedded so the launcher integration never depends on
+// a packaged png being present (old archives, portable installs).
+//
+//go:embed assets/icon.png
+var embeddedIconPNG []byte
 
 const rulePath = "/etc/udev/rules.d/99-kvmshare-input.rules"
 const uinputNode = "/dev/uinput"
@@ -97,11 +105,141 @@ func elevatingUser() (*user.User, error) {
 	return user.LookupId(strconv.Itoa(os.Getuid()))
 }
 
-// integrateDesktop runs after a successful install: grant input access.
-// Failure is a warning, never an install failure — without the rule the
-// software still works, only raw-event leaks to raw-reading apps remain.
+// integrateDesktop runs after a successful install: grant input access
+// and write the launcher (a freedesktop .desktop entry pointing at the
+// installed GUI, plus the icon the entry names). Failure is a warning,
+// never an install failure — without the rule the software still works,
+// only raw-event leaks to raw-reading apps remain; without the entry
+// the launcher shows nothing, which reads as "the install did nothing".
 func integrateDesktop(dir string) error {
-	return EnsureInputAccess()
+	if err := EnsureInputAccess(); err != nil {
+		return err
+	}
+	return writeDesktopEntry(dir)
+}
+
+// desktopDirs are the per-user freedesktop locations the entry and icon
+// go to. XDG_DATA_HOME is honored when set (that is the standard's own
+// resolution), with the conventional ~/.local/share fallback.
+func desktopDirs() (appsDir, iconsDir string, err error) {
+	base := os.Getenv("XDG_DATA_HOME")
+	if base == "" {
+		home, e := os.UserHomeDir()
+		if e != nil {
+			return "", "", e
+		}
+		base = filepath.Join(home, ".local", "share")
+	}
+	appsDir = filepath.Join(base, "applications")
+	iconsDir = filepath.Join(base, "icons", "hicolor", "256x256", "apps")
+	return appsDir, iconsDir, nil
+}
+
+// writeDesktopEntry installs the launcher for the binaries in `dir`:
+// the packaged .desktop file (carried next to the binaries by the
+// release archive) copied into the user's applications dir, and the
+// icon the entry references (Icon=kvmshare) into the hicolor theme.
+// Both per-user: no privileges needed, and `make install` produces the
+// same layout so a launcher-launched GUI is identical however it was
+// installed. A missing packaged entry (an old archive) is generated
+// from the same content so the launcher exists either way.
+func writeDesktopEntry(dir string) error {
+	appsDir, iconsDir, err := desktopDirs()
+	if err != nil {
+		return fmt.Errorf("resolve XDG data dirs: %w", err)
+	}
+	for _, d := range []string{appsDir, iconsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", d, err)
+		}
+	}
+	// Icon: prefer the packaged png, else the GUI's embedded asset.
+	png := filepath.Join(dir, "kvmshare.png")
+	if _, err := os.Stat(png); err != nil {
+		png = ""
+	}
+	if png == "" {
+		if asset, ok := embeddedIconPath(); ok {
+			png = asset
+		}
+	}
+	if png != "" {
+		if err := copyFileMode(png, filepath.Join(iconsDir, "kvmshare.png")); err != nil {
+			return fmt.Errorf("install icon: %w", err)
+		}
+	}
+	entry := filepath.Join(appsDir, "kvmshare.desktop")
+	if packaged := filepath.Join(dir, "kvmshare.desktop"); fileExists(packaged) {
+		return copyFile(packaged, entry)
+	}
+	// Generate the same entry the package ships (an old archive that
+	// predates packaging/ still gets a working launcher).
+	const tpl = `[Desktop Entry]
+Type=Application
+Name=kvmshare
+GenericName=KVM sharer
+Comment=Share one keyboard and mouse across your machines
+Exec=%s
+Terminal=false
+Categories=Utility;Network;
+Keywords=KVM;Synergy;Barrier;Deskflow;mouse;keyboard;share;
+Icon=kvmshare
+`
+	exec := filepath.Join(dir, "kvmshare-gui")
+	content := fmt.Sprintf(tpl, exec)
+	if err := os.WriteFile(entry, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", entry, err)
+	}
+	return nil
+}
+
+// fileExists is the tiny predicate the packaged-entry check uses.
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// embeddedIconPath extracts the GUI's bundled icon to the state dir so
+// an install without a packaged png still lands a launcher icon. Best
+// effort: ok=false simply means "no icon this run".
+func embeddedIconPath() (string, bool) {
+	state := os.Getenv("XDG_STATE_HOME")
+	if state == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", false
+		}
+		state = filepath.Join(home, ".local", "state")
+	}
+	dir := filepath.Join(state, "kvmshare", "icons")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", false
+	}
+	p := filepath.Join(dir, "kvmshare.png")
+	if err := os.WriteFile(p, embeddedIconPNG, 0o644); err != nil {
+		return "", false
+	}
+	return p, true
+}
+
+// copyFile is the small helper the entry and icon installs share (the
+// installer package already has one for staging --local sources; this
+// variant preserves the source mode instead of forcing 0755).
+func copyFileMode(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return nil
 }
 
 // IsElevated reports whether this process can write privileged system
@@ -233,8 +371,14 @@ func inputAccessGranted() bool {
 	return true
 }
 
-// removeDesktopIntegration undoes integrateDesktop (used by --uninstall).
+// removeDesktopIntegration undoes integrateDesktop (used by --uninstall):
+// the udev rule (when privileged) and the launcher entry + icon (always
+// — they are the user's own files).
 func removeDesktopIntegration(dir string) error {
+	if appsDir, iconsDir, err := desktopDirs(); err == nil {
+		_ = os.Remove(filepath.Join(appsDir, "kvmshare.desktop"))
+		_ = os.Remove(filepath.Join(iconsDir, "kvmshare.png"))
+	}
 	if os.Geteuid() != 0 {
 		// Best-effort without elevation: leave the rule (harmless) but
 		// report nothing — uninstall of the user's files already worked.

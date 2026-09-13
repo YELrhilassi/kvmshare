@@ -5,100 +5,153 @@ import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import { Section } from "@/components/Section";
 import { PageSkeleton } from "@/components/PageSkeleton";
-import {
-  useChordRecorder,
-  keyName,
-  modLabels,
-  Kbd,
-  type Chord,
-} from "./ChordRecorder";
+import { Repeat, Lock, Home, Monitor, Mouse, Keyboard } from "lucide-react";
+import { useChordRecorder, keyName, modLabels, Kbd, type Chord } from "./ChordRecorder";
 import { cn } from "@/lib/utils";
 
 // Input & shortcuts: the sub-page of Layout that configures *how input
 // behaves* rather than where screens sit. Three concerns, clearly
 // separated:
 //
-// * Shortcuts — chords (modifier set + key) bound to actions. Recorded
-//   as canonical HID key ids, so a binding means the same physical key
-//   on every platform pair, and a bound chord **overrides** whatever
-//   the OS would do with it (Win+Tab, media keys): the capture layer
-//   swallows it before the desktop reacts.
+// * Shortcuts — one card per action. A card shows the chord currently
+//   bound to it as key chips; "record" captures a replacement live in
+//   the card itself (chips light up as modifiers are held). No mode
+//   dropdown, no separate registry: the action *is* the registry entry.
+//   Bindings are recorded as canonical HID key ids, so a binding means
+//   the same physical key on every platform pair, and a bound chord
+//   **overrides** whatever the OS would do with it (Win+Tab, media
+//   keys): the capture layer swallows it before the desktop reacts.
 // * Mouse — pointer speed, wheel speed, natural scrolling. Portable
 //   transforms on the shared stream, applied identically for every
 //   client.
 // * Keyboard — forwarded by physical identity; only the bound chords
 //   above are intercepted.
 
-const ACTIONS: { value: string; label: string; hint: string }[] = [
-  { value: "cycle", label: "Cycle screens", hint: "Move to the next reachable machine" },
-  { value: "lock", label: "Toggle wall lock", hint: "Freeze or release the screen edges" },
-  { value: "home", label: "Go home", hint: "Return control to this machine" },
+interface ActionSpec {
+  /** Config action id: "cycle" | "lock" | "home" | "switch:<screen>". */
+  id: string;
+  title: string;
+  hint: string;
+  icon: typeof Repeat;
+}
+
+const BASE_ACTIONS: ActionSpec[] = [
+  { id: "cycle", title: "Cycle screens", hint: "Move control to the next machine in the layout", icon: Repeat },
+  { id: "lock", title: "Toggle wall lock", hint: "Freeze or release the screen edges", icon: Lock },
+  { id: "home", title: "Go home", hint: "Return control to this machine immediately", icon: Home },
 ];
 
-function chordMatches(a: Chord, b: Chord): boolean {
-  return a.key === b.key && a.ctrl === b.ctrl && a.alt === b.alt && a.shift === b.shift && a.meta === b.meta;
+/** Every configured screen gets a "switch to it" card, after the base actions. */
+function switchActions(screens: { name: string }[]): ActionSpec[] {
+  return screens
+    .filter((s) => s.name)
+    .map((s) => ({
+      id: `switch:${s.name}`,
+      title: `Switch to ${s.name}`,
+      hint: "Jump control straight to this machine",
+      icon: Monitor,
+    }));
 }
 
-function chordEqualsMods(c: Chord, mods: Binding["mods"], key: number): boolean {
-  return chordMatches(c, { ctrl: mods.ctrl, alt: mods.alt, shift: mods.shift, meta: mods.meta, key });
+function chordSig(b: { mods: Binding["mods"]; key: number }): string {
+  return `${b.mods.ctrl}|${b.mods.alt}|${b.mods.shift}|${b.mods.meta}|${b.key}`;
 }
 
-/** The chord registry row: kbd chips for the chord, action, remove. */
-function BindingRow({
+function chordLabel(b: { mods: Binding["mods"]; key: number }): string {
+  return [...modLabels(b.mods), keyName(b.key)].join(" + ");
+}
+
+/** One action card: identity, its chord (or unbound), record/clear. */
+function ActionCard({
+  spec,
   binding,
-  duplicate,
-  onRemove,
+  recording,
+  live,
+  disabled,
+  onRecord,
+  onCancelRecord,
+  onClear,
 }: {
-  binding: Binding;
-  duplicate: boolean;
-  onRemove: () => void;
+  spec: ActionSpec;
+  binding?: Binding;
+  recording: boolean;
+  live: { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean };
+  disabled: boolean;
+  onRecord: () => void;
+  onCancelRecord: () => void;
+  onClear: () => void;
 }) {
-  const mods = modLabels(binding.mods);
-  return (
-    <li className="flex items-center gap-3 rounded-lg border border-border/50 bg-card/40 px-3 py-2">
-      <span className="flex items-center gap-1">
-        {mods.map((m) => (
-          <Kbd key={m}>{m}</Kbd>
-        ))}
-        <Kbd>{keyName(binding.key)}</Kbd>
-      </span>
-      <span className="flex-1 truncate text-xs text-muted-foreground">
-        {binding.action === "switch" ? `Switch to ${binding.screen || "?"}` : binding.action}
-      </span>
-      {duplicate && (
-        <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
-          duplicate
-        </span>
-      )}
-      <button
-        className="text-muted-foreground/50 hover:text-destructive"
-        onClick={onRemove}
-        aria-label="remove shortcut"
-      >
-        ×
-      </button>
-    </li>
-  );
-}
-
-/** The live recorder panel: chips light up as modifiers are held. */
-function RecorderPanel({ live }: { live: { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean } }) {
-  const on = (m: string) =>
+  const Icon = spec.icon;
+  const lit = (m: string) =>
     (m === "Ctrl" && live.ctrl) || (m === "Alt" && live.alt) || (m === "Shift" && live.shift) || (m === "Super" && live.meta);
   return (
-    <div className="mt-3 rounded-lg border border-dashed border-primary/50 bg-primary/5 px-3 py-3">
-      <div className="flex items-center gap-1.5">
-        {["Ctrl", "Alt", "Shift", "Super"].map((m) => (
-          <Kbd key={m} dim={!on(m)}>
-            {m}
-          </Kbd>
-        ))}
-        <span className="mx-1 text-muted-foreground/40">+</span>
-        <Kbd dim>key…</Kbd>
+    <div
+      className={cn(
+        "rounded-xl border bg-card/40 p-4 transition-colors",
+        recording ? "border-primary" : "border-border/60",
+        disabled && "opacity-50",
+      )}
+    >
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-muted/40 text-muted-foreground">
+          <Icon className="h-4 w-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium">{spec.title}</div>
+          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{spec.hint}</p>
+        </div>
       </div>
-      <p className="mt-2 text-[11px] text-primary/80">
-        Hold modifiers, then tap the key. The chord overrides OS shortcuts (Win+Tab, media keys). Esc cancels.
-      </p>
+
+      <div className="mt-3 border-t border-border/40 pt-3">
+        {recording ? (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {["Ctrl", "Alt", "Shift", "Super"].map((m) => (
+              <Kbd key={m} dim={!lit(m)}>
+                {m}
+              </Kbd>
+            ))}
+            <span className="mx-0.5 text-muted-foreground/40">+</span>
+            <Kbd dim>key…</Kbd>
+            <button
+              className="ml-auto text-xs text-muted-foreground hover:text-foreground"
+              onClick={onCancelRecord}
+            >
+              cancel
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            {binding ? (
+              <>
+                <span className="flex items-center gap-1">
+                  {modLabels(binding.mods).map((m) => (
+                    <Kbd key={m}>{m}</Kbd>
+                  ))}
+                  <Kbd>{keyName(binding.key)}</Kbd>
+                </span>
+                <button
+                  className="ml-1 text-muted-foreground/40 hover:text-destructive"
+                  onClick={onClear}
+                  aria-label={`clear ${spec.title} shortcut`}
+                >
+                  ×
+                </button>
+              </>
+            ) : (
+              <span className="text-xs text-muted-foreground/50">Unbound</span>
+            )}
+            <Button
+              size="sm"
+              variant="outline"
+              className="ml-auto h-7 px-2.5 text-xs"
+              disabled={disabled}
+              onClick={onRecord}
+            >
+              {binding ? "Replace" : "Record"}
+            </Button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -108,8 +161,8 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
   const [loadErr, setLoadErr] = useState("");
   const [err, setErr] = useState("");
   const [saved, setSaved] = useState(false);
-  const [recording, setRecording] = useState(false);
-  const [pendingAction, setPendingAction] = useState<{ action: string; screen: string } | null>(null);
+  // Which action card is recording (its ActionSpec.id), or null.
+  const [recordingFor, setRecordingFor] = useState<string | null>(null);
 
   const load = async () => {
     setLoadErr("");
@@ -138,47 +191,52 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
     }
   };
 
-  // The recorder's live modifier state is the source of truth for the
-  // chips — a local copy here lagged a render behind and the "live"
-  // display never actually moved.
+  const screens = config?.screens ?? [];
+  const actions = [...BASE_ACTIONS, ...switchActions(screens)];
+  const shortcuts = config?.shortcuts ?? { enabled: true, bindings: [] };
+  const bindings = shortcuts.bindings ?? [];
+
+  // The recorder is active while any card records. Its callbacks close
+  // over the latest render's state, so `recordingFor` is current here.
   const { live } = useChordRecorder(
-    recording,
-    (chord) => {
-      setRecording(false);
-      if (pendingAction && config) {
-        const binding: Binding = {
-          mods: { ctrl: chord.ctrl, alt: chord.alt, shift: chord.shift, meta: chord.meta },
-          key: chord.key,
-          action: pendingAction.action,
-          screen: pendingAction.screen,
-        };
-        const shortcuts = config.shortcuts ?? { enabled: true, bindings: [] };
-        // A chord already bound (or the bare escape key, always
-        // reserved) is refused with a message instead of silently
-        // creating a dead or conflicting entry.
-        if (chord.key === 0x29) {
-          setErr("Esc is reserved for returning home — pick another key.");
-          setPendingAction(null);
-          return;
-        }
-        if (shortcuts.bindings.some((b) => chordEqualsMods(chord, b.mods, b.key))) {
-          setErr(`${[...modLabels(binding.mods), keyName(binding.key)].join(" + ")} is already bound.`);
-          setPendingAction(null);
-          return;
-        }
-        void save({ shortcuts: { ...shortcuts, bindings: [...shortcuts.bindings, binding] } });
+    recordingFor !== null,
+    (chord: Chord) => {
+      const action = recordingFor;
+      setRecordingFor(null);
+      if (!action || !config) return;
+      // Esc is reserved for returning home (and the recorder also
+      // treats it as cancel — this is the belt-and-braces guard).
+      if (chord.key === 0x29) {
+        setErr("Esc is reserved for returning home — pick another key.");
+        return;
       }
-      setPendingAction(null);
+      // Refuse a chord another action already holds: two actions on one
+      // key can both fire, and which one wins would be a mystery.
+      const clash = bindings.find(
+        (b) => chordSig(b) === chordSig({ mods: { ctrl: chord.ctrl, alt: chord.alt, shift: chord.shift, meta: chord.meta }, key: chord.key }) &&
+          actionIdOf(b) !== action,
+      );
+      if (clash) {
+        setErr(`${chordLabel(clash)} is already bound to "${titleOf(clash, actions)}" — clear it first.`);
+        return;
+      }
+      const sep = action.indexOf(":");
+      const binding: Binding = {
+        mods: { ctrl: chord.ctrl, alt: chord.alt, shift: chord.shift, meta: chord.meta },
+        key: chord.key,
+        action: sep === -1 ? action : action.slice(0, sep),
+        screen: sep === -1 ? "" : action.slice(sep + 1),
+      };
+      // One chord per action: recording replaces whatever the card held.
+      const rest = bindings.filter((b) => actionIdOf(b) !== action);
+      void save({ shortcuts: { ...shortcuts, bindings: [...rest, binding] } });
     },
-    () => {
-      setRecording(false);
-      setPendingAction(null);
-    },
+    () => setRecordingFor(null),
   );
 
   if (loadErr) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-8 py-8">
+      <div className="mx-auto w-full max-w-3xl px-8 py-8">
         <h1 className="text-lg font-semibold tracking-tight">Input &amp; shortcuts</h1>
         <p className="mt-4 text-sm text-destructive">Could not load: {loadErr}</p>
         <Button className="mt-3" variant="outline" onClick={() => void load()}>Retry</Button>
@@ -187,113 +245,81 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
   }
   if (!config) return <PageSkeleton rows={3} />;
 
-  const bindings = config.shortcuts?.bindings ?? [];
   const input = config.input ?? { pointerSpeed: 1, wheelSpeed: 1, swapScroll: false };
-  const screens = config.screens ?? [];
 
-  const duplicates = new Set(
-    bindings
-      .map((b, i) => ({ sig: `${b.mods.ctrl}|${b.mods.alt}|${b.mods.shift}|${b.mods.meta}|${b.key}`, i }))
-      .filter((x, _, all) => all.filter((y) => y.sig === x.sig).length > 1)
-      .map((x) => x.i),
-  );
+  const bindingFor = (id: string) =>
+    bindings.find((b) => actionIdOf(b) === id);
 
-  const removeBinding = (i: number) => {
-    save({ shortcuts: { ...(config.shortcuts ?? { enabled: true }), bindings: bindings.filter((_, j) => j !== i) } });
+  const clearBinding = (id: string) => {
+    const sep = id.indexOf(":");
+    void save({
+      shortcuts: {
+        ...shortcuts,
+        bindings: bindings.filter(
+          (b) => !(b.action === (sep === -1 ? id : id.slice(0, sep)) && (sep === -1 || (b.screen ?? "") === id.slice(sep + 1))),
+        ),
+      },
+    });
   };
 
   return (
-    <div className="mx-auto w-full max-w-2xl px-8 py-8">
+    <div className="mx-auto w-full max-w-3xl px-8 py-8">
       <h1 className="text-lg font-semibold tracking-tight">Input &amp; shortcuts</h1>
       <p className="mt-1 text-sm text-muted-foreground">
-        How the shared keyboard and mouse behave, and the chords that switch screens without touching the mouse.
-        Bindings are recorded as physical keys, so they work the same on every machine.
+        How the shared keyboard and mouse behave — and the chords that switch screens without touching the mouse.
+        Bindings are recorded as physical keys, so they work the same on every machine, and a bound chord overrides
+        whatever the OS would do with it (Win+Tab, media keys).
       </p>
 
-      <Section title="Shortcuts" className="mt-8">
-        <div className="flex items-center justify-between gap-6 py-3">
-          <div>
-            <div className="text-sm">Shortcuts enabled</div>
-            <p className="text-xs text-muted-foreground">
-              When off, every key is forwarded to the controlled machine and no chord is intercepted.
-            </p>
+      <Section
+        title="Shortcuts"
+        className="mt-8"
+        action={
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">enabled</span>
+            <Switch
+              checked={shortcuts.enabled}
+              onCheckedChange={(v) => save({ shortcuts: { ...shortcuts, enabled: v } })}
+            />
           </div>
-          <Switch
-            checked={config.shortcuts?.enabled ?? true}
-            onCheckedChange={(v) => save({ shortcuts: { ...(config.shortcuts ?? { bindings: [] }), enabled: v } })}
-          />
+        }
+      >
+        <div className={cn("grid grid-cols-1 gap-3 sm:grid-cols-2", !shortcuts.enabled && "opacity-60")}>
+          {actions.map((spec) => (
+            <ActionCard
+              key={spec.id}
+              spec={spec}
+              binding={bindingFor(spec.id)}
+              recording={recordingFor === spec.id}
+              live={live}
+              disabled={!shortcuts.enabled}
+              onRecord={() => setRecordingFor(spec.id)}
+              onCancelRecord={() => setRecordingFor(null)}
+              onClear={() => clearBinding(spec.id)}
+            />
+          ))}
         </div>
-
-        <div className="border-t border-border/50 pt-3">
-          {bindings.length === 0 && (
-            <p className="text-xs text-muted-foreground/60">No custom shortcuts yet.</p>
-          )}
-          <ul className="space-y-1.5">
-            {bindings.map((b, i) => (
-              <BindingRow
-                key={i}
-                binding={b}
-                duplicate={duplicates.has(i)}
-                onRemove={() => removeBinding(i)}
-              />
-            ))}
-          </ul>
-          {recording ? (
-            <RecorderPanel live={live} />
-          ) : (
-            <div className="mt-3 flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setPendingAction((p) => p ?? { action: "cycle", screen: "" });
-                  setRecording(true);
-                }}
-              >
-                Add shortcut
-              </Button>
-              <select
-                className="h-8 rounded-md border border-border/70 bg-muted/40 px-2 text-xs text-foreground outline-none focus:border-primary"
-                value={
-                  pendingAction
-                    ? `${pendingAction.action}${pendingAction.screen ? `:${pendingAction.screen}` : ""}`
-                    : "cycle"
-                }
-                onChange={(e) => {
-                  const v = e.target.value;
-                  // "switch:<screen>" encodes a screen-targeted action.
-                  const sep = v.indexOf(":");
-                  setPendingAction(
-                    sep === -1
-                      ? { action: v, screen: "" }
-                      : { action: v.slice(0, sep), screen: v.slice(sep + 1) },
-                  );
-                }}
-                aria-label="Action for the next recorded shortcut"
-              >
-                {ACTIONS.map((a) => (
-                  <option key={a.value} value={a.value}>{a.label}</option>
-                ))}
-                <optgroup label="Switch to screen">
-                  {screens.filter((s) => s.name).map((s) => (
-                    <option key={s.name} value={`switch:${s.name}`}>{s.name}</option>
-                  ))}
-                </optgroup>
-              </select>
-            </div>
-          )}
-        </div>
+        {recordingFor !== null && (
+          <p className="mt-3 text-xs text-primary/80">
+            Hold modifiers, then tap the key. Esc cancels.
+          </p>
+        )}
       </Section>
 
       <Section title="Mouse" className="mt-6">
         <div className="py-3">
-          <div className="flex items-baseline justify-between">
-            <div className="text-sm">Pointer speed</div>
-            <span className="font-mono text-xs text-muted-foreground">{input.pointerSpeed.toFixed(2)}×</span>
+          <div className="flex items-center gap-2">
+            <Mouse className="h-3.5 w-3.5 text-muted-foreground" />
+            <div className="flex-1">
+              <div className="flex items-baseline justify-between">
+                <div className="text-sm">Pointer speed</div>
+                <span className="font-mono text-xs text-muted-foreground">{input.pointerSpeed.toFixed(2)}×</span>
+              </div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                How far the cursor travels on the controlled machine for the same hand movement. 1.00× mirrors this machine.
+              </p>
+            </div>
           </div>
-          <p className="text-xs text-muted-foreground">
-            How far the cursor travels on the controlled machine for the same hand movement. 1.00× mirrors this machine.
-          </p>
           <Slider
             className="mt-3"
             min={0.25}
@@ -332,11 +358,14 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
       </Section>
 
       <Section title="Keyboard" className="mt-6">
-        <p className="py-3 text-xs text-muted-foreground">
-          Keys are forwarded by their physical identity, so layout follows whichever machine is being controlled —
-          type as usual. Only the chords recorded above are intercepted (before the controlled machine — and this
-          machine's own shortcuts — see them); everything else passes through untouched.
-        </p>
+        <div className="flex items-start gap-2 py-3">
+          <Keyboard className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            Keys are forwarded by their physical identity, so layout follows whichever machine is being controlled —
+            type as usual. Only the chords recorded above are intercepted (before the controlled machine — and this
+            machine's own shortcuts — see them); everything else passes through untouched.
+          </p>
+        </div>
       </Section>
 
       {(err || saved) && (
@@ -344,4 +373,15 @@ export default function InputShortcutsPage({ onSaved }: { onSaved?: () => void }
       )}
     </div>
   );
+}
+
+/** The config action id of a binding, including its screen target ("switch:hp"). */
+function actionIdOf(b: Binding): string {
+  return b.action === "switch" && b.screen ? `switch:${b.screen}` : b.action;
+}
+
+/** Human title of a binding (used in the duplicate error). */
+function titleOf(b: Binding, actions: ActionSpec[]): string {
+  const id = actionIdOf(b);
+  return actions.find((a) => a.id === id)?.title ?? id;
 }

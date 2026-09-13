@@ -22,6 +22,7 @@
 PREFIX     ?= $(HOME)/.local
 BINDIR     ?= $(PREFIX)/bin
 APPS_DIR   ?= $(HOME)/.local/share/applications
+ICONS_DIR  ?= $(HOME)/.local/share/icons/hicolor/256x256/apps
 CONFIG_DIR ?= $(HOME)/.config/kvmshare
 
 CARGO ?= cargo
@@ -61,7 +62,7 @@ build:
 
 ## Build + install into $(BINDIR), plus sample config and launcher.
 install: build
-	mkdir -p $(BINDIR) $(CONFIG_DIR) $(APPS_DIR)
+	mkdir -p $(BINDIR) $(CONFIG_DIR) $(APPS_DIR) $(ICONS_DIR)
 	install -m755 $(SERVER_BIN) $(BINDIR)/kvmshare-server
 	install -m755 $(CLIENT_BIN) $(BINDIR)/kvmshare-client
 	install -m755 $(GUI_BIN) $(BINDIR)/kvmshare-gui
@@ -70,6 +71,10 @@ install: build
 	@# The wheel daemon rides along with the role binaries.
 	install -m755 target/release/kvmshare-wheel-daemon $(BINDIR)/kvmshare-wheel-daemon 2>/dev/null || true
 	@cd $(BINDIR) && sha256sum kvmshare-server kvmshare-client kvmshare-gui kvmshare-wheel-daemon > binaries.sha256
+	@# Launcher icon: hicolor theme lookup (Icon=kvmshare in the
+	@# .desktop entry) — the launcher shows the real icon, not a blank
+	@# default.
+	install -m644 gui/assets/icon.png $(ICONS_DIR)/kvmshare.png
 	@if [ ! -f $(CONFIG_DIR)/kvmshare-server.toml ]; then \
 		cp kvmshare-server.toml $(CONFIG_DIR)/kvmshare-server.toml; \
 		echo "  sample config -> $(CONFIG_DIR)/kvmshare-server.toml"; \
@@ -77,6 +82,10 @@ install: build
 		echo "  config already present, keeping $(CONFIG_DIR)/kvmshare-server.toml"; \
 	fi
 	install -m644 packaging/kvmshare.desktop $(APPS_DIR)/kvmshare.desktop
+	@# Launchers (dmenu, GNOME, KDE) do not reliably share this shell's
+	@# PATH, so the installed entry must name the binary by absolute
+	@# path — a bare Exec= is the "launcher does nothing" bug.
+	@sed -i 's|^Exec=.*|Exec=$(abspath $(BINDIR))/kvmshare-gui|' $(APPS_DIR)/kvmshare.desktop
 	$(MAKE) --no-print-directory ensure-input-access
 	@echo "installed:"
 	@echo "  $(BINDIR)/kvmshare-server"
@@ -136,6 +145,8 @@ release: winres
 	@rm -rf dist
 	@mkdir -p dist/kvmshare_$(VERSION)_linux_amd64 dist/kvmshare_$(VERSION)_windows_amd64
 	cp $(SERVER_BIN) $(CLIENT_BIN) gui/kvmshare-gui gui/kvmshare-install gui/kvmshare-installer dist/kvmshare_$(VERSION)_linux_amd64/
+	cp packaging/kvmshare.desktop dist/kvmshare_$(VERSION)_linux_amd64/
+	cp gui/assets/icon.png dist/kvmshare_$(VERSION)_linux_amd64/kvmshare.png
 	tar -C dist -czf dist/kvmshare_$(VERSION)_linux_amd64.tar.gz kvmshare_$(VERSION)_linux_amd64
 	cp gui/kvmshare-install dist/kvmshare-install_$(VERSION)_linux_amd64
 	cp gui/kvmshare-installer dist/kvmshare-installer_$(VERSION)_linux_amd64

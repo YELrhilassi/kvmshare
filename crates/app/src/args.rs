@@ -3,6 +3,22 @@
 
 use std::path::PathBuf;
 
+/// This binary's build id (see build.rs): a 64-bit hash of the build
+/// environment, printed by `--version` and compared by the GUI's
+/// install check — the binaries of one build all carry the same id.
+pub const BUILD_ID: &str = env!("KVMSHARE_BUILD_ID");
+
+/// The binary's package version, for `--version` output.
+pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Print the version banner and exit 0: the GUI's install check and a
+/// human diagnosing an install both need a one-line, machine-parsable
+/// answer to "what is this binary?".
+fn print_version(bin: &str) -> ! {
+    println!("{bin} {PKG_VERSION} (build {BUILD_ID})");
+    std::process::exit(0);
+}
+
 /// Arguments for `kvmshare-server`.
 pub struct ServerArgs {
     pub config: Option<PathBuf>,
@@ -28,9 +44,10 @@ pub fn parse_server_args() -> Result<ServerArgs, String> {
             }
             "--log-level" | "-l" => log_level = Some(args.next().ok_or("--log-level needs a value")?),
             "--logctl" => log_ctl = Some(PathBuf::from(args.next().ok_or("--logctl needs a path")?)),
+            "--version" | "-V" => print_version("kvmshare-server"),
             "--help" | "-h" => {
                 println!(
-                    "usage: kvmshare-server [--config PATH] [--port N] [--log-level error|warn|info|debug|trace] [--logctl PATH]"
+                    "usage: kvmshare-server [--config PATH] [--port N] [--log-level error|warn|info|debug|trace] [--logctl PATH]\n       kvmshare-server --version"
                 );
                 std::process::exit(0);
             }
@@ -61,9 +78,10 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
             "--name" | "-n" => name = Some(args.next().ok_or("--name needs a value")?),
             "--log-level" | "-l" => log_level = Some(args.next().ok_or("--log-level needs a value")?),
             "--logctl" => log_ctl = Some(PathBuf::from(args.next().ok_or("--logctl needs a path")?)),
+            "--version" | "-V" => print_version("kvmshare-client"),
             "--help" | "-h" => {
                 println!(
-                    "usage: kvmshare-client SERVER[:PORT] [--name NAME] [--log-level error|warn|info|debug|trace] [--logctl PATH]"
+                    "usage: kvmshare-client SERVER[:PORT] [--name NAME] [--log-level error|warn|info|debug|trace] [--logctl PATH]\n       kvmshare-client --version"
                 );
                 std::process::exit(0);
             }
@@ -74,6 +92,14 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
             // name should not be told the argument is unknown).
             "--server" | "--connect" if addr.is_none() => {
                 addr = Some(args.next().ok_or("--server needs an address")?);
+            }
+            // A flag-looking token may never be swallowed as the
+            // positional address: the first flag-shaped argument after
+            // the address used to become it (connect-for-ever to a
+            // host literally named "--name"), and the error surfaced
+            // only as a DNS failure three seconds later.
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown argument {other:?}"))
             }
             other if addr.is_none() => addr = Some(other.to_owned()),
             other => return Err(format!("unknown argument {other:?}")),
@@ -100,5 +126,13 @@ mod tests {
         assert_eq!(with_default_port("pc", 24800), "pc:24800");
         assert_eq!(with_default_port("pc:1234", 24800), "pc:1234");
         assert_eq!(with_default_port("192.168.1.69", 24800), "192.168.1.69:24800");
+    }
+
+    #[test]
+    fn build_id_is_stamped() {
+        // build.rs must have stamped a 16-hex-digit id; `--version` and
+        // the GUI's install check both read it.
+        assert_eq!(BUILD_ID.len(), 16);
+        assert!(BUILD_ID.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }

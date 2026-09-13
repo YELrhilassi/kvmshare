@@ -12,6 +12,16 @@
 
 #[cfg(target_os = "linux")]
 fn main() {
+    // --version before anything else: the GUI's install check reads the
+    // build id from every binary in the set, this one included.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "kvmshare-wheel-daemon {} (build {})",
+            kvmshare_app::PKG_VERSION,
+            kvmshare_app::BUILD_ID
+        );
+        return;
+    }
     if let Err(e) = kvmshare_log::init("info", None) {
         eprintln!("wheel-daemon: logging: {e}");
     }

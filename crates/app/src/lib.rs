@@ -14,7 +14,10 @@ mod machine_id;
 mod session;
 mod trust;
 
-pub use args::{parse_client_args, parse_server_args, with_default_port, ClientArgs, ServerArgs};
+pub use args::{
+    parse_client_args, parse_server_args, with_default_port, BUILD_ID, ClientArgs, PKG_VERSION,
+    ServerArgs,
+};
 pub use client_state::{write_client_state, write_client_state_stopped};
 pub use trust::{policy_from_revoked_list, revoked_policy_from_env, REVOKED_ENV};
 pub use clipboard::spawn_server_clipboard;

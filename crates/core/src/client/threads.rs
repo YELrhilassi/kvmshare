@@ -132,24 +132,22 @@ pub(crate) fn udp_loop(shared: Arc<Shared>, own_id: u8) {
     let mut motion_seq: u32 = 0;
     let mut buf = [0u8; 512];
     while !shared.stop.load(Ordering::Relaxed) {
-        match shared.udp.recv(&mut buf) {
-            Ok(n) => {
-                let Some(d) = udp::unpack(&buf[..n]) else { continue };
-                if d.id != own_id || !udp::is_newer(d.seq, motion_seq) {
-                    continue;
-                }
-                motion_seq = d.seq;
-                if let Message::MouseMoveRel { dx, dy } = d.msg {
-                    // Motion outside Enter/Leave is dropped: it can beat
-                    // the TCP Enter on the wire (different transports),
-                    // and at most a frame or two at the seam is lost —
-                    // self-correcting.
-                    if shared.active.load(Ordering::Acquire) {
-                        apply_motion_frame(&shared, dx, dy);
-                    }
+        // A recv error is a timeout (idle) or link error: check stop, loop.
+        if let Ok(n) = shared.udp.recv(&mut buf) {
+            let Some(d) = udp::unpack(&buf[..n]) else { continue };
+            if d.id != own_id || !udp::is_newer(d.seq, motion_seq) {
+                continue;
+            }
+            motion_seq = d.seq;
+            if let Message::MouseMoveRel { dx, dy } = d.msg {
+                // Motion outside Enter/Leave is dropped: it can beat
+                // the TCP Enter on the wire (different transports),
+                // and at most a frame or two at the seam is lost —
+                // self-correcting.
+                if shared.active.load(Ordering::Acquire) {
+                    apply_motion_frame(&shared, dx, dy);
                 }
             }
-            Err(_) => {} // timeout (idle) or link error: check stop, loop
         }
     }
 }
