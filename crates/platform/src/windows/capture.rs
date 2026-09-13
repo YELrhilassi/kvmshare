@@ -178,6 +178,8 @@ impl Mods {
     fn bits(self) -> u8 {
         (self.ctrl as u8) | ((self.alt as u8) << 1) | ((self.shift as u8) << 2) | ((self.meta as u8) << 3)
     }
+    /// The zero chord state for the static hook slot.
+    const NONE: Mods = Mods { ctrl: false, alt: false, shift: false, meta: false };
 }
 
 /// Publish the chords the hook should intercept (mods as a 4-bit mask:
