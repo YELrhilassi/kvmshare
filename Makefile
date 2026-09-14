@@ -154,7 +154,7 @@ release: winres
 	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "-H windowsgui $(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-installer.exe ./installer
 	@rm -rf dist
 	@mkdir -p dist/kvmshare_$(VERSION)_linux_amd64 dist/kvmshare_$(VERSION)_windows_amd64
-	cp $(SERVER_BIN) $(CLIENT_BIN) gui/kvmshare-gui gui/kvmshare-install gui/kvmshare-installer dist/kvmshare_$(VERSION)_linux_amd64/
+	cp $(SERVER_BIN) $(CLIENT_BIN) target/release/kvmshare-wheel-daemon gui/kvmshare-gui gui/kvmshare-install gui/kvmshare-installer dist/kvmshare_$(VERSION)_linux_amd64/
 	cp packaging/kvmshare.desktop dist/kvmshare_$(VERSION)_linux_amd64/
 	cp gui/assets/icon.png dist/kvmshare_$(VERSION)_linux_amd64/kvmshare.png
 	tar -C dist -czf dist/kvmshare_$(VERSION)_linux_amd64.tar.gz kvmshare_$(VERSION)_linux_amd64
