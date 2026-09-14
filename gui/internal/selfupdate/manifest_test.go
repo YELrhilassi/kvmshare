@@ -86,3 +86,24 @@ func TestManifestMissingIsDistinct(t *testing.T) {
 		t.Fatalf("missing manifest must surface as ErrNoManifest, got: %v", err)
 	}
 }
+
+// A malformed manifest (short hash, torn line) must fail with an error,
+// never panic: the check runs before every role spawn, and a corrupt
+// sidecar once crashed the GUI right here (hash[:12] on 8 bytes).
+func TestManifestGarbageDoesNotPanic(t *testing.T) {
+	dir := t.TempDir()
+	seedInstall(t, dir)
+	for _, garbage := range []string{
+		"deadbeef  kvmshare-server\n", // short hash
+		"\n",                          // empty
+		"zzzz no-space tail\n",        // unparsable
+		"3ab435200000506a03c4f04fa10c3360f66a33e0fbaa0a6963efcbdf340fe791  ghost\n", // hashes a file that is not in the dir
+	} {
+		if err := os.WriteFile(filepath.Join(dir, ManifestName), []byte(garbage), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := VerifyBinaries(dir); err == nil {
+			t.Fatalf("garbage manifest %q must not verify", garbage)
+		}
+	}
+}

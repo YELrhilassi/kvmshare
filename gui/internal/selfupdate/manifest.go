@@ -83,6 +83,16 @@ func WriteManifest(dir string, bins []string) error {
 // The GUI treats it as *unverified* — see VerifyBinaries.
 var ErrNoManifest = errors.New("no " + ManifestName + " in the install dir (install predates manifests — reinstall)")
 
+// shortHash shortens a hash for error text without assuming its length:
+// a hand-edited or torn manifest can carry any garbage, and an error
+// path must never be the thing that crashes.
+func shortHash(h string) string {
+	if len(h) > 12 {
+		return h[:12] + "…"
+	}
+	return h
+}
+
 // VerifyBinaries checks every binary in `dir` against the manifest.
 // Returns the offending binary names on mismatch so an error message
 // can name the actual file to replace.
@@ -132,7 +142,7 @@ func VerifyBinaries(dir string) error {
 			return err
 		}
 		if sum != e.hash {
-			return fmt.Errorf("%s does not match the install manifest (expected %s…, got %s…) — reinstall kvmshare", p, e.hash[:12], sum[:12])
+			return fmt.Errorf("%s does not match the install manifest (expected %s, got %s) — reinstall kvmshare", p, shortHash(e.hash), shortHash(sum))
 		}
 	}
 	return nil
