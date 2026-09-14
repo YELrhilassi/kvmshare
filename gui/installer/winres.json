@@ -39,11 +39,11 @@
           "0000": {
             "CompanyName": "kvmshare",
             "FileDescription": "kvmshare Installer",
-            "FileVersion": "0.7.5",
+            "FileVersion": "0.7.6",
             "InternalName": "kvmshare-installer",
             "OriginalFilename": "kvmshare-installer.exe",
             "ProductName": "kvmshare",
-            "ProductVersion": "0.7.5"
+            "ProductVersion": "0.7.6"
           }
         }
       }

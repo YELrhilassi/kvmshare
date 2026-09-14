@@ -168,10 +168,8 @@ export default function KeyboardPage() {
   const recording = recordingFor !== null;
   const { live } = useChordRecorder(
     true,
-    // onDone/onCancel only fire while a card records — the guards
-    // inside make a stray completion a no-op.
-    undefined,
-    undefined,
+    // onDone: a completed chord. Fires on any key while the page
+    // listens; the recordingFor guard makes idle completions no-ops.
     (chord: Chord) => {
       const action = recordingFor;
       setRecordingFor(null);
@@ -204,10 +202,10 @@ export default function KeyboardPage() {
       const rest = bindings.filter((b) => actionIdOf(b) !== action);
       void save({ shortcuts: { ...shortcuts, bindings: [...rest, binding] } });
     },
+    // onCancel: Esc while a card records.
     () => setRecordingFor(null),
+    // onKey: the live panel mirrors every key the capture sees.
     (e: KeyboardEvent, down: boolean) => {
-      // The live panel mirrors every key the capture sees. Full names
-      // for modifiers, HID names for the rest — both via keyName().
       const name = modifierName(e) ?? keyNameOfEvent(e);
       if (name) {
         push(name, down);
