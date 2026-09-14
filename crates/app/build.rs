@@ -1,47 +1,73 @@
 //! Build script: stamp a **build id** into every binary of this crate.
 //!
-//! The build id is a 64-bit FNV-1a hash of (hostname, user, build
-//! timestamp). It is stable for one build and different for the next —
-//! exactly the property the install manifest needs: the GUI checks that
-//! the server, client and GUI on this machine were built together by
-//! comparing their ids, so a half-updated install (a deploy that
-//! replaced the binaries but not a sidecar manifest, a partial copy, an
-//! old binary that PATH lookup resurfaced) is *detected* instead of
-//! running mixed versions.
+//! The build id fingerprints the **source tree**: sha256 over the
+//! workspace version plus the workspace member list, truncated to 64
+//! bits. It is deterministic — every binary linked from one workspace
+//! reports the same id no matter when it was compiled, so cargo's
+//! incremental rebuilds (which refresh some crates and not others)
+//! can never split one release into "different builds".
 //!
-//! The env var is emitted as `cargo:rustc-env=` so binaries read it
-//! with `env!("KVMSHARE_BUILD_ID")` — a compile-time constant, no
-//! runtime cost, and `--version` can print it.
+//! A timestamp hash was tried first and was exactly wrong for this:
+//! each cargo invocation got a fresh id, so a release built in one
+//! `cargo build` looked internally consistent but the next build —
+//! reusing freshly compiled crates — reported different ids per
+//! binary, and the install check refused every install.
+//!
+//! The Makefile stamps the GUI (Go) with the same id, parsing the same
+//! two facts from the same file — this workspace's Cargo.toml is the
+//! single source of truth for both toolchains.
 
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use sha2::{Digest, Sha256};
 
 fn main() {
-    // Rerun whenever the sources change (normal) — the id is stamped per
-    // build, not per source state, so a rebuild for any reason refreshes
-    // it. Env vars are deliberately *not* rerun triggers: the id may
-    // change mid-session and that is fine (nothing caches it).
     println!("cargo:rerun-if-changed=build.rs");
+    // The id changes exactly when the workspace's version or membership
+    // changes — both live in the root manifest two directories up
+    // (this build script runs with cwd = crates/app; ../ is crates/).
+    println!("cargo:rerun-if-changed=../../Cargo.toml");
 
-    let host = Command::new("hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_default();
-    let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // The version is part of the id: a version bump is a new build even
+    // when no other source moved. (Inherited from the workspace root,
+    // so it equals the root manifest's `version` — the same value the
+    // Makefile parses.)
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
 
-    // FNV-1a 64-bit: tiny, deterministic, plenty for "were these built
-    // together" — collisions between two builds a user actually has are
-    // not a realistic event, and the check errs toward "consistent".
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in format!("{host}|{user}|{secs}").bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+    let members = workspace_members();
+
+    let mut h = Sha256::new();
+    h.update(version.as_bytes());
+    h.update(b"|");
+    for m in &members {
+        h.update(m.as_bytes());
+        h.update(b"|");
     }
+    let digest = h.finalize();
+    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
 
-    println!("cargo:rustc-env=KVMSHARE_BUILD_ID={hash:016x}");
+    println!("cargo:rustc-env=KVMSHARE_BUILD_ID={id}");
+}
+
+/// The workspace member list, parsed from the root Cargo.toml (the
+/// `members = [...]` array, quotes/commas stripped, sorted). The
+/// Makefile parses the same array with sed/tr — keep both simple and
+/// in lockstep.
+fn workspace_members() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(root) = std::fs::read_to_string("../../Cargo.toml") {
+        if let Some(start) = root.find("members") {
+            if let Some(open) = root[start..].find('[') {
+                let rest = &root[start + open + 1..];
+                if let Some(close) = rest.find(']') {
+                    for part in rest[..close].split(',') {
+                        let m = part.trim().trim_matches('"').trim();
+                        if !m.is_empty() {
+                            out.push(m.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }

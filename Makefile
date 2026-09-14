@@ -35,6 +35,16 @@ GO    ?= go
 VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$tag" ]; then echo "$$tag"; else echo v0.0.0-dev; fi)
 VERSION_LDFLAGS := -X kvmshare/gui/internal/selfupdate.Version=$(VERSION)
 
+# The GUI's build id: the same workspace fingerprint the Rust build
+# script stamps into the role binaries (version + workspace members),
+# computed here so one release reports one id across the whole binary
+# set — the fact the install check verifies. Computing it twice (here
+# for the GUI, in build.rs for Rust) keeps the two toolchains in lockstep
+# without cross-toolchain linkage. scripts/build-id.sh is that
+# computation — plain shell, callable by hand for verification.
+BUILD_ID := $(shell $(CURDIR)/scripts/build-id.sh $(CURDIR))
+BUILD_ID_LDFLAGS := -X kvmshare/gui/internal/selfupdate.BuildID=$(BUILD_ID)
+
 # The GUI is built with Wails v3 on GTK4/WebKitGTK 6. Its bundled C
 # sources trip deprecation warnings on modern GTK headers; silence them
 # so a clean build really is clean.
@@ -58,7 +68,7 @@ MINGW      := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
 build:
 	$(CARGO) build --release
 	cd gui/frontend && npm install --no-audit --no-fund >/dev/null && npm run build
-	cd gui && $(GO_ENV) $(GO) build -tags production -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-gui .
+	cd gui && $(GO_ENV) $(GO) build -tags production -ldflags "$(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-gui .
 
 ## Build + install into $(BINDIR), plus sample config and launcher.
 install: build
@@ -118,7 +128,7 @@ ensure-input-access:
 ## virtual wheel). Self-elevates through pkexec (works as root directly,
 ## e.g. sudo make input-access).
 input-access:
-	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install ./cmd/kvmshare-install
+	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-install ./cmd/kvmshare-install
 	cd gui && ./kvmshare-install --input-access
 	@echo "input access granted — isolation engages without a restart"
 
@@ -136,12 +146,12 @@ test:
 release: winres
 	$(CARGO) build --release
 	cd gui/frontend && npm install --no-audit --no-fund >/dev/null && npm run build
-	cd gui && $(GO_ENV) $(GO) build -tags production -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-gui .
-	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install ./cmd/kvmshare-install
-	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-installer ./installer
-	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "-H windowsgui $(VERSION_LDFLAGS)" -o kvmshare-gui.exe .
-	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -ldflags "$(VERSION_LDFLAGS)" -o kvmshare-install.exe ./cmd/kvmshare-install
-	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "-H windowsgui $(VERSION_LDFLAGS)" -o kvmshare-installer.exe ./installer
+	cd gui && $(GO_ENV) $(GO) build -tags production -ldflags "$(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-gui .
+	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-install ./cmd/kvmshare-install
+	cd gui && $(GO_ENV) $(GO) build -ldflags "$(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-installer ./installer
+	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "-H windowsgui $(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-gui.exe .
+	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -ldflags "$(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-install.exe ./cmd/kvmshare-install
+	cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO) build -tags production -ldflags "-H windowsgui $(VERSION_LDFLAGS) $(BUILD_ID_LDFLAGS)" -o kvmshare-installer.exe ./installer
 	@rm -rf dist
 	@mkdir -p dist/kvmshare_$(VERSION)_linux_amd64 dist/kvmshare_$(VERSION)_windows_amd64
 	cp $(SERVER_BIN) $(CLIENT_BIN) gui/kvmshare-gui gui/kvmshare-install gui/kvmshare-installer dist/kvmshare_$(VERSION)_linux_amd64/

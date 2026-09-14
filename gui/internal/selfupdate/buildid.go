@@ -22,7 +22,9 @@ package selfupdate
 // the message that names the offending binary.
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
@@ -38,6 +40,20 @@ const versionTimeout = 5 * time.Second
 // versionRe matches the `--version` banner: `<bin> <ver> (build <id>)`.
 // The build id is 16 lowercase hex digits (FNV-1a 64, zero-padded).
 var versionRe = regexp.MustCompile(`\(build ([0-9a-f]{16})\)`)
+
+// VersionBanner is the one-line identity every kvmshare binary prints
+// for --version: `<name> <version> (build <id>)`. The GUI carries its
+// id as a linker-stamped variable; the Rust binaries stamp theirs in
+// build.rs. Both stamp from the same workspace fingerprint, so one
+// release reports one id across the whole binary set — the fact the
+// install check verifies.
+func VersionBanner(name string) string {
+	id := BuildID
+	if id == "" {
+		id = "unknown"
+	}
+	return fmt.Sprintf("%s %s (build %s)", name, Version, id)
+}
 
 // manifestBinaries lists the files a complete install contains, in the
 // manifest's platform naming. The wheel daemon is optional in the
@@ -74,11 +90,23 @@ func parseBuildID(out string) (string, bool) {
 func buildID(dir, name string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), versionTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, dir+"/"+name, "--version").Output()
+	cmd := exec.CommandContext(ctx, dir+"/"+name, "--version")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	err := cmd.Run()
 	if err != nil {
+		// The --version banner travels on stdout; a process that wrote
+		// its banner and then failed (a stale dir without exec bits, a
+		// dying host) still answered. Prefer the banner over the exit
+		// status — but only a real banner, never an error line.
+		if stdout.Len() > 0 {
+			if id, ok := parseBuildID(stdout.String()); ok {
+				return id, nil
+			}
+		}
 		return "", err
 	}
-	id, ok := parseBuildID(string(out))
+	id, ok := parseBuildID(stdout.String())
 	if !ok {
 		return "", errUnparsableVersion
 	}
@@ -94,28 +122,32 @@ type errorString string
 
 func (e errorString) Error() string { return string(e) }
 
-// BuildsConsistent reports whether every role binary in `dir` reports
-// the same build id. The GUI and both roles must agree; the wheel
-// daemon is checked only when present. Used on manifest mismatch to
-// tell a stale manifest (repairable) from a genuinely mixed install
-// (an error the user must resolve).
+// BuildsConsistent reports whether the binaries in `dir` were built
+// together. The Rust roles stamp one workspace fingerprint in build.rs,
+// the Go GUI stamps the same fingerprint at link time — so a real
+// release reports **one id for the whole set**. An id of "unknown"
+// (a binary built without the stamp) cannot vouch for kinship, and a
+// binary that cannot answer at all — ancient, corrupt, not executable
+// — fails the check the same way. Used on manifest mismatch to tell a
+// stale manifest (repairable) from a genuinely mixed install (an error
+// the user must resolve).
 func BuildsConsistent(dir string) bool {
 	ids := make(map[string]string)
-	present := 0
 	for _, name := range manifestBinaries() {
-		p := dir + "/" + name
-		if _, err := os.Stat(p); err != nil {
+		if _, err := os.Stat(dir + "/" + name); err != nil {
 			continue // optional or missing; missing *required* files are the manifest's own error
 		}
 		id, err := buildID(dir, name)
 		if err != nil {
-			return false // cannot vouch → not consistent
+			return false // a present binary that cannot answer → not consistent
+		}
+		if id == "unknown" {
+			return false // present but unstamped: no kinship claim possible
 		}
 		ids[name] = id
-		present++
 	}
-	if present < 3 {
-		return false // GUI + server + client are the minimum verifiable set
+	if len(ids) < 2 {
+		return false // fewer than two answers cannot demonstrate kinship
 	}
 	first := ""
 	for _, id := range ids {

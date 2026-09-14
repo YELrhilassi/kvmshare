@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io/fs"
 	"kvmshare/gui/internal/sessionbus"
+	"kvmshare/gui/internal/selfupdate"
 	"log"
 	"log/slog"
 	"os"
@@ -33,27 +34,36 @@ var dist embed.FS
 //go:embed assets/icon.png
 var windowIcon []byte
 
-// parseLaunchArgs resolves the command line. Only --autostart exists:
-// the startup entries pass it so the GUI can tell a login-session launch
-// (may start hidden to the tray) from a manual one (always shows the
-// window). Anything else is an error — swallowing unknown flags as
-// noise once made "kvmshare-gui --version" start a server silently.
-func parseLaunchArgs(argv []string) (autostart bool, err error) {
+// parseLaunchArgs resolves the command line. Only --autostart and
+// --version exist: the startup entries pass --autostart so the GUI can
+// tell a login-session launch (may start hidden to the tray) from a
+// manual one (always shows the window), and --version prints the same
+// `<name> <ver> (build <id>)` banner the role binaries print — the
+// install check asks every binary in the set, GUI included. Anything
+// else is an error — swallowing unknown flags once made
+// "kvmshare-gui --version" start a server silently.
+func parseLaunchArgs(argv []string) (autostart, version bool, err error) {
 	for _, arg := range argv[1:] {
 		switch arg {
 		case "--autostart":
 			autostart = true
+		case "--version":
+			version = true
 		default:
-			return false, fmt.Errorf("unknown argument %q (only --autostart is supported)", arg)
+			return false, false, fmt.Errorf("unknown argument %q (only --autostart and --version are supported)", arg)
 		}
 	}
-	return autostart, nil
+	return autostart, version, nil
 }
 
 func main() {
-	autostartLaunch, err := parseLaunchArgs(os.Args)
+	autostartLaunch, versionFlag, err := parseLaunchArgs(os.Args)
 	if err != nil {
 		log.Fatalf("kvmshare: %v", err)
+	}
+	if versionFlag {
+		fmt.Println(selfupdate.VersionBanner("kvmshare-gui"))
+		return
 	}
 
 	core := NewApp()

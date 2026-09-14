@@ -16,3 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 fs2 = "0.4.3"
+
+[build-dependencies]
+# Build-id stamping: sha256 over the workspace fingerprint (see
+# build.rs). Host-compiled only — never linked into the binaries.
+sha2 = "0.10"

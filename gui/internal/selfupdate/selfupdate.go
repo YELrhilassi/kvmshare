@@ -38,6 +38,17 @@ import (
 // the ldflags still compares sensibly against published releases.
 var Version = "v0.0.0-dev"
 
+// BuildID is the GUI's build fingerprint, stamped at compile time via
+// -ldflags "-X ...BuildID=<id>" from the Makefile. The Makefile hashes
+// the workspace version the Rust build script uses, so the Go GUI and
+// the Rust role binaries from one release report the **same** build id
+// and can vouch for each other in the install check.
+//
+// The empty default is itself the honest answer: a GUI built without
+// the stamp (a bare `go build`) cannot claim kinship with any Rust
+// build and says so in --version instead of inventing an id.
+var BuildID = ""
+
 // DefaultUpstream is the GitHub repository releases are pulled from.
 // Overridable with KVMSHARE_UPSTREAM (useful for forks).
 const DefaultUpstream = "YELrhilassi/kvmshare"

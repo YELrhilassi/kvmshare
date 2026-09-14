@@ -26,6 +26,29 @@ func fakeBinary(t *testing.T, dir, name, banner string) {
 const bannerA = "kvmshare-server 0.7.3 (build 9f3a000000000001)\n"
 const bannerB = "kvmshare-server 0.7.3 (build 9f3a000000000002)\n"
 
+// The GUI answers --version with the same banner shape the Rust role
+// binaries print — the install check asks every binary in the set,
+// GUI included, and parses all of them with one regex.
+func TestVersionBanner(t *testing.T) {
+	orig := BuildID
+	t.Cleanup(func() { BuildID = orig })
+
+	BuildID = "ab12cd34ef567890"
+	got := VersionBanner("kvmshare-gui")
+	want := "kvmshare-gui v0.0.0-dev (build ab12cd34ef567890)"
+	if got != want {
+		t.Fatalf("banner = %q, want %q", got, want)
+	}
+	if id, ok := parseBuildID(got); !ok || id != "ab12cd34ef567890" {
+		t.Fatalf("own banner must parse: %q", got)
+	}
+
+	BuildID = "" // an unstamped (bare go build) GUI says so honestly
+	if got := VersionBanner("kvmshare-gui"); !strings.Contains(got, "(build unknown)") {
+		t.Fatalf("unstamped banner = %q, want build unknown", got)
+	}
+}
+
 func TestParseBuildID(t *testing.T) {
 	if id, ok := parseBuildID(bannerA); !ok || id != "9f3a000000000001" {
 		t.Fatalf("parseBuildID(%q) = %q, %v", bannerA, id, ok)
