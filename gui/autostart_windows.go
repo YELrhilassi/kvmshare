@@ -10,6 +10,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -25,8 +26,10 @@ func enableAutostart(exe string) error {
 		return fmt.Errorf("open Run key: %w", err)
 	}
 	defer k.Close()
-	// Quoted path, no arguments: the GUI resumes whatever role it saved.
-	return k.SetStringValue(autostartValueName, `"`+exe+`"`)
+	// Quoted path plus --autostart: the flag is how the GUI knows this
+	// launch came from the login session — it may start hidden to the
+	// tray; a manual launch (no flag) always shows the window.
+	return k.SetStringValue(autostartValueName, `"`+exe+`" --autostart`)
 }
 
 func disableAutostart() error {
@@ -58,4 +61,17 @@ func autostartPresent() bool {
 	}
 	_ = filepath.Base(val) // shape check only; the OS launches whatever is there
 	return true
+}
+
+// autostartHasFlag reports whether the existing Run-key value already
+// launches the GUI with --autostart (values written by older builds did
+// not; healAutostartEntry rewrites those).
+func autostartHasFlag() bool {
+	k, err := registry.OpenKey(registry.CURRENT_USER, autostartRunKey, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	val, _, err := k.GetStringValue(autostartValueName)
+	return err == nil && strings.Contains(val, "--autostart")
 }

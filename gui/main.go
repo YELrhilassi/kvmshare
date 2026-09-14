@@ -16,6 +16,7 @@ package main
 
 import (
 	"embed"
+	"fmt"
 	"io/fs"
 	"kvmshare/gui/internal/sessionbus"
 	"log"
@@ -32,8 +33,35 @@ var dist embed.FS
 //go:embed assets/icon.png
 var windowIcon []byte
 
+// parseLaunchArgs resolves the command line. Only --autostart exists:
+// the startup entries pass it so the GUI can tell a login-session launch
+// (may start hidden to the tray) from a manual one (always shows the
+// window). Anything else is an error — swallowing unknown flags as
+// noise once made "kvmshare-gui --version" start a server silently.
+func parseLaunchArgs(argv []string) (autostart bool, err error) {
+	for _, arg := range argv[1:] {
+		switch arg {
+		case "--autostart":
+			autostart = true
+		default:
+			return false, fmt.Errorf("unknown argument %q (only --autostart is supported)", arg)
+		}
+	}
+	return autostart, nil
+}
+
 func main() {
+	autostartLaunch, err := parseLaunchArgs(os.Args)
+	if err != nil {
+		log.Fatalf("kvmshare: %v", err)
+	}
+
 	core := NewApp()
+	// Startup entries written by older builds lack --autostart; with the
+	// distinction live, an entry without it would pop the window on
+	// every login. Rewrite once when the operator's setting says the
+	// entry should exist.
+	core.healAutostartEntry()
 
 	// Only one GUI per machine. A second launch raises the running
 	// instance's window and exits quietly — from dmenu or a launcher
@@ -121,10 +149,13 @@ func main() {
 		Linux:            application.LinuxWindow{Icon: windowIcon},
 		BackgroundColour: application.NewRGBA(10, 10, 12, 255),
 	}
-	// Start quietly when the operator asked for it — but only when a
-	// tray host exists to keep the app reachable; the same guard as
-	// close-to-tray, so a hidden start can never strand the app.
-	if core.StartHiddenToTray() {
+	// Start quietly only when this launch came from the login session
+	// (the startup entry's --autostart flag) and the operator asked for
+	// it — but only when a tray host exists to keep the app reachable;
+	// the same guard as close-to-tray, so a hidden start can never
+	// strand the app. A manual launch — icon, launcher, terminal —
+	// always shows the window.
+	if core.StartHiddenToTray(autostartLaunch) {
 		windowOpts.Hidden = true
 	}
 	window := app.Window.NewWithOptions(windowOpts)

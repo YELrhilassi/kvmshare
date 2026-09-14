@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // autostartPath is where the XDG autostart entry lives.
@@ -26,16 +27,19 @@ func autostartPath() (string, error) {
 }
 
 // The entry mirrors the desktop file the installer writes (same icon,
-// same name), with Terminal=false and no StartupWMClass churn: a plain
-// launch of the GUI. Exec is quoted because install paths may contain
-// spaces (a Windows-style per-user dir or a mounted home).
+// same name), with Terminal=false and no StartupWMClass churn. Exec is
+// quoted because install paths may contain spaces (a Windows-style
+// per-user dir or a mounted home). The --autostart argument is how the
+// GUI knows this launch came from the login session: it may start
+// hidden to the tray, and a manual launch — no flag — always shows the
+// window.
 func autostartEntry(execPath string) []byte {
 	return fmt.Appendf(nil, `[Desktop Entry]
 Type=Application
 Version=1.0
 Name=kvmshare
 Comment=Share one keyboard and mouse across your machines
-Exec="%s"
+Exec="%s" --autostart
 Icon=kvmshare
 Terminal=false
 Categories=Utility;
@@ -72,4 +76,24 @@ func autostartPresent() bool {
 	}
 	_, err = os.Stat(p)
 	return err == nil
+}
+
+// autostartHasFlag reports whether the existing XDG entry already
+// launches the GUI with --autostart (entries written by older builds
+// did not; healAutostartEntry rewrites those).
+func autostartHasFlag() bool {
+	p, err := autostartPath()
+	if err != nil {
+		return false
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "Exec=") {
+			return strings.Contains(line, "--autostart")
+		}
+	}
+	return false
 }

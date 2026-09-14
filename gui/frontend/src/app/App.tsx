@@ -7,6 +7,8 @@ import HomePage from "@/features/home/HomePage";
 import ServerPage from "@/features/server/ServerPage";
 import ClientPage from "@/features/client/ClientPage";
 import LayoutPage from "@/features/layout/LayoutPage";
+import KeyboardPage from "@/features/input/KeyboardPage";
+import MousePage from "@/features/input/MousePage";
 import LogsPage from "@/features/logs/LogsPage";
 import SettingsPage from "@/features/settings/SettingsPage";
 
@@ -84,6 +86,8 @@ function Shell() {
           {effectivePage === "server" && <ServerPage />}
           {effectivePage === "client" && <ClientPage />}
           {effectivePage === "layout" && <LayoutPage />}
+          {effectivePage === "keyboard" && <KeyboardPage />}
+          {effectivePage === "mouse" && <MousePage />}
           {effectivePage === "logs" && <LogsPage />}
           {effectivePage === "settings" && <SettingsPage />}
         </main>

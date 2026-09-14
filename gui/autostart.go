@@ -22,6 +22,24 @@ func selfExe() (string, error) {
 	return filepath.EvalSymlinks(exe)
 }
 
+// healAutostartEntry upgrades startup entries written before the
+// --autostart flag existed. The flag is how the GUI distinguishes "the
+// operator launched me" (show the window) from "I woke at login"
+// (stay in the tray); an entry without it would now pop the window on
+// every login. Only rewrites when the operator's own setting says the
+// entry should exist — the OS entry remains the authority.
+func (a *App) healAutostartEntry() {
+	a.mu.Lock()
+	want := a.settings.LaunchAtStartup
+	a.mu.Unlock()
+	if !want || !autostartPresent() || autostartHasFlag() {
+		return
+	}
+	if exe, err := selfExe(); err == nil {
+		_ = enableAutostart(exe)
+	}
+}
+
 // EnableLaunchAtStartup makes the GUI start when the user logs in.
 func (a *App) EnableLaunchAtStartup() error {
 	exe, err := selfExe()

@@ -3,46 +3,15 @@ import { api, type LayoutConfig, type Screen } from "@/lib/bridge";
 import Toolbar from "@/features/layout/Toolbar";
 import Canvas from "@/features/layout/canvas/Canvas";
 import ScreenInspector from "@/features/layout/inspector/ScreenInspector";
-import InputShortcutsPage from "@/features/layout/InputShortcutsPage";
 import { useLayoutDocument } from "@/features/layout/useLayoutDocument";
 import { useCanvasView } from "@/features/layout/useCanvasView";
 import { PageSkeleton } from "@/components/PageSkeleton";
-import { cn } from "@/lib/utils";
 
-// Layout page tabs: Arrangement is the canvas (where screens sit);
-// Input & shortcuts is the behavior sub-page (what keys and pointers
-// do). Same config document behind both, one Save per tab area.
-type Tab = "arrange" | "input";
-
-function TabBar({ tab, onTab }: { tab: Tab; onTab: (t: Tab) => void }) {
-  const tabs: { id: Tab; label: string }[] = [
-    { id: "arrange", label: "Arrangement" },
-    { id: "input", label: "Input & shortcuts" },
-  ];
-  return (
-    <div className="flex items-center gap-1 border-b border-border/60 px-8">
-      {tabs.map((t) => (
-        <button
-          key={t.id}
-          onClick={() => onTab(t.id)}
-          className={cn(
-            "-mb-px border-b-2 px-3 py-2.5 text-sm transition-colors",
-            tab === t.id
-              ? "border-primary text-foreground"
-              : "border-transparent text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {t.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
+// The layout page is the canvas alone: where screens sit. What keys
+// and pointers *do* lives on the Keyboard and Mouse pages.
 export default function LayoutPage() {
   const [config, setConfig] = useState<LayoutConfig | null>(null);
   const [error, setError] = useState("");
-  const [tab, setTab] = useState<Tab>("arrange");
 
   useEffect(() => {
     let alive = true;
@@ -71,12 +40,7 @@ export default function LayoutPage() {
     return <PageSkeleton rows={2} />;
   }
 
-  return (
-    <div className="flex h-full flex-col">
-      <TabBar tab={tab} onTab={setTab} />
-      {tab === "arrange" ? <Editor config={config} /> : <InputShortcutsPage />}
-    </div>
-  );
+  return <Editor config={config} />;
 }
 
 // The editor: one reducer for the document, one hook for the view, and

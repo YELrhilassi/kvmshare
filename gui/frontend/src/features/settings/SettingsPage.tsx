@@ -123,7 +123,8 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-2xl px-8 py-8">
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto w-full max-w-2xl px-8 py-8">
       <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
       <p className="mt-1 text-sm text-muted-foreground">
         Machine-wide behavior. Role-specific options live on the Server and Client pages.
@@ -221,6 +222,7 @@ export default function SettingsPage() {
           {err || "Saved"}
         </p>
       )}
+      </div>
     </div>
   );
 }

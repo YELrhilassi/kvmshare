@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 
-// Chord recording for the shortcut registry: one hook that captures the
+// Chord recording for the shortcut system: one hook that captures the
 // next keystroke as a chord (modifier set + physical key), plus the
-// small display pieces the registry renders around it.
+// small display pieces the pages render around it.
 //
 // Keys are identified as canonical HID usages (the same identity the
 // backend's action engine matches on), so a binding means the same
-// physical key on every platform pair. The DOM-to-HID map here covers
-// the keys a shortcut can plausibly use; unmapped keys keep listening
-// rather than recording something wrong.
+// physical key on every platform pair. The DOM-to-HID coverage below
+// spans everything a shortcut can plausibly use — letters, digits,
+// function row, navigation cluster, punctuation, numpad, and the
+// media keys (Play/Pause, track controls) keyboards ship. Unmapped
+// keys keep listening rather than recording something wrong.
 
 export interface Chord {
   ctrl: boolean;
@@ -16,6 +18,13 @@ export interface Chord {
   shift: boolean;
   meta: boolean;
   key: number; // HID usage of the non-modifier key
+}
+
+export interface LiveMods {
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  meta: boolean;
 }
 
 const HID_LETTER = 0x04;
@@ -43,18 +52,41 @@ const CODE_TO_HID: Record<string, number> = {
   BracketLeft: 0x2f,
   BracketRight: 0x30,
   Backslash: 0x31,
+  IntlBackslash: 0x31,
   Semicolon: 0x33,
   Quote: 0x34,
   Comma: 0x36,
   Period: 0x37,
   Slash: 0x38,
+  IntlRo: 0x38,
   Tab: 0x2b,
   Enter: 0x28,
+  NumpadEnter: 0x28,
   Space: 0x2c,
+  CapsLock: 0x39,
+  PrintScreen: 0x46,
+  ContextMenu: 0x65,
+  MediaPlayPause: 0xb0,
+  MediaNext: 0xb5,
+  MediaPrev: 0xb6,
+  MediaStop: 0xb7,
+  LaunchMail: 0x9c,
+  LaunchApp1: 0x9d,
+  LaunchApp2: 0x9e,
+  BrowserSearch: 0xa1,
+  BrowserHome: 0xa3,
+  BrowserBack: 0xa4,
+  BrowserForward: 0xa5,
+  NumpadAdd: 0x57,
+  NumpadSubtract: 0x56,
+  NumpadMultiply: 0x55,
+  NumpadDivide: 0x54,
+  NumpadDecimal: 0x63,
 };
 
 function codeToHid(code: string): number {
-  if (CODE_TO_HID[code]) return CODE_TO_HID[code];
+  const direct = CODE_TO_HID[code];
+  if (direct !== undefined) return direct;
   if (code.startsWith("Key")) {
     const letter = code.charCodeAt(3) - "A".charCodeAt(0);
     if (letter >= 0 && letter < 26) return HID_LETTER + letter;
@@ -65,9 +97,9 @@ function codeToHid(code: string): number {
   }
   if (/^F\d+$/.test(code)) {
     const f = parseInt(code.slice(1), 10);
-    if (f >= 1 && f <= 12) return HID_F1 + f - 1;
+    if (f >= 1 && f <= 24) return HID_F1 + f - 1;
   }
-  // Numpad: code "Numpad1"…"Numpad0" (HID keeps the keypad usage range).
+  // Numpad 1–9 (0x59–0x61) and 0 (0x62): code "Numpad1"…"Numpad0".
   if (code.startsWith("Numpad") && code.length === 7) {
     const last = code.charCodeAt(6);
     if (last >= "1".charCodeAt(0) && last <= "9".charCodeAt(0)) {
@@ -97,7 +129,9 @@ const KEYCODE_TO_HID: Record<number, number> = {
   40: 0x51, // ArrowDown
   38: 0x52, // ArrowUp
   144: 0x53, // Num Lock
-  65: 0x04, // A … Z block
+  179: 0xb0, // Media Play/Pause
+  176: 0xb5, // Media Next
+  177: 0xb6, // Media Prev
 };
 
 function eventToHid(e: KeyboardEvent): number {
@@ -106,7 +140,8 @@ function eventToHid(e: KeyboardEvent): number {
   if (kc >= 65 && kc <= 90) return HID_LETTER + (kc - 65);
   if (kc >= 48 && kc <= 57) return HID_DIGIT_ONE + (kc - 49);
   if (kc >= 112 && kc <= 123) return HID_F1 + (kc - 112);
-  return KEYCODE_TO_HID[kc] ?? 0;
+  const mapped = KEYCODE_TO_HID[kc];
+  return mapped !== undefined ? mapped : 0;
 }
 
 // Friendly name for a recorded key (the registry renders these).
@@ -114,18 +149,22 @@ const KEY_NAMES: Record<number, string> = {
   0x28: "Enter", 0x29: "Esc", 0x2a: "Backspace", 0x2b: "Tab", 0x2c: "Space",
   0x2d: "-", 0x2e: "=", 0x2f: "[", 0x30: "]", 0x31: "\\", 0x33: ";", 0x34: "'",
   0x35: "`", 0x36: ",", 0x37: ".", 0x38: "/", 0x39: "Caps Lock",
-  0x47: "Scroll Lock", 0x48: "Pause", 0x49: "Insert", 0x4a: "Home",
-  0x4b: "Page Up", 0x4c: "Delete", 0x4d: "End", 0x4e: "Page Down",
-  0x4f: "→", 0x50: "←", 0x51: "↓", 0x52: "↑", 0x53: "Num Lock",
+  0x46: "PrtSc", 0x47: "Scroll Lock", 0x48: "Pause",
+  0x49: "Insert", 0x4a: "Home", 0x4b: "Page Up", 0x4c: "Delete", 0x4d: "End",
+  0x4e: "Page Down", 0x4f: "→", 0x50: "←", 0x51: "↓", 0x52: "↑", 0x53: "Num Lock",
+  0x54: "Num /", 0x55: "Num *", 0x56: "Num -", 0x57: "Num +", 0x63: "Num .",
   0x59: "Num 1", 0x5a: "Num 2", 0x5b: "Num 3", 0x5c: "Num 4", 0x5d: "Num 5",
   0x5e: "Num 6", 0x5f: "Num 7", 0x60: "Num 8", 0x61: "Num 9", 0x62: "Num 0",
+  0x65: "Menu", 0xb0: "Play/Pause", 0xb5: "Next Track", 0xb6: "Prev Track",
+  0xb7: "Stop", 0x9c: "Mail", 0x9d: "My Computer", 0x9e: "Calculator",
+  0xa1: "Browser Search", 0xa3: "Browser Home", 0xa4: "Browser Back", 0xa5: "Browser Fwd",
 };
 
 export function keyName(key: number): string {
   if (key >= 0x04 && key <= 0x1d) return String.fromCharCode("A".charCodeAt(0) + key - 0x04);
   if (key >= 0x1e && key <= 0x27) return String.fromCharCode("1".charCodeAt(0) + key - 0x1e);
   if (key >= 0x3a && key <= 0x45) return `F${key - 0x3a + 1}`;
-  return KEY_NAMES[key] ?? `Key ${key}`;
+  return KEY_NAMES[key] ?? `Key ${key.toString(16)}`;
 }
 
 export function modLabels(c: { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean }): string[] {
@@ -137,7 +176,7 @@ export function modLabels(c: { ctrl: boolean; alt: boolean; shift: boolean; meta
   return out;
 }
 
-/** A keyboard-key chip (the registry's visual unit). */
+/** A keyboard-key chip (the shortcut UI's visual unit). */
 export function Kbd({ children, dim = false }: { children: React.ReactNode; dim?: boolean }) {
   return (
     <kbd
@@ -153,24 +192,24 @@ export function Kbd({ children, dim = false }: { children: React.ReactNode; dim?
   );
 }
 
-interface LiveMods {
-  ctrl: boolean;
-  alt: boolean;
-  shift: boolean;
-  meta: boolean;
-}
-
 const NO_MODS: LiveMods = { ctrl: false, alt: false, shift: false, meta: false };
 
 /**
  * Capture the next chord while `active`: modifier chips update **live**
- * as keys are held (the "live key detection" the registry shows), and
- * the first non-modifier key press completes the chord. Escape cancels.
+ * as keys are held, the first non-modifier key press completes the
+ * chord, and — while `suppress` — every key event is swallowed so
+ * nothing the user pushes acts on the UI (Enter must not press a
+ * focused button mid-recording; Tab must not move focus). With
+ * `onKey`, the caller also observes every push and release — that is
+ * the live-keys panel's data source. Listen-only mode (`active`
+ * without `suppress`) reports keys without eating them.
  */
 export function useChordRecorder(
   active: boolean,
-  onDone: (chord: Chord) => void,
-  onCancel: () => void,
+  onDone?: (chord: Chord) => void,
+  onCancel?: () => void,
+  onKey?: (e: KeyboardEvent, down: boolean) => void,
+  suppress = true,
 ): { live: LiveMods; listening: boolean } {
   const [live, setLive] = useState<LiveMods>(NO_MODS);
 
@@ -178,6 +217,8 @@ export function useChordRecorder(
   // does not re-attach (and lose the live state) on every parent render.
   const doneRef = useRefLatest(onDone);
   const cancelRef = useRefLatest(onCancel);
+  const keyRef = useRefLatest(onKey);
+  const suppressRef = useRefLatest(suppress);
 
   useEffect(() => {
     if (!active) {
@@ -203,19 +244,24 @@ export function useChordRecorder(
     const complete = (mods: LiveMods, hid: number) => {
       lastKey = 0;
       seenDown = new Set();
-      doneRef.current({ ...mods, key: hid });
+      doneRef.current?.({ ...mods, key: hid });
     };
     const onKey = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
+      // While recording, suppress everything: no default behavior, no
+      // bubbling — a recorded chord is captured, never acted on.
+      if (suppressRef.current) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
       sync(e);
+      keyRef.current?.(e, true);
       if (e.key === "Escape") {
-        cancelRef.current();
+        cancelRef.current?.();
         return;
       }
       // Modifier presses only light the live chips; the chord completes
       // on the first non-modifier key.
-      if (["Control", "Alt", "Shift", "Meta", "AltGraph", "CapsLock", "NumLock", "ScrollLock"].includes(e.key) && !isBindableLock(e)) {
+      if (isModifierKey(e) && !isBindableLock(e)) {
         return;
       }
       const hid = eventToHid(e);
@@ -225,7 +271,12 @@ export function useChordRecorder(
       complete(modsNow, hid);
     };
     const onKeyUp = (e: KeyboardEvent) => {
+      if (suppressRef.current) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
       sync(e);
+      keyRef.current?.(e, false);
       if (!seenDown.has(e.keyCode) && isBindableLock(e)) {
         // The keydown never reached us (browser reports these on keyup
         // only) — the release *is* the press: record the chord now.
@@ -249,9 +300,13 @@ export function useChordRecorder(
       window.removeEventListener("keyup", onKeyUp, true);
       window.removeEventListener("blur", onBlur, true);
     };
-  }, [active, doneRef, cancelRef]);
+  }, [active, doneRef, cancelRef, keyRef, suppressRef]);
 
   return { live, listening: active };
+}
+
+function isModifierKey(e: KeyboardEvent): boolean {
+  return ["Control", "Alt", "Shift", "Meta", "AltGraph", "CapsLock", "NumLock", "ScrollLock"].includes(e.key);
 }
 
 // ScrollLock/CapsLock/NumLock are modifier-shaped in DOM `key` but are

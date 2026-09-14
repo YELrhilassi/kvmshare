@@ -73,12 +73,14 @@ type Settings struct {
 	// login screen onward, whether it boots into GNOME, KDE, i3 (XDG
 	// autostart-capable session tools) or Windows.
 	StartRole string `json:"startRole"`
-	// StartHidden opens the GUI minimized to the tray on launch instead
-	// of showing the window. Only meaningful together with
-	// LaunchAtStartup — an operator who starts the app by hand wants the
-	// window — and only honored when a tray host is actually present
-	// (the same guard as close-to-tray: with no tray, hiding would
-	// strand the app invisibly).
+	// StartHidden opens the GUI minimized to the tray on an autostart
+	// launch (the startup entry passes --autostart) instead of showing
+	// the window. Only meaningful together with LaunchAtStartup — an
+	// operator who starts the app by hand wants the window, and the
+	// --autostart flag is how the GUI knows which kind of launch this
+	// is — and only honored when a tray host is actually present (the
+	// same guard as close-to-tray: with no tray, hiding would strand
+	// the app invisibly).
 	StartHidden bool `json:"startHidden"`
 }
 
@@ -258,11 +260,17 @@ func (a *App) applyStartRole() {
 	}
 }
 
-// StartHiddenToTray reports whether the GUI should open minimized to the
-// tray this launch. The operator's choice (StartHidden) is honored only
-// when a tray host actually exists — without one, hiding would strand
-// the app invisibly (the same rule close-to-tray follows).
-func (a *App) StartHiddenToTray() bool {
+// StartHiddenToTray reports whether the GUI should open minimized to
+// the tray this launch. Only an autostart launch (the startup entry's
+// --autostart flag) may hide: an operator who launched the GUI by hand
+// — icon, launcher, terminal — asked for the window. Even then the
+// operator's choice (StartHidden) applies only when a tray host
+// actually exists — without one, hiding would strand the app
+// invisibly (the same rule close-to-tray follows).
+func (a *App) StartHiddenToTray(autostart bool) bool {
+	if !autostart {
+		return false
+	}
 	a.mu.Lock()
 	want := a.settings.StartHidden
 	a.mu.Unlock()
