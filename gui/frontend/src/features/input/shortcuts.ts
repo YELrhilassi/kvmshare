@@ -46,3 +46,20 @@ export function titleOf(b: Binding, actions: ActionSpec[]): string {
   const id = actionIdOf(b);
   return actions.find((a) => a.id === id)?.title ?? id;
 }
+
+/**
+ * The engine's binding-safety rule (Binding::is_bindable,
+ * crates/core/src/actions.rs), mirrored for the UI: a binding the engine
+ * would drop is not shown as if it worked — pages filter these out, so
+ * the next save also drops them from the file (self-healing, in step
+ * with the engine's load-time sanitization).
+ */
+export function bindingIsBindable(b: Binding): boolean {
+  const hasMods = b.mods.ctrl || b.mods.alt || b.mods.shift || b.mods.meta;
+  return b.key >= 0x04 && !(b.key >= 0xe0 && b.key <= 0xe7) && (hasMods || bareSafeKey(b.key));
+}
+
+/** Keys whose bare press no app acts on — keep in sync with the engine. */
+export function bareSafeKey(key: number): boolean {
+  return key === 0x47 || key === 0x48 || (key >= 0x68 && key <= 0x73);
+}

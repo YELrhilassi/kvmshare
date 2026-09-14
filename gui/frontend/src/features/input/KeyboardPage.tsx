@@ -6,7 +6,7 @@ import { Switch } from "@/components/ui/switch";
 import { PageSkeleton } from "@/components/PageSkeleton";
 import { useChordRecorder, keyName, modLabels, Kbd, type LiveMods } from "./ChordRecorder";
 import { LiveKeys, useLiveKeys } from "./LiveKeys";
-import { allActions, actionIdOf, chordSig, titleOf, type ActionSpec } from "./shortcuts";
+import { allActions, actionIdOf, bindingIsBindable, bareSafeKey, chordSig, titleOf, type ActionSpec } from "./shortcuts";
 import { cn } from "@/lib/utils";
 
 // Keyboard — the keyboard half of the old Input & shortcuts page, now
@@ -14,7 +14,9 @@ import { cn } from "@/lib/utils";
 //
 //   left  · binder   every action as a card; record/clear its chord in
 //                    place, modifier chips lighting as keys are held,
-//                    every push and release flashing in the live panel
+//                    the live-keys panel flashing pushes and holds
+//                    *while recording* — capture is only ever armed for
+//                    a recording, never in the background
 //   right · behavior the shortcut system as a whole: enabled switch,
 //                    what a binding means (physical-key identity, OS
 //                    override), and why capture goes quiet while a
@@ -154,26 +156,38 @@ export default function KeyboardPage() {
   const screens = config?.screens ?? [];
   const actions = allActions(screens);
   const shortcuts = config?.shortcuts ?? { enabled: true, bindings: [] };
-  const bindings = shortcuts.bindings ?? [];
+  // Only bindings the engine actually honors are shown or matched; a
+  // stale unsafe one (from an older release) disappears from the page
+  // and is dropped from the file on the next save (self-healing).
+  const bindings = (shortcuts.bindings ?? []).filter(bindingIsBindable);
 
-  // Live keys: the recorder reports every push and release while any
-  // card records; outside recording the panel still listens (capture-
-  // only mode) so the operator gets feedback before clicking Record.
+  // Live keys: the recorder reports every push and release **while a
+  // card is recording** — the panel exists only inside the record UI,
+  // and the capture hook is only mounted then (outside recording the
+  // page never touches key events, so normal keyboard use of the UI is
+  // untouched).
   const { held, tape, push } = useLiveKeys();
-  const [tapeLive, setTapeLive] = useState<LiveMods>(NO_MODS);
 
-  // Listening whenever the page is visible: with a card recording the
-  // recorder captures (and suppresses) keys; otherwise it only
-  // observes, so normal keyboard use of the UI is untouched.
   const recording = recordingFor !== null;
   const { live } = useChordRecorder(
-    true,
-    // onDone: a completed chord. Fires on any key while the page
-    // listens; the recordingFor guard makes idle completions no-ops.
+    recording,
+    // onDone: a completed chord while a card records. Fires on any
+    // bindable key; validation decides whether it becomes a binding.
     (chord: Chord) => {
       const action = recordingFor;
-      setRecordingFor(null);
       if (!action || !config) return;
+      // A binding must carry a modifier unless the key is app-meaningless
+      // bare (Scroll Lock, Pause, F13–F24) — the same rule the engine's
+      // BindSection sanitization enforces, mirrored here so the user gets
+      // an immediate, actionable error instead of a silently dropped
+      // binding in the file. Recording stays armed so a retry is one
+      // keystroke away.
+      const hasMods = chord.ctrl || chord.alt || chord.shift || chord.meta;
+      if (!hasMods && !bareSafeKey(chord.key)) {
+        setErr("Add a modifier (Ctrl/Alt/Shift/Super) — a bare key like that is used by every app and would be swallowed.");
+        return;
+      }
+      setRecordingFor(null);
       // Esc is reserved for returning home (the recorder also treats it
       // as cancel — this is the belt-and-braces guard).
       if (chord.key === 0x29) {
@@ -199,6 +213,7 @@ export default function KeyboardPage() {
         screen: sep === -1 ? "" : action.slice(sep + 1),
       };
       // One chord per action: recording replaces whatever the card held.
+      // The save writes only bindable bindings — the file heals.
       const rest = bindings.filter((b) => actionIdOf(b) !== action);
       void save({ shortcuts: { ...shortcuts, bindings: [...rest, binding] } });
     },
@@ -207,13 +222,10 @@ export default function KeyboardPage() {
     // onKey: the live panel mirrors every key the capture sees.
     (e: KeyboardEvent, down: boolean) => {
       const name = modifierName(e) ?? keyNameOfEvent(e);
-      if (name) {
-        push(name, down);
-        setTapeLive({ ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey });
-      }
+      if (name) push(name, down);
     },
-    // Suppress only while a card is recording; listen-only otherwise.
-    recording,
+    // Recording is the only capture mode: always suppress while armed.
+    true,
   );
 
   const bindingFor = (id: string) => bindings.find((b) => actionIdOf(b) === id);
@@ -247,12 +259,10 @@ export default function KeyboardPage() {
   if (!config) return <PageSkeleton rows={3} />;
 
   // While control is away on another machine the physical devices are
-  // kernel-isolated: the webview sees no keys at all. Say so instead of
-  // showing a panel that silently never lights up.
+  // kernel-isolated: the webview sees no keys at all, so a recording
+  // started now would never complete — tell the user instead of arming
+  // a recorder that cannot hear them.
   const sessionLive = mode === "server" ? clients.length > 0 : clientState.status === "connected" && running.client;
-  const deafReason = sessionLive
-    ? "keys are shared with the remote machine right now"
-    : "";
 
   return (
     <div className="h-full overflow-y-auto">
@@ -278,7 +288,7 @@ export default function KeyboardPage() {
         <div className={cn("mt-6 grid items-start gap-6 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]", !shortcuts.enabled && "opacity-60")}>
           {/* Left pane — the binder */}
           <div className="min-w-0">
-            <LiveKeys held={held} tape={tape} live={recording ? live : tapeLive} deafReason={deafReason} />
+            {recording && <LiveKeys held={held} tape={tape} live={live} />}
             <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-2">
               {actions.map((spec) => (
                 <ActionCard
@@ -286,7 +296,7 @@ export default function KeyboardPage() {
                   spec={spec}
                   binding={bindingFor(spec.id)}
                   recording={recordingFor === spec.id}
-                  live={recording ? live : NO_MODS}
+                  live={recordingFor === spec.id ? live : NO_MODS}
                   disabled={!shortcuts.enabled}
                   onRecord={() => setRecordingFor(spec.id)}
                   onCancelRecord={() => setRecordingFor(null)}
@@ -326,11 +336,11 @@ export default function KeyboardPage() {
               </p>
             </section>
 
-            {shortcuts.bindings.length > 0 && (
+            {bindings.length > 0 && (
               <section className="rounded-xl border border-border/60 bg-card/40 p-4">
                 <h2 className="text-sm font-medium">Registry</h2>
                 <ul className="mt-2 space-y-1.5">
-                  {shortcuts.bindings.map((b) => (
+                  {bindings.map((b) => (
                     <li key={`${b.action}:${b.screen ?? ""}`} className="flex items-center justify-between gap-3 text-xs">
                       <span className="flex flex-wrap items-center gap-1">
                         {modLabels(b.mods).map((m) => (

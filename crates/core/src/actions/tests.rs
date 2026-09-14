@@ -147,3 +147,82 @@ fn config_reload_drops_pending_chords() {
     // key in the client's down state.
     assert_eq!(e.key_up(hid::SCROLL_LOCK), Some(hid::SCROLL_LOCK));
 }
+
+#[test]
+fn default_chords_survive_sanitization() {
+    // Scroll Lock and Pause are bare but app-meaningless: the defaults
+    // must never be silently dropped by the safety gate.
+    let d = BindSection::default();
+    assert_eq!(d.clone().sanitized().bindings.len(), d.bindings.len());
+    for b in &d.bindings {
+        assert!(b.is_bindable(), "default binding {} must be bindable", b.key);
+    }
+}
+
+#[test]
+fn bare_tab_is_dropped_by_sanitization() {
+    // The field report: a bare Tab binding ate Tab system-wide (and on
+    // X11 passive-grabbed it), making the whole desktop feel dead while
+    // "cycle" flapped on every auto-repeat. The engine refuses it.
+    let cfg = BindSection {
+        enabled: true,
+        bindings: vec![Binding {
+            mods: Mods::NONE,
+            key: 0x2b, // Tab
+            action: "cycle".into(),
+            screen: String::new(),
+        }],
+    };
+    let mut e = ActionEngine::new(cfg);
+    // The surviving config binds nothing: Tab passes through untouched.
+    assert!(e.key_down(0x2b, Mods::NONE, true).is_none());
+    assert!(e.key_up(0x2b).is_none());
+}
+
+#[test]
+fn bare_workhorse_keys_are_dropped_bare_modifier_keys_never_bind() {
+    // Letters/digits/Enter without modifiers: dropped. A modifier usage
+    // (0xE0) as the chord key: never a chord at all — also dropped.
+    for key in [0x04, 0x1e, 0x28, 0x2c, 0xe0] {
+        let cfg = BindSection {
+            enabled: true,
+            bindings: vec![Binding { mods: Mods::NONE, key, action: "cycle".into(), screen: String::new() }],
+        };
+        assert!(
+            ActionEngine::new(cfg).key_down(key, Mods::NONE, true).is_none(),
+            "bare key 0x{key:02x} must not swallow presses"
+        );
+    }
+}
+
+#[test]
+fn hot_reload_applies_the_same_safety_gate() {
+    let mut e = engine();
+    // Start sane.
+    e.set_config(BindSection {
+        enabled: true,
+        bindings: vec![Binding { mods: Mods { ctrl: true, ..Mods::NONE }, key: 0x2b, action: "cycle".into(), screen: String::new() }],
+    });
+    assert!(e.key_down(0x2b, Mods { ctrl: true, ..Mods::NONE }, true).is_some());
+    // A mid-session edit that arms bare Tab must not take effect.
+    e.set_config(BindSection {
+        enabled: true,
+        bindings: vec![Binding { mods: Mods::NONE, key: 0x2b, action: "cycle".into(), screen: String::new() }],
+    });
+    assert!(e.key_down(0x2b, Mods::NONE, true).is_none(), "hot reload must sanitize too");
+}
+
+#[test]
+fn modified_chords_always_bind() {
+    // The rule's positive case: any real key with a modifier is fine,
+    // including workhorse keys the bare form would break.
+    for key in [0x04, 0x2b, 0x2c, 0x28] {
+        let cfg = BindSection {
+            enabled: true,
+            bindings: vec![Binding { mods: Mods { meta: true, ..Mods::NONE }, key, action: "cycle".into(), screen: String::new() }],
+        };
+        let mut e = ActionEngine::new(cfg);
+        e.key_down(hid::META_L, Mods::NONE, true);
+        assert!(e.key_down(key, Mods::NONE, true).is_some(), "modified key 0x{key:02x} must bind");
+    }
+}

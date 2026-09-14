@@ -93,6 +93,11 @@ pub mod hid {
     }
 }
 
+/// The smallest HID usage a binding may name. Everything below it is
+/// error/undefined space in the USB HID usage tables; the modifiers live
+/// at 0xE0–0xE7. Recording and loading both gate on this.
+const MIN_BINDABLE_KEY: u32 = 0x04;
+
 /// One keystroke-to-action mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
@@ -147,6 +152,61 @@ pub struct BindSection {
     /// Master switch. Off = engine fully inert (every key forwards).
     pub enabled: bool,
     pub bindings: Vec<Binding>,
+}
+
+impl BindSection {
+    /// Drop every binding a user must never have meant, and log what was
+    /// dropped. See [`Binding::is_bindable`] for the exact rule.
+    ///
+    /// Why the engine sanitizes and not just the GUI: the config file is
+    /// a written artifact — an earlier GUI release (or a hand edit) can
+    /// leave a binding like bare Tab in it, and the engine must stay
+    /// correct against the file that exists, not the file the current
+    /// GUI would write. A bad binding must never cost the user their
+    /// keyboard; the whole section silently failing to load (what strict
+    /// validation would do here) is exactly that.
+    pub fn sanitized(mut self) -> Self {
+        self.bindings.retain(|b| {
+            if b.is_bindable() {
+                true
+            } else {
+                kvmshare_log::log_warn!(
+                    "shortcut binding for key 0x{:02x} is unsafe (bare or out of range) and was ignored — record it again with a modifier in the GUI",
+                    b.key
+                );
+                false
+            }
+        });
+        self
+    }
+}
+
+impl Binding {
+    /// Would swallowing this chord be safe? A binding must name a real
+    /// key (everything under [`MIN_BINDABLE_KEY`] is error space), and
+    /// either carry at least one modifier **or** name a key whose bare
+    /// press carries no application meaning (see [`Binding::bare_safe`]).
+    /// The keyboard's workhorse keys — Tab, letters, digits, Space,
+    /// Enter — keep their meaning in every application, and a binding
+    /// without modifiers swallows one of them system-wide: the engine
+    /// consumes a bound key before apps see it (both by design and, on
+    /// X11, via a passive grab). The Scroll Lock escape stays available
+    /// regardless: it is wired in the capture layer, outside this
+    /// config.
+    pub fn is_bindable(&self) -> bool {
+        self.key >= MIN_BINDABLE_KEY
+            && !hid::is_modifier(self.key)
+            && (self.mods.any() || Self::bare_safe(self.key))
+    }
+
+    /// Keys whose **bare** press no mainstream application acts on, so
+    /// binding one without modifiers can never eat a keystroke the user
+    /// meant for an app. The default chords are built from this set
+    /// (Scroll Lock, Pause); F13–F24 join them because nothing binds
+    /// them. Everything else needs a modifier.
+    fn bare_safe(key: u32) -> bool {
+        matches!(key, hid::SCROLL_LOCK | hid::PAUSE | 0x68..=0x73)
+    }
 }
 
 impl Default for BindSection {
@@ -227,6 +287,12 @@ struct PendingChord {
 
 impl ActionEngine {
     pub fn new(cfg: BindSection) -> Self {
+        Self::new_sanitized(cfg.sanitized())
+    }
+
+    /// The constructor after sanitization — exposed for tests that need
+    /// to install a known-shape config directly.
+    pub(crate) fn new_sanitized(cfg: BindSection) -> Self {
         Self {
             cfg,
             mods: Mods::NONE,
@@ -243,9 +309,12 @@ impl ActionEngine {
 
     /// Adopt a new config section (hot reload). Drops any half-typed
     /// chord — the old prefix may mean nothing under the new bindings.
+    /// Incoming bindings pass the same safety gate as startup (see
+    /// [`BindSection::sanitized`]): a config edit must never arm a
+    /// bare-Tab swallow mid-session either.
     pub fn set_config(&mut self, cfg: BindSection) {
         self.pending = None;
-        self.cfg = cfg;
+        self.cfg = cfg.sanitized();
         // `owned` survives: those presses were consumed, so their
         // releases stay ours regardless of the new bindings.
     }
