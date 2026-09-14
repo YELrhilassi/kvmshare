@@ -150,6 +150,9 @@ release: winres
 	tar -C dist -czf dist/kvmshare_$(VERSION)_linux_amd64.tar.gz kvmshare_$(VERSION)_linux_amd64
 	cp gui/kvmshare-install dist/kvmshare-install_$(VERSION)_linux_amd64
 	cp gui/kvmshare-installer dist/kvmshare-installer_$(VERSION)_linux_amd64
+	@# Sanity gate: a fresh Windows role binary must carry this
+	@# release's build banner. A silent cargo failure used to leave
+	@# the previous build's exe in the dist dir and ship it.
 	@if [ -n "$(MINGW)" ]; then \
 		echo "mingw-w64 found — building Windows binaries"; \
 		$(CARGO) build --release --target $(WIN_TARGET) || exit 1; \
@@ -157,9 +160,6 @@ release: winres
 		( cd dist && zip -qr kvmshare_$(VERSION)_windows_amd64.zip kvmshare_$(VERSION)_windows_amd64 ); \
 		cp gui/kvmshare-install.exe dist/kvmshare-install_$(VERSION)_windows_amd64.exe; \
 		cp gui/kvmshare-installer.exe dist/kvmshare-installer_$(VERSION)_windows_amd64.exe; \
-		@# Sanity gate: a fresh Windows role binary must carry this
-		@# release's build banner. A silent cargo failure used to leave
-		@# the previous build's exe in the dist dir and ship it.
 		grep -q " (build " dist/kvmshare_$(VERSION)_windows_amd64/kvmshare-server.exe || { echo "FATAL: Windows server exe has no build banner (stale cross-compile output)"; exit 1; }; \
 	else \
 		echo "note: x86_64-w64-mingw32-gcc not found — Windows server/client binaries omitted (install mingw-w64, then make release includes them)"; \
