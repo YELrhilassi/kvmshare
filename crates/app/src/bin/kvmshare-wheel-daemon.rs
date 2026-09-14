@@ -33,6 +33,17 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    // --version still answers on every platform: the GUI's install check
+    // reads the build id from every binary in the set, and a Windows
+    // install carries this file as a stub.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "kvmshare-wheel-daemon {} (build {})",
+            kvmshare_app::PKG_VERSION,
+            kvmshare_app::BUILD_ID
+        );
+        return;
+    }
     eprintln!("kvmshare-wheel-daemon: not supported on this platform (Linux only)");
     std::process::exit(1);
 }
