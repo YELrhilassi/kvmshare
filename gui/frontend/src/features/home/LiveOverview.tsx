@@ -23,7 +23,7 @@ import { RotateCw } from "lucide-react";
 //               both the trusted and the refused lists; the Home page
 //               never makes the user think about the difference. Fine
 //               control by machine id stays on the Server page.)
-type RowState = "connected" | "blocked" | "ready" | "nearby" | "offline";
+type RowState = "connected" | "blocked" | "ready" | "away" | "nearby" | "offline";
 
 // Same prefix contract as the backend (ids.Trusted): an entry matches a
 // machine id when either is a prefix of the other, and entries shorter
@@ -60,7 +60,7 @@ export default function LiveOverview() {
       const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
       if (clientState.status === "connected" && clientState.server === addr) return "connected";
     }
-    if (matchesID(trusted, p.id)) return "ready";
+    if (matchesID(trusted, p.id)) return p.active ? "ready" : "away";
     if (p.active) return "nearby";
     return "offline";
   };
@@ -122,6 +122,7 @@ export default function LiveOverview() {
     connected: { label: isServer ? "connected" : "in control", className: "bg-emerald-500/10 text-emerald-500" },
     blocked: { label: "blocked", className: "bg-destructive/10 text-destructive" },
     ready: { label: "ready", className: "bg-sky-500/10 text-sky-400" },
+    away: { label: "away", className: "bg-muted/40 text-muted-foreground" },
     nearby: { label: "nearby", className: "bg-amber-500/10 text-amber-500" },
     offline: { label: "offline", className: "bg-muted/40 text-muted-foreground" },
   };
@@ -133,6 +134,8 @@ export default function LiveOverview() {
         return "refused until you unblock it";
       case "ready":
         return "waiting for it to come online";
+      case "away":
+        return "trusted — connects when its server starts";
       case "offline":
         return "not running";
       default:
