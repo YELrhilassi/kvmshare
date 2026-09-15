@@ -70,6 +70,37 @@ pub enum SessionEnd {
     Reconnect,
 }
 
+/// A refusal the *server* decided at the handshake: a policy answer
+/// (revoked, not allowed, outside the local network), not a network
+/// failure. Retrying cannot change the answer — every retry is another
+/// refused handshake, which the client used to loop on forever (its
+/// GUI stuck at "connecting…", the server's log the only witness).
+/// The reconnect loop treats this as final: it stops and reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The wire error code (see `kvmshare_protocol::id::errors`).
+    pub code: u8,
+    /// The server's human-readable explanation — surfaced to the
+    /// operator through the client's state file and GUI.
+    pub text: String,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server refused this machine: {}", self.text)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// Recover a [`Refusal`] from an `io::Error` that carries one (the
+/// `Client::connect` failure path wraps errors in `io::Error`). The
+/// reconnect loop uses this to tell a policy answer from a network
+/// failure.
+pub fn refusal_from(err: &io::Error) -> Option<Refusal> {
+    err.get_ref()?.downcast_ref::<Refusal>().cloned()
+}
+
 /// A connected client. The transport is owned by the TCP thread (the
 /// thread that called [`Client::run`]); the cursor stream socket moves
 /// into [`Shared`] when `run` starts.
@@ -115,9 +146,7 @@ impl Client {
                 }
                 (own_screen_id, layout, server_id)
             }
-            RecvResult::Msg(Message::Error { code, text }) => Err(io::Error::other(format!(
-                "server rejected the connection ({code}): {text}"
-            )))?,
+            RecvResult::Msg(Message::Error { code, text }) => Err(io::Error::other(Refusal { code, text }))?,
             other => return Err(io::Error::other(format!("unexpected first message: {other:?}"))),
         };
 

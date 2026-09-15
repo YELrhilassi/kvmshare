@@ -11,7 +11,7 @@ use std::time::Duration;
 use kvmshare_app::guard::{self, RoleGuard};
 use kvmshare_app::{
     hostname, machine_id, parse_client_args, revoked_policy_from_env, state_dir, with_default_port,
-    write_client_state, write_client_state_stopped, DEFAULT_PORT,
+    write_client_state, write_client_state_refused, write_client_state_stopped, DEFAULT_PORT,
 };
 use kvmshare_core::client::{Client, SessionEnd};
 use kvmshare_log::{log_error, log_info, log_warn};
@@ -160,6 +160,18 @@ fn run() -> Result<(), String> {
                 }
             }
             Err(e) => {
+                // A refusal is the server answering a question, not the
+                // network failing to deliver it. Retrying cannot change
+                // the answer — the machine must be un-revoked, trusted,
+                // or re-added to the layout by an operator — so the loop
+                // stops and says why. (The old behavior retried forever:
+                // the GUI read "connecting…" while the server answered
+                // every attempt with the same refusal.)
+                if let Some(refusal) = kvmshare_core::client::refusal_from(&e) {
+                    log_error!("{refusal} — staying stopped");
+                    write_client_state_refused(&state_dir, &addr, &refusal.text);
+                    std::process::exit(1);
+                }
                 if !warned {
                     log_warn!("connect failed: {e} — retrying every 3 s");
                     warned = true;

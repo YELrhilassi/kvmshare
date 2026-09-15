@@ -32,6 +32,29 @@ pub fn write_client_state_stopped(state_dir: &Path, server: &str) {
     write_state(state_dir, "disconnected", server, true);
 }
 
+/// Write the state for a connection the server *refused* (a policy
+/// answer: revoked, not allowed, outside the local network). The status
+/// is `refused` and the server's explanation travels in `reason=`, so
+/// the GUI can show the operator the actual problem instead of a
+/// forever-"connecting…". The process exits after writing this —
+/// retrying cannot change the server's answer — so the GUI reads a
+/// stable terminal state, not a flapping one.
+pub fn write_client_state_refused(state_dir: &Path, server: &str, reason: &str) {
+    let dir = state_dir.to_path_buf();
+    let file = dir.join("client.state");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // One line; a reason is prose and must never inject newlines into
+    // the key=value file.
+    let reason = reason.replace(['\n', '\r'], " ");
+    let body = format!("status=refused\nserver={server}\nreason={reason}\n");
+    let tmp = file.with_extension("state.tmp");
+    if fs::write(&tmp, body).is_ok() {
+        let _ = fs::rename(&tmp, &file);
+    }
+}
+
 fn write_state(state_dir: &Path, status: &str, server: &str, stopped: bool) {
     let dir = state_dir.to_path_buf();
     let file = dir.join("client.state");
@@ -74,5 +97,15 @@ mod tests {
         assert!(body.contains("status=disconnected"));
         assert!(body.contains("stopped=1"), "a server-requested stop must be distinguishable");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refused_state_carries_a_single_line_reason() {
+        let dir = scratch_dir("refused");
+        write_client_state_refused(&dir, "192.168.1.72:24800", "revoked: line one\nline two");
+        let body = fs::read_to_string(dir.join("client.state")).unwrap();
+        assert!(body.contains("status=refused"));
+        assert!(body.contains("reason=revoked: line one line two"));
+        assert_eq!(body.lines().count(), 3, "reason must stay on one line");
     }
 }

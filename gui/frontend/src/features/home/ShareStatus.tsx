@@ -29,6 +29,11 @@ export default function ShareStatus() {
   const isServer = mode === "server";
   const active = isServer ? running.server : running.client;
   const connected = clientState.status === "connected";
+  // The server answered the connect attempt with a policy refusal
+  // (revoked, not in the layout, outside the network). The client stops
+  // instead of retrying — so this state is terminal and needs its own
+  // sentence, not a forever-"Connecting…".
+  const refused = !isServer && clientState.status === "refused";
   const connecting = !isServer && running.client && !connected;
   // A client that has been "connecting" past a short grace period is
   // not really on its way — the server is unreachable and it keeps
@@ -66,11 +71,13 @@ export default function ShareStatus() {
       : "Not sharing"
     : connected
       ? `Connected to ${serverLabel}`
-      : connecting
-        ? stuckConnecting
-          ? "Server unreachable"
-          : "Connecting…"
-        : "Not connected";
+      : refused
+        ? "Connection refused"
+        : connecting
+          ? stuckConnecting
+            ? "Server unreachable"
+            : "Connecting…"
+          : "Not connected";
 
   const blurb = isServer
     ? active
@@ -78,11 +85,13 @@ export default function ShareStatus() {
       : "Nothing is shared right now. Start to let other machines use your keyboard and mouse."
     : connected
       ? `${serverLabel} is using this machine's keyboard and mouse${clientName ? ` (as ${clientName})` : ""}.`
-      : connecting
-        ? stuckConnecting
-          ? `Can't reach ${serverLabel} — retrying every few seconds.`
-          : "Connecting to the server — nothing is shared yet."
-        : "No one is controlling this machine right now. Pick a machine below to connect.";
+      : refused
+        ? clientState.reason || "The server declined this machine's connection."
+        : connecting
+          ? stuckConnecting
+            ? `Can't reach ${serverLabel} — retrying every few seconds.`
+            : "Connecting to the server — nothing is shared yet."
+          : "No one is controlling this machine right now. Pick a machine below to connect.";
 
   const verb = isServer
     ? active
@@ -97,7 +106,7 @@ export default function ShareStatus() {
   return (
     <Section title="Status">
       <div className="flex items-center gap-3">
-        <span className={cn("h-2.5 w-2.5 rounded-full", dot ? "bg-emerald-500" : "bg-muted-foreground/40")} />
+        <span className={cn("h-2.5 w-2.5 rounded-full", dot ? "bg-emerald-500" : refused ? "bg-destructive" : "bg-muted-foreground/40")} />
         <span className="text-xl font-semibold tracking-tight">{title}</span>
       </div>
       <p className="max-w-md text-sm text-muted-foreground">{blurb}</p>

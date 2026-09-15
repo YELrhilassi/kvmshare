@@ -7,8 +7,10 @@
 //! `geometry`.
 
 mod geometry;
+mod ids;
 mod io;
 
+pub use ids::set_id;
 pub use io::default_config_path;
 
 use std::path::Path;

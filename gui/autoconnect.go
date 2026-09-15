@@ -102,6 +102,16 @@ func (a *App) autoConnectStep(attempts map[string]*autoConnectAttempt, wasRunnin
 	if wasRunning && a.clientStoppedByServer() {
 		a.pauseAutoConnect()
 	}
+	// A refused client exits after writing its terminal state (the server
+	// answered the handshake with a policy refusal). Reconnecting cannot
+	// change that answer — only an operator action can (un-revoke, trust,
+	// layout edit) — so auto-connect must stop here too, or every tick
+	// would spawn a client that connects, is refused, and exits: a
+	// connect storm against a server that keeps saying no. The pause
+	// clears on the operator's next explicit Start/Connect.
+	if a.clientRefused() {
+		a.pauseAutoConnect()
+	}
 	if a.autoConnectPaused() {
 		// Re-arming must not inherit a stale backoff from before the stop.
 		a.resetAttempts(attempts)
@@ -363,6 +373,25 @@ func (a *App) clientStoppedByServer() bool {
 	for _, line := range strings.Split(string(raw), "\n") {
 		kv := strings.SplitN(strings.TrimSpace(line), "=", 2)
 		if len(kv) == 2 && kv[0] == "stopped" && kv[1] == "1" {
+			return true
+		}
+	}
+	return false
+}
+
+// clientRefused reports whether the client's state file records a
+// connection the server refused (a terminal policy answer — revoked,
+// not in the layout, outside the network). The file only says "refused"
+// after the client gave up for good, so reading it here is safe: there
+// is no transient "refused" state a retrying client passes through.
+func (a *App) clientRefused() bool {
+	raw, err := os.ReadFile(filepath.Join(a.stateDir, "client.state"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		kv := strings.SplitN(strings.TrimSpace(line), "=", 2)
+		if len(kv) == 2 && kv[0] == "status" && kv[1] == "refused" {
 			return true
 		}
 	}

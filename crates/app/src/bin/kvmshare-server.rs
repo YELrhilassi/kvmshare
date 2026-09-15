@@ -4,7 +4,7 @@
 //! desktop layout, listens for clients, and forwards local input to
 //! whichever client the cursor is on.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -178,6 +178,17 @@ fn spawn_event_sink(
         while let Ok(evt) = rx.recv() {
             match evt {
                 ServerEvent::ClientConnected { name, id, addr, since_ms, info } => {
+                    // Connecting *is* trust: the operator paired this
+                    // machine by letting it in (a layout screen, a trust
+                    // click, or a pairing request), and a peer that was
+                    // admitted once must keep working — including after
+                    // the operator's Disconnect button, whose reconnect
+                    // must not bounce off a trust wall. Recording it in
+                    // the config keeps the GUI's "trusted machines"
+                    // surface truthful about who can get in.
+                    if let Err(e) = auto_trust(&config_path, &id) {
+                        log_warn!("auto-trust {id}: {e}");
+                    }
                     clients.insert(name.clone(), (id, addr, since_ms));
                     let _ = auto_config_screen_size(&config_path, &name, &info);
                 }
@@ -188,6 +199,25 @@ fn spawn_event_sink(
             persist_clients(&state_dir, &clients);
         }
     });
+}
+
+/// Record a connected client's machine id in the config's trusted list.
+///
+/// A machine can only reach this point by being admitted — the layout
+/// named it, or the operator trusted it, or pairing accepted it — so
+/// remembering its id makes that admission durable and visible. This is
+/// what makes "connect → disconnect → connect again" work without the
+/// reconnect depending on a layout screen that a disconnect may have
+/// removed. Idempotent (already-trusted is a no-op); failures are
+/// non-fatal (the session proceeds; only the *next* start loses the
+/// shortcut).
+fn auto_trust(config_path: &Path, machine_id: &str) -> Result<(), String> {
+    let mut cfg = Config::load(config_path)?;
+    if cfg.network_policy().is_trusted(machine_id) {
+        return Ok(());
+    }
+    cfg.network.trusted_ids = kvmshare_app::set_id(&cfg.network.trusted_ids, machine_id, true);
+    cfg.save(config_path)
 }
 
 /// Serialize the current client map as `clients.json` (atomic write).

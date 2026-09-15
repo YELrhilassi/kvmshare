@@ -21,8 +21,14 @@ const connectingGrace = 8 * time.Second
 
 // ClientState is what the Home page's connection panel shows.
 type ClientState struct {
-	Status string `json:"status"` // "connected" | "connecting" | "disconnected"
+	Status string `json:"status"` // "connected" | "connecting" | "disconnected" | "refused"
 	Server string `json:"server"` // address the client talks to
+	// Reason carries the server's refusal explanation when Status is
+	// "refused" (revoked, not in the layout, outside the local network).
+	// Empty otherwise. It is the operator-facing answer to "why can this
+	// machine not connect" — the client stops on a refusal, so without
+	// it the GUI could only ever show a forever-"connecting…".
+	Reason string `json:"reason"`
 	// ConnectingSinceMs is when the current "connecting" run began
 	// (unix ms, 0 when not connecting). The page uses it to say
 	// "can't reach the server" instead of a forever-"Connecting…".
@@ -71,11 +77,14 @@ func (a *App) ClientStatus() ClientState {
 		}
 		switch kv[0] {
 		case "status":
-			if kv[1] == "connected" || kv[1] == "connecting" || kv[1] == "disconnected" {
+			switch kv[1] {
+			case "connected", "connecting", "disconnected", "refused":
 				st.Status = kv[1]
 			}
 		case "server":
 			st.Server = kv[1]
+		case "reason":
+			st.Reason = kv[1]
 		}
 	}
 	// Remember when the client started waiting, so "connecting" can

@@ -134,8 +134,10 @@ export interface UpdateResult {
 }
 
 export interface ClientState {
-  status: "connected" | "connecting" | "disconnected";
+  status: "connected" | "connecting" | "disconnected" | "refused";
   server: string;
+  /** The server's refusal explanation when status is "refused". */
+  reason?: string;
   /** When the current connecting run began (unix ms, 0 when not connecting). */
   connectingSinceMs: number;
 }

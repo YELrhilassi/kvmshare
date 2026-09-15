@@ -163,8 +163,9 @@ export default function ServerPage() {
 
         <Section title="Trusted machines" className="mt-12">
           <p className="text-sm text-muted-foreground">
-            A trusted machine may connect even before it appears in the layout. You can also trust a machine
-            from its row on the Home page — its id is shown there.
+            A trusted machine may connect even before it appears in the layout. Machines you allow to connect
+            are added here automatically — connecting is trusting. You can also trust a machine from its row on
+            the Home page, or paste its id below.
           </p>
           <div className="flex flex-wrap gap-1.5">
             {network.trustedIds.length === 0 && (

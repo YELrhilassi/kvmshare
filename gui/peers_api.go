@@ -34,9 +34,20 @@ func (a *App) RefreshDiscovery() ([]discovery.Peer, error) {
 // SendConnectRequest asks a discovered client (identified by its full
 // or short id) to connect to this machine's server. Used from the
 // server's Home page: pick a nearby machine, tell it to connect here.
+//
+// The request is a UDP datagram: fire-and-forget by nature. When this
+// machine is not running a server, the client would dutifully try to
+// connect, time out against a port nobody listens on, and retry forever
+// — the “pc server ready / waiting for it to come online” stand-off the
+// Connect button used to produce. The button only exists to invite a
+// peer to *this* server, so refusing it here turns a silent deadlock
+// into an error the operator can act on.
 func (a *App) SendConnectRequest(peerID string) error {
 	if a.disc == nil {
 		return fmt.Errorf("discovery not started")
+	}
+	if !a.ServerRunning() {
+		return fmt.Errorf("start this machine's server first — there is nothing for %s to connect to yet", shortID(peerID))
 	}
 	return a.disc.SendConnectRequest(peerID)
 }

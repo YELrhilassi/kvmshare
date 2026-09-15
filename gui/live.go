@@ -105,10 +105,20 @@ func (a *App) snapshot() LiveSnapshot {
 func (a *App) reconciledClientState(clientRunning bool) ClientState {
 	cs := a.ClientStatus()
 	if !clientRunning {
+		// "refused" is a terminal answer from the server, and the client
+		// process has exited after writing it. Reconciling must not
+		// flatten it into "disconnected": the whole point is to show
+		// the operator *why* the machine cannot connect. (Every other
+		// no-process state is reconciled to "disconnected" — the file
+		// may outlive a crashed process — but a refusal is a stable
+		// fact, not a transient one.)
+		if cs.Status == "refused" {
+			return cs
+		}
 		cs.Status = "disconnected"
 		return cs
 	}
-	if cs.Status != "connected" {
+	if cs.Status != "connected" && cs.Status != "refused" {
 		cs.Status = "connecting"
 	}
 	return cs

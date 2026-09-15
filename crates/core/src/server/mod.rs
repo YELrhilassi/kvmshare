@@ -138,7 +138,7 @@ impl Policy {
 /// or its 8-char short form (prefix match). Guards: empty entries never
 /// match; a short form must be at least 4 chars so a typo'd one-char
 /// "trust" cannot silently admit everything starting with it.
-pub(crate) fn id_matches(id: &str, entry: &str) -> bool {
+pub fn id_matches(id: &str, entry: &str) -> bool {
     if entry.is_empty() || entry.len() < 4 {
         return false;
     }
@@ -665,9 +665,18 @@ impl Server {
             }
         };
         match command {
-            // The operator dismissed the machine; the screen goes too so a
-            // reconnect (reconnect/restart commands) is admitted fresh.
-            kvmshare_protocol::id::control::DISCONNECT => self.disconnect_client(id, "the operator asked it to disconnect"),
+            // An operator disconnect ends the *session* — it is not a
+            // statement about the machine. The client's screen stays in
+            // the layout so a later Connect (this GUI or the client's
+            // own retry) is admitted by the same rule that admitted it
+            // before; policy-level refusals go through Block, which
+            // removes the screen. Without this, a disconnect deleted a
+            // layout-named screen and every reconnect bounced off the
+            // allowlist — the GUI stuck at "connecting…" with the
+            // refusal only visible in a log the user had turned off.
+            kvmshare_protocol::id::control::DISCONNECT => {
+                self.disconnect_client_keep_screen(id, "the operator asked it to disconnect")
+            }
             _ => {
                 log_info!("client command to {name}: control code {command}");
                 client::enqueue(&self.clients, id, Message::Control { command });

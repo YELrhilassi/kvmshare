@@ -300,12 +300,15 @@ fn allowlist_refuses_unknown_and_admits_trusted() {
 
     let info = screen_info();
 
-    // Untrusted and unnamed: refused with a NOT_ALLOWED error.
+    // Untrusted and unnamed: refused with a typed NOT_ALLOWED refusal.
     let err = Client::connect(&format!("127.0.0.1:{port}"), "stranger", "machine-stranger", info.clone())
         .unwrap_err();
-    assert!(
-        err.to_string().contains("rejected"),
-        "unknown untrusted client should be refused, got: {err}"
+    let refusal = kvmshare_core::client::refusal_from(&err)
+        .unwrap_or_else(|| panic!("unknown untrusted client should be refused, got: {err}"));
+    assert_eq!(
+        refusal.code,
+        kvmshare_protocol::id::errors::NOT_ALLOWED,
+        "a policy refusal must carry its code: {refusal}"
     );
     // Wait a beat so the refused connection is fully torn down; the
     // server never registered it.
@@ -380,10 +383,9 @@ fn allowlist_admits_by_short_id_prefix() {
     // admitted (the 8-char short form is specific enough).
     let err = Client::connect(&format!("127.0.0.1:{port}"), "wrong-peer", "70b97dXXffffffffffffffffffffffffff", info)
         .unwrap_err();
-    assert!(
-        err.to_string().contains("rejected"),
-        "id not matching the short prefix should be refused, got: {err}"
-    );
+    let refusal = kvmshare_core::client::refusal_from(&err)
+        .unwrap_or_else(|| panic!("id not matching the short prefix should be refused, got: {err}"));
+    assert_eq!(refusal.code, kvmshare_protocol::id::errors::NOT_ALLOWED);
 }
 
 #[test]
@@ -542,10 +544,15 @@ fn revoked_machine_is_refused_even_when_named_in_the_layout() {
     let info = screen_info();
     // "hp" IS the layout's screen 1 — named, matching, and still refused.
     let err = Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("rejected"), "revoked client must be refused, got: {err}");
-    assert!(err.contains("revoked"), "the refusal must say why, got: {err}");
+        .unwrap_err();
+    let refusal = kvmshare_core::client::refusal_from(&err)
+        .unwrap_or_else(|| panic!("revoked client must be refused, got: {err}"));
+    assert_eq!(
+        refusal.code,
+        kvmshare_protocol::id::errors::REVOKED,
+        "the refusal must carry the revoked code: {refusal}"
+    );
+    assert!(refusal.text.contains("revoked"), "the refusal must say why, got: {refusal}");
     thread::sleep(Duration::from_millis(50));
     assert_eq!(server.client_count(), 0, "a revoked client must never be registered");
 }
@@ -682,4 +689,77 @@ fn unrevoked_machine_is_readmitted_fresh() {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(server.client_count(), 1, "an un-revoked machine is admitted again");
+}
+
+/// The operator's Disconnect button, then reconnect: the session ends
+/// but the *layout screen stays*, so the client's next connect is
+/// admitted by the same rule as the first one. This is the regression
+/// behind "after clicking disconnect I can't reconnect" — the disconnect
+/// used to delete the client's screen from the running session, and the
+/// allowlist then refused every reconnect (NOT_ALLOWED) while the GUI
+/// showed a forever-"connecting…".
+#[test]
+fn operator_disconnect_then_reconnect_is_admitted() {
+    let session = Session::new(two_screen_layout(), 0);
+    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    // Allowlist on, trusted list empty: "hp" is admitted only because
+    // its name is pinned in the layout — exactly the production setup
+    // this regression came from.
+    let policy = Policy { allowlist: true, local_only: false, ..Policy::default() };
+    let server = Arc::new(
+        Server::with_options(
+            session,
+            0,
+            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+        )
+        .unwrap(),
+    );
+    let port = server.local_addr().unwrap().port();
+    let (_input_tx, input_rx) = mpsc::channel::<Message>();
+    let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
+    let clipboard: kvmshare_core::server::ServerClipboard =
+        Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
+    thread::spawn({
+        let server = server.clone();
+        move || {
+            server
+                .run(input_rx, engine, clipboard, Arc::new(kvmshare_core::server::Liveness::default()))
+                .unwrap()
+        }
+    });
+
+    let info = screen_info();
+
+    // First connect: admitted via the pinned layout screen.
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info.clone()).unwrap();
+    assert_eq!(client.own_id(), 1);
+    drop(client);
+
+    // The operator disconnects the machine (the GUI's Disconnect). The
+    // main loop drains the control channel on an idle poll.
+    control_tx
+        .send(Control::ClientCommand { name: "hp".into(), command: kvmshare_protocol::id::control::DISCONNECT })
+        .unwrap();
+    // The first client's reader thread also needs a moment to observe
+    // its ended session and tear down.
+    for _ in 0..100 {
+        if server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(server.client_count(), 0, "the operator disconnect must end the session");
+    thread::sleep(Duration::from_millis(150)); // let the main loop finish teardown
+
+    // Reconnect: must be admitted again — the screen survived the
+    // disconnect. Before the fix this failed with NOT_ALLOWED.
+    let client = Client::connect(&format!("127.0.0.1:{port}"), "hp", "machine-hp", info).unwrap();
+    assert_eq!(client.own_id(), 1, "the disconnect must not have removed the layout screen");
+    for _ in 0..100 {
+        if server.client_count() >= 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(server.client_count(), 1, "the reconnect must be admitted");
 }
