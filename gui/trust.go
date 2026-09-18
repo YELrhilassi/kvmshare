@@ -98,6 +98,9 @@ func (a *App) RevokeServer(id string, revoked bool) error {
 	a.mu.Lock()
 	a.settings.RevokedServers = setID(a.settings.RevokedServers, id, revoked)
 	a.saveSettingsLocked()
+	// The elevated client spawn reads this list from the file fallback,
+	// not from an environment — keep it in step at every change.
+	a.writeRevokedIdsFileLocked()
 	a.mu.Unlock()
 
 	if !revoked {

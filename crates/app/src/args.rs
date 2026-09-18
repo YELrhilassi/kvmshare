@@ -26,6 +26,9 @@ pub struct ServerArgs {
     pub log_level: Option<String>,
     /// Log-control file path (GUI writes it; hot-reloaded by the logger).
     pub log_ctl: Option<PathBuf>,
+    /// Log-file path (GUI sets it when stderr would go nowhere: the
+    /// elevated scheduled-task spawn on Windows).
+    pub log_file: Option<PathBuf>,
 }
 
 /// Parse `kvmshare-server [--config PATH] [--port N] [--log-level LEVEL] [--logctl PATH]`.
@@ -34,6 +37,7 @@ pub fn parse_server_args() -> Result<ServerArgs, String> {
     let mut port: Option<u16> = None;
     let mut log_level: Option<String> = None;
     let mut log_ctl: Option<PathBuf> = None;
+    let mut log_file: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -44,17 +48,18 @@ pub fn parse_server_args() -> Result<ServerArgs, String> {
             }
             "--log-level" | "-l" => log_level = Some(args.next().ok_or("--log-level needs a value")?),
             "--logctl" => log_ctl = Some(PathBuf::from(args.next().ok_or("--logctl needs a path")?)),
+            "--log-file" => log_file = Some(PathBuf::from(args.next().ok_or("--log-file needs a path")?)),
             "--version" | "-V" => print_version("kvmshare-server"),
             "--help" | "-h" => {
                 println!(
-                    "usage: kvmshare-server [--config PATH] [--port N] [--log-level error|warn|info|debug|trace] [--logctl PATH]\n       kvmshare-server --version"
+                    "usage: kvmshare-server [--config PATH] [--port N] [--log-level error|warn|info|debug|trace] [--logctl PATH] [--log-file PATH]\n       kvmshare-server --version"
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(ServerArgs { config, port: port.unwrap_or(0), log_level, log_ctl })
+    Ok(ServerArgs { config, port: port.unwrap_or(0), log_level, log_ctl, log_file })
 }
 
 /// Arguments for `kvmshare-client`.
@@ -64,6 +69,9 @@ pub struct ClientArgs {
     pub log_level: Option<String>,
     /// Log-control file path (GUI writes it; hot-reloaded by the logger).
     pub log_ctl: Option<PathBuf>,
+    /// Log-file path (GUI sets it when stderr would go nowhere: the
+    /// elevated scheduled-task spawn on Windows).
+    pub log_file: Option<PathBuf>,
 }
 
 /// Parse `kvmshare-client SERVER[:PORT] [--name NAME] [--log-level LEVEL] [--logctl PATH]`.
@@ -72,16 +80,18 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
     let mut name: Option<String> = None;
     let mut log_level: Option<String> = None;
     let mut log_ctl: Option<PathBuf> = None;
+    let mut log_file: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--name" | "-n" => name = Some(args.next().ok_or("--name needs a value")?),
             "--log-level" | "-l" => log_level = Some(args.next().ok_or("--log-level needs a value")?),
             "--logctl" => log_ctl = Some(PathBuf::from(args.next().ok_or("--logctl needs a path")?)),
+            "--log-file" => log_file = Some(PathBuf::from(args.next().ok_or("--log-file needs a path")?)),
             "--version" | "-V" => print_version("kvmshare-client"),
             "--help" | "-h" => {
                 println!(
-                    "usage: kvmshare-client SERVER[:PORT] [--name NAME] [--log-level error|warn|info|debug|trace] [--logctl PATH]\n       kvmshare-client --version"
+                    "usage: kvmshare-client SERVER[:PORT] [--name NAME] [--log-level error|warn|info|debug|trace] [--logctl PATH] [--log-file PATH]\n       kvmshare-client --version"
                 );
                 std::process::exit(0);
             }
@@ -105,7 +115,7 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(ClientArgs { server_addr: addr.ok_or("missing server address (use `kvmshare-client HOST[:PORT]`)")?, name, log_level, log_ctl })
+    Ok(ClientArgs { server_addr: addr.ok_or("missing server address (use `kvmshare-client HOST[:PORT]`)")?, name, log_level, log_ctl, log_file })
 }
 
 /// Normalize `host` or `host:port` to `host:port` (default port).

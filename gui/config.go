@@ -280,9 +280,14 @@ func (a *App) SaveConfig(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
 	}
-	// Atomic replace: the running server watches this file, so it must
-	// never see a torn write.
-	if err := fileutil.Write(a.configPath, raw, 0o644); err != nil {
+	// Atomic replace under the cross-process lock: the running server
+	// watches this file AND writes it too (auto-trust, screen-size
+	// correction). Both writers read-modify-write the whole file, so
+	// without the shared lock a save could land between the server's
+	// read and write and erase its change — a trust edit vanishing, the
+	// flapping users saw. The lock (same file the Rust side takes)
+	// makes the whole read-modify-write series exclusive.
+	if err := fileutil.WriteLocked(a.configPath, raw, 0o644, true); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 

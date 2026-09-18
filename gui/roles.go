@@ -192,7 +192,7 @@ func (a *App) ServerStart() (bool, error) {
 		return false, err
 	}
 	p, err := a.spawnServerLocked()
-	if err == nil {
+	if err == nil && p != nil {
 		err = a.checkStarted(p, a.serverLogPath, "server")
 	}
 	// The stop reported the client gone, yet the fresh server still died
@@ -202,7 +202,7 @@ func (a *App) ServerStart() (bool, error) {
 	if conflictError(err) {
 		if stopErr := a.stopRoleLocked(roleClient); stopErr == nil {
 			p, err = a.spawnServerLocked()
-			if err == nil {
+			if err == nil && p != nil {
 				err = a.checkStarted(p, a.serverLogPath, "server")
 			}
 		}
@@ -211,12 +211,18 @@ func (a *App) ServerStart() (bool, error) {
 		return false, err
 	}
 	a.serverProc = p
-	a.watchAutoRestart(roleServer, p)
+	// A nil p is the task-spawned (elevated) path: no handle to reap,
+	// liveness already proven by the role lock.
+	if p != nil {
+		a.watchAutoRestart(roleServer, p)
+	}
 	return true, nil
 }
 
 // spawnServerLocked starts the server binary with the configured args.
-// Callers hold a.mu.
+// Returns the reaped child handle, or nil when the platform's elevated
+// path started the role (no handle exists; liveness was proven against
+// the role lock). Callers hold a.mu.
 func (a *App) spawnServerLocked() (*proc, error) {
 	if _, err := os.Stat(a.serverPath); err != nil {
 		return nil, fmt.Errorf("server binary not found at %s (run make install)", a.serverPath)
@@ -227,7 +233,7 @@ func (a *App) spawnServerLocked() (*proc, error) {
 	// The log-control file sets the level/enabled the operator chose;
 	// the process polls it, so later changes apply without a restart.
 	a.writeLogCtlLocked(roleServer)
-	return a.spawn(a.serverPath, a.serverLogPath, nil, "--config", a.configPath,
+	return a.startRoleProcess(a.serverPath, a.serverLogPath, nil, "--config", a.configPath,
 		"--logctl", filepath.Join(a.stateDir, roleServer+".logctl"))
 }
 
@@ -277,8 +283,12 @@ func (a *App) clientStartLocked() (bool, error) {
 	// refuses a session whose server id is on it, which covers connects
 	// the GUI never screened (a hand-typed address, a reconnect).
 	env := a.clientRevokedEnvLocked()
-	p, err := a.spawn(a.clientPath, a.clientLogPath, env, args...)
-	if err == nil {
+	// The elevated task spawn carries no environment: persist the
+	// revoked list where the client reads it as a fallback (the env
+	// channel still wins for direct spawns).
+	a.writeRevokedIdsFileLocked()
+	p, err := a.startRoleProcess(a.clientPath, a.clientLogPath, env, args...)
+	if err == nil && p != nil {
 		err = a.checkStarted(p, a.clientLogPath, "client")
 	}
 	// Same conflict-retry as ServerStart: a server that reappeared in
@@ -286,8 +296,8 @@ func (a *App) clientStartLocked() (bool, error) {
 	// into a confusing "exited immediately" error.
 	if conflictError(err) {
 		if stopErr := a.stopRoleLocked(roleServer); stopErr == nil {
-			p, err = a.spawn(a.clientPath, a.clientLogPath, env, args...)
-			if err == nil {
+			p, err = a.startRoleProcess(a.clientPath, a.clientLogPath, env, args...)
+			if err == nil && p != nil {
 				err = a.checkStarted(p, a.clientLogPath, "client")
 			}
 		}
@@ -354,7 +364,7 @@ func (a *App) watchAutoRestart(role string, p *proc) {
 			if relevant {
 				var np *proc
 				np, err = a.spawnServerLocked()
-				if err == nil {
+				if err == nil && np != nil {
 					if cErr := a.checkStarted(np, a.serverLogPath, "server"); cErr != nil {
 						err = cErr
 					} else {
@@ -372,11 +382,13 @@ func (a *App) watchAutoRestart(role string, p *proc) {
 			}
 			restarts++
 			// The fresh process inherits the same supervision: watch it
-			// the same way. A start that survives a while is healthy — it
-			// resets the consecutive-restart budget, so a wedge that only
-			// happens under specific conditions can never exhaust it over
-			// time.
+			// the same way. A task-spawned restart (nil handle) has no
+			// exit to watch — the elevated role manages itself; give up
+			// gracefully instead of dereferencing nil.
 			p = a.serverProc
+			if p == nil {
+				return
+			}
 			select {
 			case <-p.done:
 				if time.Since(p.started) > restartBudgetResetAfter {

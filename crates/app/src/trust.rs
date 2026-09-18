@@ -39,6 +39,28 @@ pub fn revoked_policy_from_env() -> Policy {
     policy_from_revoked_list(&std::env::var(REVOKED_ENV).unwrap_or_default())
 }
 
+/// File in the state dir carrying the same list, used when the spawn
+/// could not carry an environment variable: the GUI's scheduled-task
+/// spawn on Windows (an elevated role process has no custom env) writes
+/// `revoked-ids.txt` beside the locks instead. One list, two channels —
+/// the env wins when both exist (the direct-spawn channel is written
+/// fresh at every spawn and can never go stale).
+pub const REVOKED_FILE: &str = "revoked-ids.txt";
+
+/// The effective revoked-servers policy for this process: the env list
+/// when set, otherwise the state-dir file, otherwise empty.
+pub fn revoked_policy(state_dir: &std::path::Path) -> Policy {
+    if let Ok(raw) = std::env::var(REVOKED_ENV) {
+        if !raw.trim().is_empty() {
+            return policy_from_revoked_list(&raw);
+        }
+    }
+    match std::fs::read_to_string(state_dir.join(REVOKED_FILE)) {
+        Ok(raw) => policy_from_revoked_list(&raw),
+        Err(_) => Policy::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +82,17 @@ mod tests {
         assert!(p.is_revoked("70b97d38631dda4b8f6ef627d753022d"));
         // A different machine is untouched.
         assert!(!p.is_revoked("98980a4d000000000000000000000000"));
+    }
+
+    #[test]
+    fn state_dir_file_is_used_when_env_is_empty() {
+        let dir = std::env::temp_dir().join(format!("kvmtrust-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join(REVOKED_FILE), "70b97d38\n").unwrap();
+        // Env unset (or empty) → the file decides.
+        std::env::remove_var(REVOKED_ENV);
+        let p = revoked_policy(&dir);
+        assert!(p.is_revoked("70b97d38631dda4b8f6ef627d753022d"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

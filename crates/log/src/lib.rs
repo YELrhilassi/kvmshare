@@ -89,6 +89,12 @@ static CONTROL: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// never grow memory without limit — losing a few log lines under
 /// extreme backpressure is the right trade against freezing a cursor.
 static SINK: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
+/// An explicit log file (`--log-file`), opened once by the writer
+/// thread on first use. Set for processes whose stderr does not reach
+/// anything useful — the GUI's scheduled-task spawn on Windows, where
+/// an elevated role has no console and its parent no pipe. When unset,
+/// everything goes to stderr exactly as before.
+static LOG_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// How often the control file is re-read. Cheap (one tiny file), and
 /// 400 ms keeps level changes feeling instant.
@@ -135,6 +141,14 @@ pub fn set_level(lvl: Level) {
     *LEVEL.lock().unwrap() = lvl;
 }
 
+/// Route every following log line into `path` instead of stderr. Used
+/// by the role binaries when launched without a usable stderr (the GUI's
+/// elevated scheduled-task spawn on Windows). Append mode per line, so
+/// a tailer sees lines live and truncation still works.
+pub fn set_log_file(path: PathBuf) {
+    *LOG_FILE.lock().unwrap() = Some(path);
+}
+
 /// Enable or disable all logging at runtime.
 pub fn set_enabled(on: bool) {
     *ENABLED.lock().unwrap() = on;
@@ -160,6 +174,16 @@ fn sink() -> Option<mpsc::SyncSender<String>> {
                         // the loop: the writer thread is the only regular
                         // writer, but other stderr users (panics,
                         // eprintln) must never deadlock on it.
+                        if let Some(path) = LOG_FILE.lock().unwrap().clone() {
+                            // Append per line: the file stays readable by
+                            // the GUI's tailer, and an external truncate
+                            // (ClearLog) keeps working — the file is
+                            // reopened on the next line.
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                                let _ = writeln!(f, "{line}");
+                            }
+                            continue;
+                        }
                         let mut out = std::io::stderr().lock();
                         let _ = writeln!(out, "{line}");
                     }

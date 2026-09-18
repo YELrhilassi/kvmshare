@@ -133,9 +133,20 @@ export interface UpdateResult {
   error?: string;
 }
 
+// How this machine's role processes get their input privileges. On
+// Windows the roles must run elevated to reach elevated windows (Task
+// Manager, installers); the GUI reports whether that is working.
+export interface RoleElevation {
+  elevated: boolean;
+  canElevate: boolean;
+  detail?: string;
+}
+
 export interface ClientState {
   status: "connected" | "connecting" | "disconnected" | "refused";
   server: string;
+  /** The server's machine id from its Welcome (set on "connected"). */
+  serverId?: string;
   /** The server's refusal explanation when status is "refused". */
   reason?: string;
   /** When the current connecting run began (unix ms, 0 when not connecting). */
@@ -220,6 +231,9 @@ interface GoApp {
   EnableLaunchAtStartup(): Promise<void>;
   DisableLaunchAtStartup(): Promise<void>;
   LaunchAtStartupEnabled(): Promise<boolean>;
+  // Role elevation (meaningful on Windows): whether role processes run
+  // elevated, and what stands in the way when they do not.
+  RoleElevation(): Promise<RoleElevation>;
 }
 
 interface WailsCall {
@@ -318,4 +332,5 @@ export const api = (): GoApp => ({
   EnableLaunchAtStartup: () => call<void>("EnableLaunchAtStartup"),
   DisableLaunchAtStartup: () => call<void>("DisableLaunchAtStartup"),
   LaunchAtStartupEnabled: () => call<boolean>("LaunchAtStartupEnabled"),
+  RoleElevation: () => call<RoleElevation>("RoleElevation"),
 });

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useApp } from "@/app/AppProvider";
-import { api, type Settings } from "@/lib/bridge";
+import { api, type RoleElevation, type Settings } from "@/lib/bridge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Section } from "@/components/Section";
@@ -54,6 +54,7 @@ export default function SettingsPage() {
   const { refresh } = useApp();
   const [settings, setSettings] = useState<Settings | null>(null);
   const [autostart, setAutostart] = useState(false);
+  const [elevation, setElevation] = useState<RoleElevation | null>(null);
   const [err, setErr] = useState("");
   const [loadErr, setLoadErr] = useState("");
   const [saved, setSaved] = useState(false);
@@ -61,9 +62,14 @@ export default function SettingsPage() {
   const load = async () => {
     setLoadErr("");
     try {
-      const [s, a] = await Promise.all([api().GetSettings(), api().LaunchAtStartupEnabled()]);
+      const [s, a, el] = await Promise.all([
+        api().GetSettings(),
+        api().LaunchAtStartupEnabled(),
+        api().RoleElevation().catch(() => null),
+      ]);
       setSettings(s);
       setAutostart(a);
+      setElevation(el);
     } catch (e) {
       setLoadErr(String(e));
     }
@@ -191,6 +197,8 @@ export default function SettingsPage() {
         </div>
       </Section>
 
+      {elevation && <ElevationCard status={elevation} />}
+
       <Section title="Diagnostics" className="mt-6">
         <Toggle
           checked={settings.logEnabled}
@@ -224,5 +232,19 @@ export default function SettingsPage() {
       )}
       </div>
     </div>
+  );
+}
+
+// ElevationCard reports whether the role processes run with the input
+// privileges this platform needs (a Windows concern; the card renders
+// everywhere but only ever says something on Windows).
+function ElevationCard({ status }: { status: RoleElevation }) {
+  if (status.elevated) {
+    return null;
+  }
+  return (
+    <Section title="Input privileges" className="mt-6">
+      <p className="text-sm text-amber-500">{status.detail || "Roles are not running with elevated input privileges."}</p>
+    </Section>
   );
 }

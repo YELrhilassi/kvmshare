@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use kvmshare_app::guard::{self, RoleGuard};
 use kvmshare_app::{
-    hostname, machine_id, parse_client_args, revoked_policy_from_env, state_dir, with_default_port,
-    write_client_state, write_client_state_refused, write_client_state_stopped, DEFAULT_PORT,
+    hostname, machine_id, parse_client_args, revoked_policy, state_dir, with_default_port,
+    write_client_state, write_client_state_connected, write_client_state_refused,
+    write_client_state_stopped, DEFAULT_PORT,
 };
 use kvmshare_core::client::{Client, SessionEnd};
 use kvmshare_log::{log_error, log_info, log_warn};
@@ -31,6 +32,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_client_args()?;
+    if let Some(f) = &args.log_file {
+        kvmshare_log::set_log_file(f.clone());
+    }
     kvmshare_log::init(
         &args.log_level.unwrap_or_else(kvmshare_log::level_from_env_or_default),
         args.log_ctl,
@@ -61,14 +65,16 @@ fn run() -> Result<(), String> {
     // (reconnect immediately).
     let mut warned = false;
     let mut prompt_warned = false;
-    // Servers this machine must not hold a session with (revoked in the
-    // GUI, handed to us at spawn). Enforced right after the handshake,
-    // once the server's id is known — see `kvmshare_app::trust`.
-    let revoked = revoked_policy_from_env();
     // The live state file the GUI reads (Home's connection panel): it
     // always says what this process is doing *right now* — connecting,
     // connected, or not connected. Written on every transition.
     let state_dir = state_dir();
+    // Servers this machine must not hold a session with (revoked in the
+    // GUI, handed to us at spawn via env — or via the state-dir file on
+    // the scheduled-task spawn, which carries no custom environment).
+    // Enforced right after the handshake, once the server's id is known
+    // — see `kvmshare_app::trust`.
+    let revoked = revoked_policy(&state_dir);
     write_client_state(&state_dir, "disconnected", &addr);
     loop {
         // The UAC secure desktop (Windows): while a consent prompt is
@@ -119,7 +125,10 @@ fn run() -> Result<(), String> {
                 }
                 warned = false;
                 log_info!("connected, screen id {}", client.own_id());
-                write_client_state(&state_dir, "connected", &addr);
+                // The id, not the address, is what the GUI matches the
+                // session to a peer by — addresses churn (DHCP, dual
+                // interfaces, beacon expiry); the id does not.
+                write_client_state_connected(&state_dir, &addr, client.server_id());
                 // The outbox is reserved for app-level control messages;
                 // the core run loop handles clipboard upload and
                 // keepalives itself.

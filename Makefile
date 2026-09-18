@@ -78,9 +78,7 @@ install: build
 	install -m755 $(GUI_BIN) $(BINDIR)/kvmshare-gui
 	@# Manifest: sha256 of the installed set, checked by the GUI before
 	@# every spawn (a mixed-version install must never run silently).
-	@# The wheel daemon rides along with the role binaries.
-	install -m755 target/release/kvmshare-wheel-daemon $(BINDIR)/kvmshare-wheel-daemon 2>/dev/null || true
-	@cd $(BINDIR) && sha256sum kvmshare-server kvmshare-client kvmshare-gui kvmshare-wheel-daemon > binaries.sha256
+	@cd $(BINDIR) && sha256sum kvmshare-server kvmshare-client kvmshare-gui > binaries.sha256
 	@# Launcher icon: hicolor theme lookup (Icon=kvmshare in the
 	@# .desktop entry) — the launcher shows the real icon, not a blank
 	@# default.
@@ -166,7 +164,7 @@ release: winres
 	@if [ -n "$(MINGW)" ]; then \
 		echo "mingw-w64 found — building Windows binaries"; \
 		$(CARGO) build --release --target $(WIN_TARGET) || exit 1; \
-		cp target/$(WIN_TARGET)/release/kvmshare-server.exe target/$(WIN_TARGET)/release/kvmshare-client.exe target/$(WIN_TARGET)/release/kvmshare-wheel-daemon.exe gui/kvmshare-gui.exe gui/kvmshare-install.exe gui/kvmshare-installer.exe dist/kvmshare_$(VERSION)_windows_amd64/ || exit 1; \
+		cp target/$(WIN_TARGET)/release/kvmshare-server.exe target/$(WIN_TARGET)/release/kvmshare-client.exe gui/kvmshare-gui.exe gui/kvmshare-install.exe gui/kvmshare-installer.exe dist/kvmshare_$(VERSION)_windows_amd64/ || exit 1; \
 		( cd dist && zip -qr kvmshare_$(VERSION)_windows_amd64.zip kvmshare_$(VERSION)_windows_amd64 ); \
 		cp gui/kvmshare-install.exe dist/kvmshare-install_$(VERSION)_windows_amd64.exe; \
 		cp gui/kvmshare-installer.exe dist/kvmshare-installer_$(VERSION)_windows_amd64.exe; \

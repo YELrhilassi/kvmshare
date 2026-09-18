@@ -96,6 +96,10 @@ func main() {
 	stopBus := sessionbus.Ensure(core.stateDir)
 	defer stopBus()
 
+	// A role-elevation task left behind by a hard-killed role is swept
+	// here (the task normally self-deletes when the role exits).
+	core.cleanupElevationTask()
+
 	// Input isolation (Linux server) needs a one-time system grant. The
 	// sibling installer handles it silently — at most one privilege
 	// prompt, never again after. Runs in the background.

@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
+
 use super::Config;
 
 impl Config {
@@ -42,15 +44,51 @@ impl Config {
     }
 }
 
-/// Write `text` to `path` atomically (temp file + rename), creating
-/// parent directories. The running server watches this file, so it must
-/// never observe a torn write.
+/// Write `text` to `path` atomically (temp file + rename) while holding
+/// the cross-process config lock, creating parent directories.
+///
+/// Why the lock: two writers exist — this process (auto-trust, screen
+/// correction) and the GUI (layout saves, trust edits). Both do
+/// read-modify-write of the *whole* file; without a shared mutex a
+/// GUI save and a server auto-trust can interleave and one write
+/// erases the other's change (a trusted id vanishing, re-adding, and
+/// vanishing again — visible to the user as connection flapping). The
+/// lock file lives beside the config and is advisory; every writer in
+/// this repo takes it, which is what makes it real.
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let _lock = ConfigLock::acquire(path)?;
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
+}
+
+/// The cross-process config lock: an flock (or LockFileEx on Windows)
+/// on `<config>.lock`, held for the whole read-modify-write. Locking is
+/// blocking — writers are rare and quick, and blocking is correct: the
+/// alternative (failing) would drop a policy write silently.
+struct ConfigLock(std::fs::File);
+
+impl ConfigLock {
+    fn acquire(config_path: &Path) -> Result<Self, String> {
+        let mut p = config_path.as_os_str().to_owned();
+        p.push(".lock");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&p)
+            .map_err(|e| format!("open {}: {e}", p.to_string_lossy()))?;
+        f.lock_exclusive().map_err(|e| format!("lock {}: {e}", p.to_string_lossy()))?;
+        Ok(ConfigLock(f))
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Where the server looks for its config when `--config` is not given:

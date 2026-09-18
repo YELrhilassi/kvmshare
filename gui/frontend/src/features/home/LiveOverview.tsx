@@ -50,15 +50,25 @@ export default function LiveOverview() {
   // same-role machine is still shown, muted, with its real role.
   const usable = (p: Peer) => (isServer ? p.role === "client" : p.role === "server");
 
+  // The machine we are connected to, by id — never by address. As a
+  // client we know the server's id from its Welcome (the client writes
+  // it into client.state); as a server the connected-client list
+  // carries the client's id. Matching by id keeps the row stable when
+  // discovery blinks or the address churns (DHCP, dual interfaces) —
+  // matching by address made a live session flip to nearby/ready and
+  // back on every beacon gap.
+  const connectedId: string | null = isServer
+    ? (clients.find((c) => c.id)?.id ?? null)
+    : clientState.status === "connected"
+      ? clientState.serverId || null
+      : null;
+
   const stateOf = (p: Peer): RowState => {
     // A block outranks everything: the machine is refused, so its
     // trust or liveness is beside the point.
     if (matchesID(revoked, p.id)) return "blocked";
-    if (isServer) {
-      if (clients.some((c) => c.id === p.id)) return "connected";
-    } else {
-      const addr = `${p.addr}:${p.port || DEFAULT_PORT}`;
-      if (clientState.status === "connected" && clientState.server === addr) return "connected";
+    if (connectedId && (p.id === connectedId || p.id.startsWith(connectedId) || connectedId.startsWith(p.id))) {
+      return "connected";
     }
     if (matchesID(trusted, p.id)) return p.active ? "ready" : "away";
     if (p.active) return "nearby";

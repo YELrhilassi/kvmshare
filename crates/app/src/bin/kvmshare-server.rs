@@ -28,6 +28,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_server_args()?;
+    if let Some(f) = &args.log_file {
+        kvmshare_log::set_log_file(f.clone());
+    }
     kvmshare_log::init(
         &args.log_level.unwrap_or_else(kvmshare_log::level_from_env_or_default),
         args.log_ctl,
@@ -283,13 +286,10 @@ fn auto_config_screen_size(config_path: &PathBuf, name: &str, info: &ScreenInfo)
     }
     screen.width = w;
     screen.height = h;
-    let text = match toml::to_string_pretty(&cfg) {
-        Ok(t) => t,
-        Err(_) => return Ok(()),
-    };
-    let tmp = config_path.with_extension("toml.tmp");
-    if std::fs::write(&tmp, &text).is_ok() {
-        let _ = std::fs::rename(&tmp, config_path);
+    // cfg.save takes the cross-process config lock, so this write can
+    // never interleave with the GUI's (a lost update here used to
+    // resurrect a stale layout or drop a trust edit).
+    if cfg.save(config_path).is_ok() {
         log_info!("auto-configured screen {name:?} to {w}x{h} from the client's reported geometry");
     }
     Ok(())

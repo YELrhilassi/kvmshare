@@ -310,7 +310,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kvmshare-app"
-version = "0.7.8"
+version = "0.7.9"
 dependencies = [
  "fs2",
  "getrandom",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "kvmshare-core"
-version = "0.7.8"
+version = "0.7.9"
 dependencies = [
  "kvmshare-log",
  "kvmshare-protocol",
@@ -337,11 +337,11 @@ dependencies = [
 
 [[package]]
 name = "kvmshare-log"
-version = "0.7.8"
+version = "0.7.9"
 
 [[package]]
 name = "kvmshare-platform"
-version = "0.7.8"
+version = "0.7.9"
 dependencies = [
  "arboard",
  "evdev",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "kvmshare-protocol"
-version = "0.7.8"
+version = "0.7.9"
 
 [[package]]
 name = "libc"

@@ -23,6 +23,12 @@ const connectingGrace = 8 * time.Second
 type ClientState struct {
 	Status string `json:"status"` // "connected" | "connecting" | "disconnected" | "refused"
 	Server string `json:"server"` // address the client talks to
+	// ServerID is the machine id the server revealed in its Welcome,
+	// recorded only on the connected state. The network page matches the
+	// live session to a discovered peer by this id — address strings
+	// churn (DHCP, dual interfaces, a beacon expiring mid-session), the
+	// id does not — so a connected row stays one stable row.
+	ServerID string `json:"serverId,omitempty"`
 	// Reason carries the server's refusal explanation when Status is
 	// "refused" (revoked, not in the layout, outside the local network).
 	// Empty otherwise. It is the operator-facing answer to "why can this
@@ -83,6 +89,8 @@ func (a *App) ClientStatus() ClientState {
 			}
 		case "server":
 			st.Server = kv[1]
+		case "server_id":
+			st.ServerID = kv[1]
 		case "reason":
 			st.Reason = kv[1]
 		}
