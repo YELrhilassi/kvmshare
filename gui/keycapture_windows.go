@@ -414,6 +414,13 @@ func isRepeat(vk uint32, down bool) bool {
 // keyboardHookProc is the WH_KEYBOARD_LL callback: invoked synchronously
 // on the hook thread for every keyboard event system-wide, before the
 // OS decides what the chord means.
+//
+// go vet's unsafeptr check flags the lparam conversion below as a
+// "possible misuse"; it is not. The pointer originates in Windows —
+// the OS hands the hook callback a KBDLLHOOKSTRUCT* as lparam — and is
+// never derived from a Go pointer, so there is no roundtrip to misuse.
+// This is the canonical form every Go low-level-hook implementation
+// uses.
 func keyboardHookProc(code int32, wparam, lparam uintptr) uintptr {
 	if code >= 0 {
 		info := (*kbdllHookStruct)(unsafe.Pointer(lparam))

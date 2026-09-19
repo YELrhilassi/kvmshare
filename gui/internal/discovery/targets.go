@@ -91,14 +91,59 @@ func computeBroadcastAddrs() []*net.UDPAddr {
 	return out
 }
 
-// computeProbeTargets lists every candidate host on this machine's /24
-// subnets (all hosts minus ourselves and the broadcast addresses). Only
-// /24 subnets are probed — the sweep stays at 254 packets per interval,
-// and anything larger is left to the broadcast/mDNS channels (and
-// manual addresses).
+// computeProbeTargets lists every candidate host on this machine's IPv4
+// subnets (all hosts minus ourselves and the broadcast addresses).
+// Subnets up to /24 are enumerated host-by-host (254 packets per sweep,
+// the deliberate cost ceiling); a wider subnet (e.g. /16) is covered by
+// its subnet-directed broadcast target instead, which every on-subnet
+// kvmshare machine receives — the sweep stays bounded while the network
+// is not silently reduced to its first 254 addresses.
 func computeProbeTargets() []*net.UDPAddr {
 	var out []*net.UDPAddr
 	seen := map[string]bool{}
+	add := func(ip net.IP, mask net.IPMask) {
+		ones, bits := mask.Size()
+		if bits != 32 {
+			return
+		}
+		if ones > 24 {
+			// Smaller than /24: enumerate the host range exactly.
+			hosts := 1 << (bits - ones)
+			base := append(net.IP([]byte(nil)), ip.Mask(mask)...) // network address
+			for i := 1; i < hosts-1; i++ {                        // skip network and broadcast
+				cand := append(net.IP([]byte(nil)), base...)
+				cand[3] = byte(i)
+				if cand.Equal(ip) {
+					continue // ourselves
+				}
+				key := cand.String()
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				out = append(out, &net.UDPAddr{IP: cand, Port: Port})
+			}
+			return
+		}
+		// /24 or wider: the subnet-directed broadcast reaches every host
+		// that would have been enumerated, at one packet per subnet.
+		bcast := net.IPv4(ip[0], ip[1], ip[2], 255)
+		if ip.To4() != nil && ones < 24 {
+			// A wide subnet's directed broadcast uses the mask, not /24:
+			// set every host bit.
+			bcast = make(net.IP, 4)
+			net := ip.Mask(mask)
+			for i := 0; i < 4; i++ {
+				bcast[i] = net[i] | ^mask[i]
+			}
+		}
+		key := bcast.String()
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, &net.UDPAddr{IP: bcast, Port: Port})
+	}
 	ifs, _ := net.Interfaces()
 	for _, ifc := range ifs {
 		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
@@ -117,22 +162,7 @@ func computeProbeTargets() []*net.UDPAddr {
 			if ip == nil {
 				continue
 			}
-			ones, bits := ipn.Mask.Size()
-			if bits != 32 || ones != 24 {
-				continue
-			}
-			for i := 1; i < 255; i++ { // skip network (.0) and broadcast (.255)
-				cand := net.IPv4(ip[0], ip[1], ip[2], byte(i))
-				if cand.Equal(ip) {
-					continue // ourselves
-				}
-				key := cand.String()
-				if seen[key] {
-					continue
-				}
-				seen[key] = true
-				out = append(out, &net.UDPAddr{IP: cand, Port: Port})
-			}
+			add(ip, ipn.Mask)
 		}
 	}
 	return out

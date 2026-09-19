@@ -44,14 +44,13 @@ func (s *Service) Republish() {
 	s.reg = reg
 }
 
-// browse runs until the process ends, maintaining the peer map from
-// mDNS. mDNS is the best-effort second channel: every failure here is
-// silent by design (the broadcast channel is the primary one), and the
-// context keeps the resolver's goroutines from outliving the engine in
-// embedders that stop it.
-func (s *Service) browse() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// browse runs for the duration of one session's context, maintaining
+// the peer map from mDNS. mDNS is the best-effort second channel: every
+// failure here is silent by design (the broadcast channel is the
+// primary one), and the session context keeps the resolver's goroutines
+// from outliving the session that wanted them.
+func (s *Service) browse(ctx context.Context) {
+	defer s.loopsWG.Done()
 
 	entries := make(chan *zeroconf.ServiceEntry, 8)
 	resolver, err := zeroconf.NewResolver()
@@ -64,7 +63,7 @@ func (s *Service) browse() {
 
 	for {
 		select {
-		case <-s.stop:
+		case <-ctx.Done():
 			return
 		case e, ok := <-entries:
 			if !ok {

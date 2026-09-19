@@ -30,7 +30,7 @@ func newTestService(t *testing.T) (*Service, *fakeHost) {
 	t.Helper()
 	h := &fakeHost{id: "aaaaaaaa11111111", name: "pc", port: 24800, role: "server", run: true, lan: "192.168.1.86"}
 	s := New(h)
-	t.Cleanup(func() { close(s.stop) })
+	t.Cleanup(s.Close)
 	return s, h
 }
 

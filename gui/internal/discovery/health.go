@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"context"
 	"log"
 	"sync/atomic"
 	"time"
@@ -8,7 +9,9 @@ import (
 
 // Health-watch cadence and thresholds. quietAfter must comfortably
 // exceed beaconInterval: two live machines exchange beacons every 2 s,
-// so a healthy session is never quiet this long.
+// so a healthy session is never quiet this long. Warnings only mean
+// something while a session is actually listening — an idle engine is
+// quiet *by design*, not by failure, and must not log.
 const (
 	watchInterval = 30 * time.Second
 	quietAfter    = 90 * time.Second
@@ -42,9 +45,10 @@ func (w *warnOnce) log(msg string, err error, cooldown time.Duration) {
 // condition per cooldown, so a broken network costs a handful of log
 // lines per hour instead of one every tick.
 type warnCounters struct {
-	beacon warnOnce // socket problems on the send path
-	listen warnOnce // socket problems on the receive path
-	quiet  warnOnce // healthy sockets but hearing nothing
+	beacon  warnOnce // socket problems on the send path
+	listen  warnOnce // socket problems on the receive path
+	quiet   warnOnce // session live but hearing nothing
+	session warnOnce // session lifecycle transitions (grounded, idle)
 }
 
 // watchLoop is the discovery layer's own pulse check. Every
@@ -53,12 +57,12 @@ type warnCounters struct {
 // so (once per cooldown per condition). This exists because discovery
 // used to fail silently: a dead listener looked exactly like an empty
 // network, and nobody could tell the difference from the outside.
-func (s *Service) watchLoop() {
+func (s *Service) watchLoop(ctx context.Context) {
 	ticker := time.NewTicker(watchInterval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.stop:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s.checkHealth()
@@ -67,8 +71,16 @@ func (s *Service) watchLoop() {
 }
 
 // checkHealth runs one watch pass. Deliberately cheap: two
-// mutex-guarded reads, no syscalls.
+// mutex-guarded reads, no syscalls. Only a *running* session can be
+// unhealthy — an idle engine is the quiet the user asked for.
 func (s *Service) checkHealth() {
+	s.sess.mu.Lock()
+	state := s.sess.state
+	s.sess.mu.Unlock()
+	if state == SessionIdle {
+		return
+	}
+
 	s.mu.Lock()
 	listening := s.listenConn != nil
 	beaconing := s.beaconConn != nil
@@ -94,9 +106,9 @@ func (s *Service) checkHealth() {
 	// network filters the discovery traffic (AP isolation, VLAN) —
 	// exactly the case the user needs to know about, because the fix is
 	// on the network side (or manual addresses). Only meaningful once
-	// this engine has been up long enough to expect traffic
+	// this session has been up long enough to expect traffic
 	// (quietAfter).
 	if listening && beaconing && nPeers == 0 && now.Sub(last) > quietAfter {
-		s.warns.quiet.log("discovery: healthy but hearing no beacons — the network may filter broadcast/multicast (AP isolation?); manual addresses still work", nil, warnCooldown)
+		s.warns.quiet.log("discovery: session live but hearing no beacons — the network may filter broadcast/multicast (AP isolation?); manual addresses still work", nil, warnCooldown)
 	}
 }

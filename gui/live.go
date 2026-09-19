@@ -153,7 +153,10 @@ func (a *App) shouldEmit(snap LiveSnapshot) bool {
 }
 
 // stateLoop runs the single re-check loop. Started once from main.go
-// after the application exists (idempotent via stateOnce).
+// after the application exists (idempotent via stateOnce). Each tick
+// also maps the machine's session state onto the discovery duty cycle
+// (discsessions.go), so role and connection transitions drive the
+// engine's traffic budget no matter which code path caused them.
 func (a *App) stateLoop() {
 	a.stateOnce.Do(func() {
 		go func() {
@@ -163,6 +166,7 @@ func (a *App) stateLoop() {
 			ticker := time.NewTicker(stateInterval)
 			defer ticker.Stop()
 			for range ticker.C {
+				a.discoverySessionSync()
 				a.emitState()
 			}
 		}()

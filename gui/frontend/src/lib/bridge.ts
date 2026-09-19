@@ -102,6 +102,16 @@ export interface Peer {
   active: boolean;
 }
 
+/** The discovery duty-cycle state: what the engine is doing right now. */
+export interface DiscoveryStatus {
+  /** "idle" (nothing running), "seeking" (full-rate hunt), "connected" (partner present, low rate). */
+  state: "idle" | "seeking" | "connected";
+  /** Consecutive sessions that ended without hearing anyone (0 = healthy). */
+  failedSessions: number;
+  /** Seconds left in the current session (0 when idle). */
+  secondsLeft: number;
+}
+
 export interface LogSettings {
   role: "server" | "client";
   level: string;
@@ -216,6 +226,12 @@ interface GoApp {
   GetMachineId(): Promise<string>;
   DiscoverPeers(): Promise<Peer[]>;
   RefreshDiscovery(): Promise<Peer[]>;
+  // Direct probe of one address (host, or host:port) — the manual path
+  // of last resort; errors name the address and why it did not answer.
+  ProbeHost(addr: string): Promise<Peer>;
+  // The discovery duty-cycle state (idle/seeking/connected, failed
+  // session count, seconds left) for the "On this network" header.
+  DiscoveryStatus(): Promise<DiscoveryStatus>;
   ListClients(): Promise<ConnectedClient[]>;
   ClientCommand(name: string, action: string): Promise<void>;
   // Each setter is idempotent: pass the desired membership, not a toggle.
@@ -326,6 +342,8 @@ export const api = (): GoApp => ({
   GetMachineId: () => call<string>("GetMachineId"),
   DiscoverPeers: () => call<Peer[]>("DiscoverPeers"),
   RefreshDiscovery: () => call<Peer[]>("RefreshDiscovery"),
+  ProbeHost: (addr) => call<Peer>("ProbeHost", addr),
+  DiscoveryStatus: () => call<DiscoveryStatus>("DiscoveryStatus"),
   ListClients: () => call<ConnectedClient[]>("ListClients"),
   ClientCommand: (name, action) => call<void>("ClientCommand", name, action),
   TrustClient: (id, trusted) => call<void>("TrustClient", id, trusted),

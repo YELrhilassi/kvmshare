@@ -5,35 +5,11 @@ import (
 	"errors"
 	"net"
 	"syscall"
-	"time"
 )
 
-// Timing constants. peerTTL is several beacon periods times a margin
-// for burst loss: on Wi-Fi, broadcast frames are sent at the base rate
-// and unacked, so a short burst of interference used to expire a live
-// peer (visible as the peer list flapping between populated and empty).
-// The unicast probe channel stamps the same liveness map, so a peer
-// that survives on either channel never ages out.
-const (
-	beaconInterval = 2 * time.Second
-	probeInterval  = 10 * time.Second
-	peerTTL        = 45 * time.Second
-)
-
-// listenRetry is how long listenLoop waits before rebuilding its socket
-// after a bind failure (port taken by another app). Long enough to let
-// the conflicting process exit, short enough that recovery feels
-// automatic.
-const listenRetry = 5 * time.Second
-
-// Pairing work runs on its own goroutine so the listener never blocks
-// on it. Depth covers a brief connect stall; overflow drops (senders
-// retry naturally with their next request), and each job carries a
-// deadline so a queued request can't act on stale state.
-const (
-	pairQueueLen  = 8
-	pairJobMaxAge = 10 * time.Second
-)
+// Timing constants live in sessions.go — one owner for the duty-cycle
+// numbers (session budgets, beacon/probe rates, peer TTL). This file
+// keeps only the wire format and socket classification.
 
 // isFatalUDPError classifies receive/send errors that mean the socket
 // itself is gone (closed under us, interface removed) and must be

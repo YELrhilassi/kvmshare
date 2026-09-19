@@ -92,9 +92,9 @@ export default function LiveOverview() {
   };
 
   // Force a discovery sweep: clear the peer map, re-announce, re-probe
-  // the subnet now. The result also seeds the pushed state (the event
-  // dedupe compares snapshots, so identical lists stay quiet). The
-  // brief spin keeps the button honest about what it just did.
+  // the subnet now. The sweep runs synchronously on the backend and
+  // reports failure — the message lands here instead of the old silent
+  // no-op. The brief spin keeps the button honest about what it did.
   const rescan = async () => {
     if (sweeping) return;
     setSweeping(true);
@@ -103,7 +103,8 @@ export default function LiveOverview() {
       await api().RefreshDiscovery();
       await refresh();
     } catch (e) {
-      setErr(String(e));
+      setErr(readableError(e));
+      await refresh();
     } finally {
       window.setTimeout(() => setSweeping(false), 600);
     }
@@ -252,4 +253,12 @@ export default function LiveOverview() {
       {err && <p className="mt-2 text-xs text-destructive">{err}</p>}
     </Section>
   );
+}
+
+// readableError turns a rejected bridge call into one plain sentence:
+// Wails wraps backend errors as "Error: <message>", which reads like a
+// stack trace where a sentence belongs.
+function readableError(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  return raw.replace(/^Error:\s*/, "");
 }
