@@ -13,8 +13,8 @@ import "fmt"
 func IsElevated() bool           { return true }
 func SelfElevate([]string) error { return nil }
 
-// integrateDesktop is a no-op outside Windows/Linux.
-func integrateDesktop(string) error { return nil }
+// integrate is a no-op outside Windows/Linux.
+func integrate(string) error { return nil }
 
 // ensureInputAccess is unsupported outside Linux.
 func ensureInputAccess() error { return fmt.Errorf("--input-access is Linux-only") }
@@ -33,6 +33,10 @@ func EnsureFirewall(int, int) error { return nil }
 // EnsureFirewallViaInstaller matches EnsureFirewall: no-op outside
 // Windows (see platform_windows.go for the relay's purpose).
 func EnsureFirewallViaInstaller(int, int) error { return nil }
+
+// EnsureElevationTasks matches the Windows contract (elevation_windows.go
+// there): a no-op on platforms with no role-elevation tasks.
+func EnsureElevationTasks(string) error { return nil }
 
 // FirewallRulesPresent matches EnsureFirewall: always true outside
 // Windows (no firewall rules to check).

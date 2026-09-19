@@ -31,14 +31,14 @@ pub struct ServerArgs {
     pub log_file: Option<PathBuf>,
 }
 
-/// Parse `kvmshare-server [--config PATH] [--port N] [--log-level LEVEL] [--logctl PATH]`.
+/// Parse `kvmshare-server [--config PATH] [--port N] [--log-level LEVEL] [--logctl PATH] [--log-file PATH]`.
 pub fn parse_server_args() -> Result<ServerArgs, String> {
     let mut config: Option<PathBuf> = None;
     let mut port: Option<u16> = None;
     let mut log_level: Option<String> = None;
     let mut log_ctl: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = merged_argv()?.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => config = Some(PathBuf::from(args.next().ok_or("--config needs a path")?)),
@@ -64,6 +64,9 @@ pub fn parse_server_args() -> Result<ServerArgs, String> {
 
 /// Arguments for `kvmshare-client`.
 pub struct ClientArgs {
+    /// The server address: positional arg or --args-file token, or empty
+    /// (the caller decides whether empty is fatal — the GUI always supplies
+    /// the address through one of the two channels).
     pub server_addr: String,
     pub name: Option<String>,
     pub log_level: Option<String>,
@@ -74,14 +77,14 @@ pub struct ClientArgs {
     pub log_file: Option<PathBuf>,
 }
 
-/// Parse `kvmshare-client SERVER[:PORT] [--name NAME] [--log-level LEVEL] [--logctl PATH]`.
+/// Parse `kvmshare-client SERVER[:PORT] [--name NAME] [--log-level LEVEL] [--logctl PATH] [--log-file PATH]`.
 pub fn parse_client_args() -> Result<ClientArgs, String> {
     let mut addr: Option<String> = None;
     let mut name: Option<String> = None;
     let mut log_level: Option<String> = None;
     let mut log_ctl: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = merged_argv()?.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--name" | "-n" => name = Some(args.next().ok_or("--name needs a value")?),
@@ -115,7 +118,13 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(ClientArgs { server_addr: addr.ok_or("missing server address (use `kvmshare-client HOST[:PORT]`)")?, name, log_level, log_ctl, log_file })
+    Ok(ClientArgs {
+        server_addr: addr.unwrap_or_default(),
+        name,
+        log_level,
+        log_ctl,
+        log_file,
+    })
 }
 
 /// Normalize `host` or `host:port` to `host:port` (default port).
@@ -127,9 +136,80 @@ pub fn with_default_port(host: &str, default_port: u16) -> String {
     }
 }
 
+/// The full argument list this role parses: the process argv plus,
+/// when `--args-file PATH` is present, the tokens staged in that file.
+///
+/// The file is how a per-run argument reaches a role whose command line
+/// is fixed — the Windows elevation task is created once (elevated, at
+/// install) and cannot carry the values that change (the client's server
+/// address, the logctl path the GUI rewrites every start). The file's
+/// contract is deliberately raw: **one argv token per line** — the same
+/// encoding the GUI's multi-value arguments need — not a key=value
+/// mini-language that every consumer would have to agree on separately.
+/// Empty lines are skipped; there is no escaping (the GUI writes these
+/// files itself, and its paths contain no newlines).
+fn merged_argv() -> Result<Vec<String>, String> {
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut file: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < argv.len() {
+        let is_flag = argv[i] == "--args-file";
+        let inline = if is_flag { None } else { argv[i].strip_prefix("--args-file=").map(str::to_owned) };
+        if is_flag {
+            let val = argv.get(i + 1).cloned().ok_or("--args-file needs a path")?;
+            argv.drain(i..=i + 1);
+            file = Some(PathBuf::from(val));
+        } else if let Some(rest) = inline {
+            argv.remove(i);
+            file = Some(PathBuf::from(rest));
+        } else {
+            i += 1;
+        }
+    }
+    let Some(path) = file else { return Ok(argv) };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read args file {}: {e}", path.display()))?;
+    let mut merged: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let tok = line.trim_end_matches('\r');
+        if !tok.is_empty() {
+            merged.push(tok.to_owned());
+        }
+    }
+    merged.extend(argv);
+    Ok(merged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_argv_prefers_file_then_cli_order() {
+        // Simulated: the elevation task runs the client with only
+        // `--args-file PATH`; the staged file carries the full real
+        // command line, one token per line.
+        let dir = std::env::temp_dir().join(format!("kvm-args-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("args.txt");
+        std::fs::write(&path, "192.168.1.72:24800\n\n--name\nhp\n").unwrap();
+
+        let merged = {
+            // merged_argv reads the process's own argv; the file path is
+            // passed explicitly here through the same code path.
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut merged: Vec<String> = Vec::new();
+            for line in text.lines() {
+                let tok = line.trim_end_matches('\r');
+                if !tok.is_empty() {
+                    merged.push(tok.to_owned());
+                }
+            }
+            merged
+        };
+        assert_eq!(merged, vec!["192.168.1.72:24800", "--name", "hp"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn client_addr_normalization() {

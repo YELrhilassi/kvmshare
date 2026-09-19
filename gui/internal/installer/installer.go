@@ -167,11 +167,11 @@ func Uninstall(log func(string, ...any)) error {
 }
 
 // Integrate finishes a successful install: desktop entry + input access
-// on Linux, shortcuts + uninstall entry on Windows. Best-effort — the
-// binaries are already in place; a failed integration step must never
-// look like a failed install.
+// on Linux, shortcuts + uninstall entry + the role-elevation tasks on
+// Windows. Best-effort — the binaries are already in place; a failed
+// integration step must never look like a failed install.
 func Integrate(dir string, log func(string, ...any)) error {
-	if err := integrateDesktop(dir); err != nil {
+	if err := integrate(dir); err != nil {
 		logf(log, "desktop integration: %v", err)
 		return err
 	}

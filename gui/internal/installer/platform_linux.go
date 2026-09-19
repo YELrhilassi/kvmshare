@@ -105,13 +105,13 @@ func elevatingUser() (*user.User, error) {
 	return user.LookupId(strconv.Itoa(os.Getuid()))
 }
 
-// integrateDesktop runs after a successful install: grant input access
+// integrate runs after a successful install: grant input access
 // and write the launcher (a freedesktop .desktop entry pointing at the
 // installed GUI, plus the icon the entry names). Failure is a warning,
 // never an install failure — without the rule the software still works,
 // only raw-event leaks to raw-reading apps remain; without the entry
 // the launcher shows nothing, which reads as "the install did nothing".
-func integrateDesktop(dir string) error {
+func integrate(dir string) error {
 	if err := EnsureInputAccess(); err != nil {
 		return err
 	}
@@ -399,6 +399,11 @@ func EnsureFirewall(int, int) error { return nil }
 // (inbound UDP is accepted; see platform_windows.go for the relay's
 // purpose on Windows).
 func EnsureFirewallViaInstaller(int, int) error { return nil }
+
+// EnsureElevationTasks matches the Windows contract (elevation_windows.go
+// there): a no-op here — Linux has no per-role elevation tasks, input
+// access is a one-time udev grant instead.
+func EnsureElevationTasks(string) error { return nil }
 
 // FirewallRulesPresent matches EnsureFirewall: always true on Linux
 // (no firewall rules to check).

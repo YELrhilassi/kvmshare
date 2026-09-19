@@ -51,6 +51,9 @@ fn run() -> Result<(), String> {
     let _guard: RoleGuard = guard::acquire(guard::ROLE_CLIENT)?;
 
     let addr = with_default_port(&args.server_addr, DEFAULT_PORT);
+    if args.server_addr.is_empty() {
+        return Err("no server address (pass HOST[:PORT], or stage it in the --args-file)".into());
+    }
     let name = args.name.unwrap_or_else(hostname);
     // This machine's stable id: sent in Hello so the server can trust
     // this machine by id (the allowlist's trusted-ids bypass) and list

@@ -38,6 +38,8 @@ func main() {
 		firewall         = flag.Bool("firewall", false, "(Windows) open kvmshare's inbound firewall ports; run elevated")
 		firewallSession  = flag.Int("session-port", 0, "session port for --firewall")
 		firewallDiscovery = flag.Int("discovery-port", 0, "discovery port for --firewall")
+		elevationTask    = flag.Bool("elevation-task", false, "(Windows) create the per-role elevation tasks; run elevated")
+		elevationStateDir = flag.String("state-dir", "", "state dir for --elevation-task")
 	)
 	flag.Parse()
 
@@ -71,6 +73,19 @@ func main() {
 			fatal(err)
 		}
 		fmt.Println("firewall: inbound rules ready")
+		return
+	}
+	// Privileged subcommand: invoked by the GUI (and by Integrate) to
+	// create the per-role elevation tasks — creation with RunLevel
+	// HIGHEST needs an elevated caller, running the tasks never does.
+	if *elevationTask {
+		if *elevationStateDir == "" {
+			fatal(fmt.Errorf("--elevation-task needs --state-dir"))
+		}
+		if err := installer.EnsureElevationTasks(*elevationStateDir); err != nil {
+			fatal(err)
+		}
+		fmt.Println("elevation: role tasks ready")
 		return
 	}
 

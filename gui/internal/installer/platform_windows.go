@@ -45,9 +45,11 @@ const icoName = "kvmshare.ico"
 
 // integrateDesktop makes a finished install visible on the desktop: writes
 // the icon next to the binaries, creates Start Menu + desktop shortcuts,
-// and registers an uninstall entry. Best-effort per step — a shortcut
+// registers an uninstall entry, and — when this install ran elevated, as
+// it always does on Windows — creates the per-role elevation tasks the
+// GUI later starts unprivileged. Best-effort per step — a shortcut
 // failure must not roll back a completed binary install.
-func integrateDesktop(dir string) error {
+func integrate(dir string) error {
 	var problems []string
 
 	if err := os.WriteFile(filepath.Join(dir, icoName), selfupdate.IconBytes, 0o644); err != nil {
@@ -59,6 +61,15 @@ func integrateDesktop(dir string) error {
 	if err := registerUninstall(dir); err != nil {
 		problems = append(problems, fmt.Sprintf("uninstall entry: %v", err))
 	}
+	// The elevation tasks are the difference between a fully working
+	// install and one whose roles degrade on elevated windows — create
+	// them here, while this caller is still elevated. Skipped silently
+	// for a non-elevated run (the GUI relays creation later, once).
+	if IsElevated() {
+		if err := EnsureElevationTasks(stateDirForTasks()); err != nil {
+			problems = append(problems, fmt.Sprintf("elevation tasks: %v", err))
+		}
+	}
 	// No layout config is written at install time: the server owns it and
 	// creates a machine-accurate default (this machine's real name +
 	// display, no invented clients) on its first start.
@@ -68,11 +79,29 @@ func integrateDesktop(dir string) error {
 	return nil
 }
 
-// removeDesktopIntegration undoes integrateDesktop (used by --uninstall).
+// stateDirForTasks is the per-user state dir the elevation task's args
+// file lives in — the same location the GUI resolves (paths.go). The
+// standard Windows location (no home, no desktop assumptions beyond
+// %USERPROFILE%), overridable by KVMSHARE_STATE_DIR for tests and
+// portable installs.
+func stateDirForTasks() string {
+	if dir := os.Getenv("KVMSHARE_STATE_DIR"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "state", "kvmshare")
+}
+
+// removeDesktopIntegration undoes integrate (used by --uninstall):
+// shortcuts, the Add/Remove entry, and the per-role elevation tasks.
 func removeDesktopIntegration(dir string) error {
 	removeShortcuts()
 	_ = registry.DeleteKey(registry.CURRENT_USER, uninstallKey)
 	_ = os.Remove(filepath.Join(dir, icoName))
+	DeleteElevationTasks()
 	// Put the UAC prompt policy back the way it was before kvmshare
 	// moved it to the normal desktop (best-effort: nothing to restore
 	// when kvmshare never changed it).
@@ -419,4 +448,35 @@ func firewallSubcommandAvailable(exe string) bool {
 		return false
 	}
 	return strings.Contains(string(out), "--firewall")
+}
+
+// EnsureElevationTasksViaInstaller relays role-elevation-task creation
+// through the installed kvmshare-install CLI, re-running elevated — the
+// GUI's self-heal when the tasks are missing (a portable copy, a policy
+// wipe): creation with RunLevel HIGHEST needs an elevated caller, and
+// the GUI must not be one (see elevation_windows.go). One UAC prompt,
+// only when actually needed.
+func EnsureElevationTasksViaInstaller(stateDir string) error {
+	dir := selfupdate.InstallDir()
+	exe := filepath.Join(dir, "kvmshare-install.exe")
+	if _, err := os.Stat(exe); err != nil {
+		return fmt.Errorf("installer CLI not found at %s", exe)
+	}
+	// The CLI subcommand must exist before relaying (added together with
+	// this call site; an older install would loop silently otherwise).
+	if !elevationSubcommandAvailable(exe) {
+		return fmt.Errorf("installed kvmshare-install does not support elevation setup (update kvmshare)")
+	}
+	return SelfElevate([]string{"--elevation-task", "--state-dir", stateDir})
+}
+
+// elevationSubcommandAvailable reports whether the installed CLI
+// understands --elevation-task (parse its -h output). A cheap guard
+// against a mixed-version relay loop.
+func elevationSubcommandAvailable(exe string) bool {
+	out, err := hiddenCmd(exe, "-h").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "--elevation-task")
 }
