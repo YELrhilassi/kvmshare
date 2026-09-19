@@ -38,7 +38,6 @@ package main
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -49,8 +48,15 @@ import (
 
 // captureTTL bounds a capture session without a renewal. Long enough
 // for any deliberate recording; short enough that a crashed page
-// cannot leave the keyboard dead for minutes.
+// cannot leave the keyboard dead for minutes. On lapse the hook
+// notifies the page (captureExpired, a broadcast the open session's
+// recorder listens for) and stops suppressing — the user regains their
+// machine even if the page never returns.
 const captureTTL = 2 * time.Minute
+
+// captureExpiredEvent is the TTL-lapse notification. Carries the dead
+// session's token in keyEvent.Token.
+const captureExpiredEvent = "keycapture:expired"
 
 // keyEvent is one key transition delivered to the page.
 type keyEvent struct {
@@ -162,12 +168,14 @@ func stopHook() error {
 	return nil
 }
 
-// exitHookThread tears the pump thread down (GUI shutdown).
+// exitHookThread tears the pump thread down (GUI shutdown). Safe to
+// call when the hook was never started.
 func exitHookThread() {
 	hookMu.Lock()
-	defer hookMu.Unlock()
-	if hookThreadHwnd != 0 {
-		procPostMessageW.Call(hookThreadHwnd, hookExitMsg, 0, 0)
+	hwnd := hookThreadHwnd
+	hookMu.Unlock()
+	if hwnd != 0 {
+		procPostMessageW.Call(hwnd, hookExitMsg, 0, 0)
 	}
 }
 
@@ -229,22 +237,31 @@ const (
 )
 
 var (
+	// hookMu guards the hook thread's identity (handle, window). The
+	// hook proc reads nothing through it — it snapshots the session
+	// through keyCapture.mu — so a held hookMu never delays keystrokes.
 	hookMu         sync.Mutex
 	hookHandle     uintptr
 	hookThreadHwnd uintptr
 	hookClassOnce  sync.Once
 	hookClassErr   error
+	// spawnMu serializes hook-thread startup: two concurrent role starts
+	// must not both see hookHandle == 0 and race two pump threads.
+	spawnMu sync.Mutex
 )
 
 // ensureHook installs the low-level keyboard hook, spawning its pump
 // thread. Idempotent: the hook stays installed between recordings so
 // starting a session never races the install.
 func ensureHook() error {
+	spawnMu.Lock()
+	defer spawnMu.Unlock()
 	hookMu.Lock()
-	defer hookMu.Unlock()
 	if hookHandle != 0 {
+		hookMu.Unlock()
 		return nil
 	}
+	hookMu.Unlock()
 	ready := make(chan error, 1)
 	go func() { ready <- runHookThread() }()
 	return <-ready
@@ -408,39 +425,46 @@ func keyboardHookProc(code int32, wparam, lparam uintptr) uintptr {
 			down := msg == wmKeydown || msg == wmSyskeydown
 			up := msg == wmKeyup || msg == wmSyskeyup
 			if down || up {
-				// The session snapshot is read fresh per event: the GUI
-				// thread may swap or clear it at any moment.
-				keyCapture.mu.Lock()
-				sess := keyCapture.session
-				token := ""
-				if sess != nil && time.Now().After(sess.expires) {
-					// TTL lapse: the page crashed or stalled. Kill the
-					// session — suppression ends with it — and let the
-					// event pass (the user regains a live machine).
-					keyCapture.session = nil
-					sess = nil
-				}
-				if sess != nil {
-					token = sess.token
-				}
-				app := keyCapture.app
-				keyCapture.mu.Unlock()
+					// The session snapshot is read fresh per event: the GUI
+					// thread may swap or clear it at any moment.
+					keyCapture.mu.Lock()
+					sess := keyCapture.session
+					expired := false
+					if sess != nil && time.Now().After(sess.expires) {
+						// TTL lapse: the page crashed or stalled. Kill the
+						// session — suppression ends with it — tell the page
+						// once, and let this event pass (the user regains a
+						// live machine immediately).
+						keyCapture.session = nil
+						sess = nil
+						expired = true
+					}
+					token := ""
+					if sess != nil {
+						token = sess.token
+					}
+					app := keyCapture.app
+					keyCapture.mu.Unlock()
 
-				if sess != nil && app != nil {
-					downNow := down
-					repeat := isRepeat(info.vkCode, downNow)
-					app.Emit("keycapture:"+token, keyEvent{
-						Token:    token,
-						Down:     downNow,
-						Repeat:   repeat,
-						VK:       info.vkCode,
-						Scan:     info.scanCode,
-						Extended: info.flags&llkhfExtended != 0,
-						Control:  asyncDown(vkControl),
-						Alt:      asyncDown(vkMenu),
-						Shift:    asyncDown(vkShift),
-						Meta:     asyncDown(vkLWin) || asyncDown(vkRWin),
-					})
+					if expired && app != nil {
+						app.Emit(captureExpiredEvent, keyEvent{Token: token})
+					}
+
+					if sess != nil && app != nil {
+						downNow := down
+						repeat := isRepeat(info.vkCode, downNow)
+						app.Emit("keycapture:"+token, keyEvent{
+							Token:    token,
+							Down:     downNow,
+							Repeat:   repeat,
+							VK:       info.vkCode,
+							Scan:     info.scanCode,
+							Extended: info.flags&llkhfExtended != 0,
+							Control:  asyncDown(vkControl),
+							Alt:      asyncDown(vkMenu),
+							Shift:    asyncDown(vkShift),
+							Meta:     asyncDown(vkLWin) || asyncDown(vkRWin),
+						})
 					// Suppression: the recorder owns the keyboard.
 					// Returning without CallNextHookEx stops the event
 					// dead — the shell never sees Super, the task
@@ -479,6 +503,4 @@ func hookWndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	return r
 }
 
-// Atomic here only to document that hook state is thread-confined; the
-// mutexes above are the actual guards.
-var _ = atomic.Bool{}
+

@@ -95,6 +95,9 @@ function hidOf(scan: number, extended: boolean): number {
 /** The token-tagged event name the backend emits on. */
 const eventNameFor = (token: string) => `keycapture:${token}`;
 
+/** The backend's TTL-lapse broadcast: the session died, keys pass through. */
+const EXPIRED_EVENT = "keycapture:expired";
+
 /**
  * Open a backend capture session. Returns a disposer — null when the
  * hook is unavailable (non-Windows, old backend, standard user without
@@ -130,8 +133,6 @@ export async function startBackendCapture(
   const handler = (e: { data: RawKeyEvent }) => {
     const raw = e?.data;
     if (!raw || raw.token !== token) return;
-    // TTL expiry is signaled by the absence of further events; the
-    // explicit onExpired path covers the backend's session teardown.
     const mods: BackendMods = { ctrl: raw.control, alt: raw.alt, shift: raw.shift, meta: raw.meta };
     if (!sameMods(mods, lastMods)) {
       lastMods = mods;
@@ -143,9 +144,20 @@ export async function startBackendCapture(
     if (hid !== 0) onKey(hid, raw.down, mods);
   };
   ev.On(eventNameFor(token), handler);
+  // The TTL-lapse broadcast: the backend killed the session (the page
+  // stalled past captureTTL). One notification, then keys pass through
+  // system-wide — the caller must re-arm or accept the loss.
+  const expiredHandler = (e: { data: RawKeyEvent }) => {
+    const raw = e?.data;
+    if (!raw || raw.token !== token || expired) return;
+    expired = true;
+    onExpired();
+  };
+  ev.On(EXPIRED_EVENT, expiredHandler);
 
   return () => {
     ev.Off(eventNameFor(token));
+    ev.Off(EXPIRED_EVENT);
     if (!expired) void api().StopKeyCapture(token).catch(() => {});
   };
 }
