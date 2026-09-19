@@ -195,7 +195,6 @@ var (
 	procRegisterClassW      = user32.NewProc("RegisterClassW")
 	procCreateWindowExW     = user32.NewProc("CreateWindowExW")
 	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
-	procGetAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 	procPostMessageW        = user32.NewProc("PostMessageW")
 	kernel32                = windows.NewLazySystemDLL("kernel32.dll")
 	procGetModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
@@ -411,6 +410,75 @@ func isRepeat(vk uint32, down bool) bool {
 	return false
 }
 
+// modState tracks the live modifier set from the event stream itself.
+//
+// GetAsyncKeyState is deliberately NOT used: the hook swallows every
+// event while a session is live, and a swallowed event never updates
+// the system async-key table — the snapshot would read "not pressed"
+// for the very Super the user is holding, recorded chords would lose
+// their modifiers, and validation would answer "Add a modifier" for a
+// chord that plainly had one (measured, reproducible).
+//
+// Low-level hooks report the L/R-specific virtual keys
+// (VK_LCONTROL 0xA2 / VK_RCONTROL 0xA3, VK_LSHIFT/VK_RSHIFT,
+// VK_LMENU/VK_RMENU, VK_LWIN/VK_RWIN), so each field ORs its pair.
+type modState struct {
+	mu             sync.Mutex
+	lCtrl, rCtrl   bool
+	lShift, rShift bool
+	lAlt, rAlt     bool
+	lWin, rWin     bool
+}
+
+var mods modState
+
+const (
+	vkLControl = 0xA2
+	vkRControl = 0xA3
+	vkLShift   = 0xA0
+	vkRShift   = 0xA1
+	vkLMenu    = 0xA4
+	vkRMenu    = 0xA5
+)
+
+// apply folds one hook event into the tracked modifier set (call for
+// every down/up of every key, before any suppression decision).
+func (m *modState) apply(vk uint32, down bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch vk {
+	case vkControl, vkLControl, vkRControl:
+		if vk == vkRControl {
+			m.rCtrl = down
+		} else {
+			m.lCtrl = down
+		}
+	case vkShift, vkLShift, vkRShift:
+		if vk == vkRShift {
+			m.rShift = down
+		} else {
+			m.lShift = down
+		}
+	case vkMenu, vkLMenu, vkRMenu:
+		if vk == vkRMenu {
+			m.rAlt = down
+		} else {
+			m.lAlt = down
+		}
+	case vkLWin:
+		m.lWin = down
+	case vkRWin:
+		m.rWin = down
+	}
+}
+
+// snapshot reads the tracked set.
+func (m *modState) snapshot() (ctrl, alt, shift, meta bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lCtrl || m.rCtrl, m.lAlt || m.rAlt, m.lShift || m.rShift, m.lWin || m.rWin
+}
+
 // keyboardHookProc is the WH_KEYBOARD_LL callback: invoked synchronously
 // on the hook thread for every keyboard event system-wide, before the
 // OS decides what the chord means.
@@ -432,46 +500,51 @@ func keyboardHookProc(code int32, wparam, lparam uintptr) uintptr {
 			down := msg == wmKeydown || msg == wmSyskeydown
 			up := msg == wmKeyup || msg == wmSyskeyup
 			if down || up {
-					// The session snapshot is read fresh per event: the GUI
-					// thread may swap or clear it at any moment.
-					keyCapture.mu.Lock()
-					sess := keyCapture.session
-					expired := false
-					if sess != nil && time.Now().After(sess.expires) {
-						// TTL lapse: the page crashed or stalled. Kill the
-						// session — suppression ends with it — tell the page
-						// once, and let this event pass (the user regains a
-						// live machine immediately).
-						keyCapture.session = nil
-						sess = nil
-						expired = true
-					}
-					token := ""
-					if sess != nil {
-						token = sess.token
-					}
-					app := keyCapture.app
-					keyCapture.mu.Unlock()
+				// Track the modifier set from the stream itself, before
+				// anything else: the async-key table cannot see events
+				// we swallow (see modState docs).
+				mods.apply(info.vkCode, down)
+				// The session snapshot is read fresh per event: the GUI
+				// thread may swap or clear it at any moment.
+				keyCapture.mu.Lock()
+				sess := keyCapture.session
+				expired := false
+				if sess != nil && time.Now().After(sess.expires) {
+					// TTL lapse: the page crashed or stalled. Kill the
+					// session — suppression ends with it — tell the page
+					// once, and let this event pass (the user regains a
+					// live machine immediately).
+					keyCapture.session = nil
+					sess = nil
+					expired = true
+				}
+				token := ""
+				if sess != nil {
+					token = sess.token
+				}
+				app := keyCapture.app
+				keyCapture.mu.Unlock()
 
-					if expired && app != nil {
-						app.Emit(captureExpiredEvent, keyEvent{Token: token})
-					}
+				if expired && app != nil {
+					app.Emit(captureExpiredEvent, keyEvent{Token: token})
+				}
 
-					if sess != nil && app != nil {
-						downNow := down
-						repeat := isRepeat(info.vkCode, downNow)
-						app.Emit("keycapture:"+token, keyEvent{
-							Token:    token,
-							Down:     downNow,
-							Repeat:   repeat,
-							VK:       info.vkCode,
-							Scan:     info.scanCode,
-							Extended: info.flags&llkhfExtended != 0,
-							Control:  asyncDown(vkControl),
-							Alt:      asyncDown(vkMenu),
-							Shift:    asyncDown(vkShift),
-							Meta:     asyncDown(vkLWin) || asyncDown(vkRWin),
-						})
+				if sess != nil && app != nil {
+					downNow := down
+					repeat := isRepeat(info.vkCode, downNow)
+					ctrl, alt, shift, meta := mods.snapshot()
+					app.Emit("keycapture:"+token, keyEvent{
+						Token:    token,
+						Down:     downNow,
+						Repeat:   repeat,
+						VK:       info.vkCode,
+						Scan:     info.scanCode,
+						Extended: info.flags&llkhfExtended != 0,
+						Control:  ctrl,
+						Alt:      alt,
+						Shift:    shift,
+						Meta:     meta,
+					})
 					// Suppression: the recorder owns the keyboard.
 					// Returning without CallNextHookEx stops the event
 					// dead — the shell never sees Super, the task
@@ -483,12 +556,6 @@ func keyboardHookProc(code int32, wparam, lparam uintptr) uintptr {
 	}
 	r, _, _ := procCallNextHookEx.Call(0, uintptr(code), wparam, lparam)
 	return r
-}
-
-// asyncDown reads the live state of one virtual key.
-func asyncDown(vk uint32) bool {
-	r, _, _ := procGetAsyncKeyState.Call(uintptr(vk))
-	return r&0x8000 != 0
 }
 
 // hookWndProc handles the control messages on the hook thread.
@@ -509,5 +576,3 @@ func hookWndProc(hwnd, message, wparam, lparam uintptr) uintptr {
 	r, _, _ := procDefWindowProcW.Call(hwnd, message, wparam, lparam)
 	return r
 }
-
-

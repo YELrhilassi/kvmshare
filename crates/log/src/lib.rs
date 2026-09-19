@@ -195,6 +195,21 @@ fn sink() -> Option<mpsc::SyncSender<String>> {
     Some(tx)
 }
 
+/// Write one finished line to the configured destination *synchronously*
+/// (log file when set, stderr otherwise). Used by the error path in
+/// [`write_line`]: a fatal line must be on disk before the process can
+/// exit.
+fn emit(line: String) {
+    if let Some(path) = LOG_FILE.lock().unwrap().clone() {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+        }
+        return;
+    }
+    let mut out = std::io::stderr().lock();
+    let _ = writeln!(out, "{line}");
+}
+
 /// Emit one line if logging is enabled and `lvl` is within the current
 /// level. Exposed for the macros below.
 ///
@@ -212,6 +227,16 @@ pub fn write_line(lvl: Level, args: std::fmt::Arguments<'_>) {
     let ms = ms % 1000;
     let component = COMPONENT.get().map(String::as_str).unwrap_or("kvmshare");
     let line = format!("{h:02}:{m:02}:{s:02}.{ms:03} {} {component}: {}", lvl.label(), args);
+    // Errors bypass the queue and write synchronously: a fatal error is
+    // usually the last line the process emits before `std::process::exit`,
+    // which cannot wait for the writer thread — an async error line was
+    // silently lost, and a role that failed to start exited code 1 with
+    // no explanation anywhere (measured: the role-lock refusal). Errors
+    // are rare; blocking this caller for one write is the right trade.
+    if lvl == Level::Error {
+        emit(line);
+        return;
+    }
     // The channel is bounded; a full queue drops the line rather than
     // blocking the caller (see [`SINK`]).
     if let Some(tx) = sink() {

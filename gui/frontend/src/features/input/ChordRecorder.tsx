@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { startBackendCapture, captureKind, type BackendMods } from "./BackendCapture";
+import { startBackendCapture, captureKind, isModifierHid, type BackendMods } from "./BackendCapture";
 
 // Chord recording for the shortcut system: one hook that captures the
 // next keystroke as a chord (modifier set + physical key), plus the
@@ -342,6 +342,12 @@ export function useChordRecorder(
           const liveMods = asLiveMods(mods);
           setMods(liveMods);
           if (!down) return;
+          // A modifier key press updates the live chips (done above via
+          // the snapshot) and nothing else: a modifier is never the
+          // chord-completing key. Before this guard, Super's HID usage
+          // arrived here as a "key" and the recorder completed a bare
+          // chord instantly — the "Add a modifier" error.
+          if (isModifierHid(hid)) return;
           if (hid === 0x29) {
             // Esc cancels (reserved for returning home).
             settled = true;

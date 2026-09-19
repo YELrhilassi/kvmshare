@@ -331,8 +331,10 @@ version = "0.8.5"
 dependencies = [
  "kvmshare-log",
  "kvmshare-protocol",
+ "libc",
  "serde",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

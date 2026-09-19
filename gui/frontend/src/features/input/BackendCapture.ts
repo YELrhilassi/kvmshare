@@ -72,8 +72,40 @@ const SCAN_TO_HID: Record<string, number> = {
   "55:0": 0x55, "74:0": 0x56, "78:0": 0x57, "53:1": 0x54, "83:0": 0x63,
   "79:0": 0x59, "80:0": 0x5a, "81:0": 0x5b, "75:0": 0x5c, "76:0": 0x5d,
   "77:0": 0x5e, "71:0": 0x5f, "72:0": 0x60, "73:0": 0x61, "82:0": 0x62,
-  // Media (E0-extended)
-  "91:1": 0xb5, "90:1": 0xb6, "92:1": 0xb7, "93:1": 0xcd,
+  "89:0": 0x67, // KP =
+  "86:0": 0x32, // # ~ (ISO)
+  // Modifiers — recorded as HID modifier usages (0xe0–0xe7) so the
+  // recorder can light the live chips and NEVER treat a modifier press
+  // as the chord-completing key. L/R pairs share one usage; the set of
+  // held modifiers travels separately in the event's mod snapshot.
+  // Shift is the only pair without an E0 ambiguity (RShift = 0x36 E0).
+  "29:0": 0xe0, "29:1": 0xe4, // Ctrl left / right (also resolved in hidOf)
+  "42:0": 0xe1, "54:1": 0xe5, // Shift left / right
+  "56:0": 0xe2, "56:1": 0xe6, // Alt left / AltGr (also resolved in hidOf)
+  "91:1": 0xe3, // Left Win  (scan 0x5b E0 — NOT a media key; see below)
+  "92:1": 0xe7, // Right Win (scan 0x5c E0)
+  // Media transport (E0-extended). The scans are the standard set-1
+  // extended codes (0x19/0x10/0x24/0x22) — they deliberately alias the
+  // non-extended letter scans (p/q/j/4), which is why the extended flag
+  // is part of every key here.
+  "25:1": 0xb5, // Next Track
+  "16:1": 0xb6, // Previous Track
+  "36:1": 0xb7, // Stop
+  "34:1": 0xcd, // Play/Pause
+  // International (JIS)
+  "115:0": 0x87, // Ro (0x73)
+  "93:0": 0x88, // Katakana (0x70)
+  "124:0": 0x89, // Yen (0x7d)
+  "94:0": 0x8a, // Henkan / Convert (0x79)
+  "95:0": 0x8b, // Muhenkan / Non-convert (0x7b)
+  // Volume (E0-extended)
+  "160:1": 0xe8, // Mute (0x20 E0)
+  "174:1": 0xe9, // Volume Up (0x30 E0)
+  // Browser / AC (E0-extended)
+  "50:1": 0x194, // WWW Home (0x32 E0)
+  "101:1": 0x221, // Search (0x65 E0)
+  "106:1": 0x224, // Back (0x6a E0)
+  "105:1": 0x225, // Forward (0x69 E0)
 };
 
 /**
@@ -89,7 +121,16 @@ function hidOf(scan: number, extended: boolean): number {
   if (scan === 55) return extended ? 0x46 : 0x55; // PrtSc / KP *
   if (scan === 56) return extended ? 0xe6 : 0xe2; // Alt / AltGr
   if (scan === 29) return extended ? 0xe4 : 0xe0; // Ctrl / R-Ctrl
+  if (scan === 42) return 0xe1; // Left Shift (never E0)
+  if (scan === 54) return 0xe5; // Right Shift (E0)
+  if (scan === 91) return 0xe3; // Left Win (E0) — collides with nothing
+  if (scan === 92) return 0xe7; // Right Win (E0)
   return SCAN_TO_HID[`${scan}:${extended ? 1 : 0}`] ?? 0;
+}
+
+/** Is this HID usage one of the eight modifier keys (0xe0–0xe7)? */
+export function isModifierHid(hid: number): boolean {
+  return hid >= 0xe0 && hid <= 0xe7;
 }
 
 /** The token-tagged event name the backend emits on. */

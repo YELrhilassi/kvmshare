@@ -136,6 +136,17 @@ static TX: OnceLock<Sender<Message>> = OnceLock::new();
 static KEYS_DOWN: LazyLock<Mutex<HashSet<(u16, bool)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Motion pending forwarding, as whole pixels. A gaming mouse reports at
+/// 1000 Hz or more; forwarding every `WM_MOUSEMOVE` hook event verbatim
+/// floods the wire (and the client's receive loop) with 1–3 px frames,
+/// which the receiving side then spends its time unpacking — the
+/// Windows-server direction visibly stuttered next to the Linux one
+/// (whose capture coalesces per pass, see X11 `PendingMotion`). The
+/// accumulation drains once per message-loop pass, keeping the stream
+/// as even as the hand while cutting the frame rate to the steering
+/// cadence.
+static PENDING_MOTION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+
 /// Set when an escape (Scroll Lock) press was consumed while the cursor
 /// was away; the matching release is swallowed too (it was never
 /// forwarded, so forwarding its release would leave the client with a
@@ -250,7 +261,11 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 let dx = info.pt.x - actual.x;
                 let dy = info.pt.y - actual.y;
                 if dx != 0 || dy != 0 {
-                    hook_send(Message::MouseMoveRel { dx, dy });
+                    // Merge into the pending accumulator; whole pixels
+                    // flush per message-loop pass (see PENDING_MOTION).
+                    let mut pending = PENDING_MOTION.lock().unwrap();
+                    pending.0 += dx as f64;
+                    pending.1 += dy as f64;
                 }
             }
         } else if let Some((button, pressed)) = buttons::from_wparam(msg, info.mouseData) {
@@ -535,6 +550,18 @@ fn run_forever(
                 wm::TranslateMessage(&msg);
                 wm::DispatchMessageW(&msg);
             }
+            // Per-pass motion flush (see PENDING_MOTION): everything the
+            // hook accumulated since the last pass leaves as whole-pixel
+            // frames now — the stream stays even and the frame rate
+            // matches the drain cadence, not the mouse's report rate.
+            // PeekMessage with PM_NOREMOVE keeps this from blocking: we
+            // are only checking whether the queue is empty so a burst of
+            // hook events drains as one flush, not a flurry of them.
+            // (PeekMessageW returns BOOL, an i32 in windows-sys: non-zero
+            // means a message is waiting.)
+            if wm::PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, wm::PM_NOREMOVE) == 0 {
+                flush_pending_motion();
+            }
         }
     };
     // SAFETY: unhooking the handles this thread installed, then
@@ -553,6 +580,24 @@ fn run_forever(
 /// The last beaconed cursor position (`None` = none yet). Only changes
 /// are forwarded, so a still (or pinned) cursor goes quiet.
 static LAST_BEACON: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+/// Drain the pending motion accumulator, forwarding whole pixels.
+/// Called once per message-loop pass when the queue is momentarily empty
+/// (see the loop in [`run_forever`]). Truncation toward zero keeps slow
+/// sub-pixel motion symmetric (the same rule as the X11 accumulator).
+fn flush_pending_motion() {
+    let taken = {
+        let mut pending = PENDING_MOTION.lock().unwrap();
+        let ix = pending.0.trunc() as i32;
+        let iy = pending.1.trunc() as i32;
+        pending.0 -= ix as f64;
+        pending.1 -= iy as f64;
+        (ix, iy)
+    };
+    if taken != (0, 0) {
+        hook_send(Message::MouseMoveRel { dx: taken.0, dy: taken.1 });
+    }
+}
 
 /// One beacon poll: forward the real cursor position when it moved
 /// since the last poll. See the module docs for why the session needs

@@ -20,6 +20,13 @@ use super::events::{REPEAT_DELAY, REPEAT_INTERVAL};
 use super::thread::InputCapture;
 use super::thread::BEACON_PERIOD;
 
+/// How hard the crossing grab fights an existing grabber before giving
+/// up (see [`InputCapture::set_grabbed`]).
+const GRAB_ATTEMPTS: u32 = 6;
+
+/// The wait between grab attempts.
+const GRAB_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Map a chord's packed modifier mask (bit0 ctrl, bit1 alt, bit2 shift,
 /// bit3 meta — the order documented on the core `Engine` trait) to the
 /// X11 modifier mask. The modifier→modifier-mapping assignment is the
@@ -166,38 +173,61 @@ impl InputCapture {
             let mask = xproto::EventMask::BUTTON_PRESS
                 | xproto::EventMask::BUTTON_RELEASE
                 | xproto::EventMask::POINTER_MOTION;
-            // Each step fails as `None` on transport or reply errors.
-            let pointer = self
-                .conn
-                .grab_pointer(
-                    false,
-                    self.root,
-                    mask,
-                    xproto::GrabMode::ASYNC,
-                    xproto::GrabMode::ASYNC,
-                    x11rb::NONE,
-                    x11rb::NONE,
-                    x11rb::CURRENT_TIME,
-                )
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|r| r.status == xproto::GrabStatus::SUCCESS);
-            let keyboard = self
-                .conn
-                .grab_keyboard(
-                    false,
-                    self.root,
-                    x11rb::CURRENT_TIME,
-                    xproto::GrabMode::ASYNC,
-                    xproto::GrabMode::ASYNC,
-                )
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|r| r.status == xproto::GrabStatus::SUCCESS);
+            // The grab races whoever else is grabbing right now — a WM
+            // alt-tab popup, our own chord passive-grab re-arm, a
+            // screenshot tool. A single attempt losing that race left the
+            // local desktop live while the cursor was on the client (the
+            // user's own typing acted on BOTH machines at once), so the
+            // attempt is retried on a short jitter-free cadence: a popup
+            // grab lives milliseconds, ours (GrabMode::SYNC passive
+            // grabs) release on the next key. `x11rb::CURRENT_TIME` is
+            // still correct — a retry re-issues a fresh request, and the
+            // server resolves it against the latest timestamp it saw.
+            let mut pointer = None;
+            let mut keyboard = None;
+            for attempt in 0..GRAB_ATTEMPTS {
+                if attempt > 0 {
+                    std::thread::sleep(GRAB_RETRY_GAP);
+                }
+                if pointer != Some(true) {
+                    pointer = self
+                        .conn
+                        .grab_pointer(
+                            false,
+                            self.root,
+                            mask,
+                            xproto::GrabMode::ASYNC,
+                            xproto::GrabMode::ASYNC,
+                            x11rb::NONE,
+                            x11rb::NONE,
+                            x11rb::CURRENT_TIME,
+                        )
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.status == xproto::GrabStatus::SUCCESS);
+                }
+                if keyboard != Some(true) {
+                    keyboard = self
+                        .conn
+                        .grab_keyboard(
+                            false,
+                            self.root,
+                            x11rb::CURRENT_TIME,
+                            xproto::GrabMode::ASYNC,
+                            xproto::GrabMode::ASYNC,
+                        )
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.status == xproto::GrabStatus::SUCCESS);
+                }
+                if pointer == Some(true) && keyboard == Some(true) {
+                    break;
+                }
+            }
             match (pointer, keyboard) {
                 (Some(true), Some(true)) => true,
                 (p, k) => {
-                    log_warn!("input grab not acquired (pointer: {p:?}, keyboard: {k:?})");
+                    log_warn!("input grab not acquired after {GRAB_ATTEMPTS} attempts (pointer: {p:?}, keyboard: {k:?})");
                     false
                 }
             }
