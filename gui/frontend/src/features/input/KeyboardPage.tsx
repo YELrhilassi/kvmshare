@@ -5,7 +5,6 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { PageSkeleton } from "@/components/PageSkeleton";
 import { useChordRecorder, keyName, modLabels, Kbd, type LiveMods } from "./ChordRecorder";
-import { LiveKeys, useLiveKeys } from "./LiveKeys";
 import { allActions, actionIdOf, bindingIsBindable, bareSafeKey, chordSig, titleOf, type ActionSpec } from "./shortcuts";
 import { cn } from "@/lib/utils";
 
@@ -13,18 +12,18 @@ import { cn } from "@/lib/utils";
 // its own page with a split-pane editor:
 //
 //   left  · binder   every action as a card; record/clear its chord in
-//                    place, modifier chips lighting as keys are held,
-//                    the live-keys panel flashing pushes and holds
-//                    *while recording* — capture is only ever armed for
-//                    a recording, never in the background
+//                    place, modifier chips lighting as keys are held.
+//                    Capture is only ever armed for a recording, never
+//                    in the background — and on Windows it runs at the
+//                    OS boundary, so the native binding of the chord
+//                    being recorded (Win+Tab, Alt+Tab…) never fires.
 //   right · behavior the shortcut system as a whole: enabled switch,
 //                    what a binding means (physical-key identity, OS
 //                    override), and why capture goes quiet while a
 //                    shared session is live (kernel isolation)
 //
 // The recorder suppresses every key it sees while active, so recording
-// never operates the UI underneath it, and OS-stolen chords (Win+Tab)
-// complete on blur instead of vanishing.
+// never operates the UI underneath it.
 
 const NO_MODS: LiveMods = { ctrl: false, alt: false, shift: false, meta: false };
 
@@ -161,13 +160,6 @@ export default function KeyboardPage() {
   // and is dropped from the file on the next save (self-healing).
   const bindings = (shortcuts.bindings ?? []).filter(bindingIsBindable);
 
-  // Live keys: the recorder reports every push and release **while a
-  // card is recording** — the panel exists only inside the record UI,
-  // and the capture hook is only mounted then (outside recording the
-  // page never touches key events, so normal keyboard use of the UI is
-  // untouched).
-  const { held, tape, push } = useLiveKeys();
-
   const recording = recordingFor !== null;
   const { live } = useChordRecorder(
     recording,
@@ -219,13 +211,6 @@ export default function KeyboardPage() {
     },
     // onCancel: Esc while a card records.
     () => setRecordingFor(null),
-    // onKey: the live panel mirrors every key the capture sees.
-    (e: KeyboardEvent, down: boolean) => {
-      const name = modifierName(e) ?? keyNameOfEvent(e);
-      if (name) push(name, down);
-    },
-    // Recording is the only capture mode: always suppress while armed.
-    true,
   );
 
   const bindingFor = (id: string) => bindings.find((b) => actionIdOf(b) === id);
@@ -288,7 +273,6 @@ export default function KeyboardPage() {
         <div className={cn("mt-6 grid items-start gap-6 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]", !shortcuts.enabled && "opacity-60")}>
           {/* Left pane — the binder */}
           <div className="min-w-0">
-            {recording && <LiveKeys held={held} tape={tape} live={live} />}
             <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-2">
               {actions.map((spec) => (
                 <ActionCard
@@ -306,7 +290,8 @@ export default function KeyboardPage() {
             </div>
             {recording && !sessionLive && (
               <p className="mt-3 text-xs text-primary/80">
-                Hold modifiers, then tap the key — every key you push shows in the live panel. Esc cancels.
+                Hold modifiers, then tap the key — the chord is captured before the OS acts on it, so native bindings
+                like Win+Tab will not fire while recording. Esc cancels.
               </p>
             )}
             {recording && sessionLive && (
@@ -323,6 +308,7 @@ export default function KeyboardPage() {
               <ul className="mt-2 space-y-1.5 text-xs leading-relaxed text-muted-foreground">
                 <li>• Bindings are recorded as physical keys, so they work the same on every machine pair.</li>
                 <li>• A bound chord is swallowed before the desktop sees it — Win+Tab, Alt+Tab, media keys included.</li>
+                <li>• Recording swallows its keys too: the chord you press never triggers what the OS had bound to it.</li>
                 <li>• One chord per action; recording replaces the card's chord, and a chord held elsewhere is refused.</li>
               </ul>
             </section>
@@ -331,8 +317,8 @@ export default function KeyboardPage() {
               <h2 className="text-sm font-medium">While control is on another machine</h2>
               <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
                 When a client is using this machine's keyboard and mouse, the physical devices are isolated at the
-                kernel — the desktop (and this window) see nothing, by design. Key recording and the live panel resume
-                the moment control comes home.
+                kernel — the desktop (and this window) see nothing, by design. Key recording resumes the moment control
+                comes home.
               </p>
             </section>
 
@@ -363,61 +349,4 @@ export default function KeyboardPage() {
       </div>
     </div>
   );
-}
-
-/** Human name of a modifier keydown, or null when the key is not one. */
-function modifierName(e: KeyboardEvent): string | null {
-  switch (e.key) {
-    case "Control":
-      return "Ctrl";
-    case "Alt":
-    case "AltGraph":
-      return "Alt";
-    case "Shift":
-      return "Shift";
-    case "Meta":
-      return "Super";
-    default:
-      return null;
-  }
-}
-
-/** Human name of any key event, via the shared HID mapping when possible. */
-function keyNameOfEvent(e: KeyboardEvent): string {
-  // The recorder's own keyName() is HID-based; for live display we can
-  // afford the DOM label when the HID id is unknown (never recorded).
-  const hidKey = e.key;
-  if (hidKey.length === 1) return hidKey.toUpperCase();
-  switch (hidKey) {
-    case "Escape":
-      return "Esc";
-    case " ":
-      return "Space";
-    case "ArrowUp":
-      return "↑";
-    case "ArrowDown":
-      return "↓";
-    case "ArrowLeft":
-      return "←";
-    case "ArrowRight":
-      return "→";
-    case "Backspace":
-    case "Tab":
-    case "Enter":
-    case "CapsLock":
-    case "NumLock":
-    case "ScrollLock":
-    case "Insert":
-    case "Delete":
-    case "Home":
-    case "End":
-    case "PageUp":
-    case "PageDown":
-    case "Pause":
-    case "PrintScreen":
-      return hidKey;
-    default:
-      if (/^F\d+$/.test(hidKey)) return hidKey;
-      return hidKey;
-  }
 }

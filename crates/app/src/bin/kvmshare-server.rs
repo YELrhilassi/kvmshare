@@ -4,6 +4,14 @@
 //! desktop layout, listens for clients, and forwards local input to
 //! whichever client the cursor is on.
 
+// windowsgui on Windows: a background daemon with no console of its
+// own. The console subsystem is why a task-started (elevated) server
+// flashed a cmd window on the desktop for its whole run — Task
+// Scheduler launches it in the interactive session and Windows
+// allocates a console for a console binary; windowsgui does not get
+// one. Logging goes to the file/stderr channels either way.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};

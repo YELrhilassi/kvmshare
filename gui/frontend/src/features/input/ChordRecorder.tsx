@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { startBackendCapture, captureKind, type BackendMods } from "./BackendCapture";
 
 // Chord recording for the shortcut system: one hook that captures the
 // next keystroke as a chord (modifier set + physical key), plus the
@@ -197,19 +198,28 @@ const NO_MODS: LiveMods = { ctrl: false, alt: false, shift: false, meta: false }
 /**
  * Capture the next chord while `active`: modifier chips update **live**
  * as keys are held, the first non-modifier key press completes the
- * chord, and — while `suppress` — every key event is swallowed so
- * nothing the user pushes acts on the UI (Enter must not press a
- * focused button mid-recording; Tab must not move focus). With
- * `onKey`, the caller also observes every push and release — that is
- * the live-keys panel's data source. Listen-only mode (`active`
- * without `suppress`) reports keys without eating them.
+ * chord.
+ *
+ * Two ears, in order of preference:
+ *
+ *  - **The backend hook** (Windows): a system-wide WH_KEYBOARD_LL
+ *    session, active only while recording. It sees the physical chord
+ *    *before the OS* — Super+Tab and friends are swallowed there, so
+ *    the native binding never fires and the tab-switcher never
+ *    triggers. Keys arrive as canonical HID ids.
+ *  - **DOM events** (fallback / other platforms): keydown/keyup on the
+ *    webview window with preventDefault while recording — enough for
+ *    every key the OS has not bound; an OS-bound chord completes on
+ *    blur (the last key held when the switcher steals focus is what
+ *    the user meant).
+ *
+ * In both ears a completed chord is swallowed — never acted on by the
+ * page or the OS.
  */
 export function useChordRecorder(
   active: boolean,
   onDone?: (chord: Chord) => void,
   onCancel?: () => void,
-  onKey?: (e: KeyboardEvent, down: boolean) => void,
-  suppress = true,
 ): { live: LiveMods; listening: boolean } {
   const [live, setLive] = useState<LiveMods>(NO_MODS);
 
@@ -217,17 +227,16 @@ export function useChordRecorder(
   // does not re-attach (and lose the live state) on every parent render.
   const doneRef = useRefLatest(onDone);
   const cancelRef = useRefLatest(onCancel);
-  const keyRef = useRefLatest(onKey);
-  const suppressRef = useRefLatest(suppress);
 
   useEffect(() => {
     if (!active) {
       setLive(NO_MODS);
       return;
     }
-    // Keys seen down since the chord started. Scroll Lock / Pause are
-    // reported on keyup (not keydown) by some browsers, and an OS may
-    // swallow the whole chord after keydown — both handled below.
+    // Keys seen down since the chord started (DOM ear only). Scroll
+    // Lock / Pause are reported on keyup (not keydown) by some
+    // browsers, and an OS may swallow the whole chord after keydown —
+    // both handled below.
     let seenDown = new Set<number>();
     // The live modifier state, tracked synchronously (React state lags
     // one render — the blur handler below needs it *now*).
@@ -237,25 +246,70 @@ export function useChordRecorder(
     // keyup never arrives. The chord collected so far is still what
     // the user meant — complete it on blur instead of dropping it.
     let lastKey = 0;
-    const sync = (e: KeyboardEvent) => {
-      modsNow = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
-      setLive(modsNow);
-    };
+    let settled = false; // one chord per recording session
     const complete = (mods: LiveMods, hid: number) => {
-      lastKey = 0;
-      seenDown = new Set();
+      if (settled) return;
+      settled = true;
       doneRef.current?.({ ...mods, key: hid });
     };
+    const setMods = (mods: LiveMods) => {
+      modsNow = mods;
+      setLive(mods);
+    };
+
+    // ---- Ear 1: the backend hook (Windows). Preferred whenever the
+    // ---- backend offers it: the only ear that sees OS-bound chords.
+    let disposeHook: (() => void) | null | undefined = undefined;
+    if (captureKind === "hook") {
+      void startBackendCapture(
+        (hid, down, mods) => {
+          const liveMods: LiveMods = { ctrl: mods.ctrl, alt: mods.alt, shift: mods.shift, meta: mods.meta };
+          setMods(liveMods);
+          if (!down) return;
+          if (hid === 0x29) {
+            // Esc cancels (reserved for returning home).
+            settled = true;
+            cancelRef.current?.();
+            return;
+          }
+          complete(liveMods, hid);
+        },
+        (mods) => setMods({ ctrl: mods.ctrl, alt: mods.alt, shift: mods.shift, meta: mods.meta }),
+        () => {
+          // The hook expired the session (page stalled too long):
+          // fall through to the DOM ear rather than going deaf.
+          disposeHook = null;
+          setMods(NO_MODS);
+        },
+      ).then((d) => {
+        if (d) disposeHook = d;
+        else disposeHook = null; // hook unavailable — DOM ear below
+      });
+    } else {
+      disposeHook = null;
+    }
+    // While disposeHook is undefined the hook is still being negotiated;
+    // the DOM ear below activates only when it is explicitly null. The
+    // negotiated flag is read synchronously by the handlers, which are
+    // attached regardless and become no-ops while the hook owns keys.
+    let hookOwns = captureKind === "hook";
+
+    // ---- Ear 2: DOM events (fallback). preventDefault while recording
+    // ---- stops the page from acting; an OS-bound chord completes on
+    // ---- blur (that ear cannot stop the OS, but the chord the user
+    // ---- held when focus was stolen is still recoverable).
+    const sync = (e: KeyboardEvent) => {
+      setMods({ ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey });
+    };
     const onKey = (e: KeyboardEvent) => {
+      if (hookOwns) return; // the backend hook is feeding us
       // While recording, suppress everything: no default behavior, no
       // bubbling — a recorded chord is captured, never acted on.
-      if (suppressRef.current) {
-        e.preventDefault();
-        e.stopPropagation();
-      }
+      e.preventDefault();
+      e.stopPropagation();
       sync(e);
-      keyRef.current?.(e, true);
       if (e.key === "Escape") {
+        settled = true;
         cancelRef.current?.();
         return;
       }
@@ -271,12 +325,10 @@ export function useChordRecorder(
       complete(modsNow, hid);
     };
     const onKeyUp = (e: KeyboardEvent) => {
-      if (suppressRef.current) {
-        e.preventDefault();
-        e.stopPropagation();
-      }
+      if (hookOwns) return;
+      e.preventDefault();
+      e.stopPropagation();
       sync(e);
-      keyRef.current?.(e, false);
       if (!seenDown.has(e.keyCode) && isBindableLock(e)) {
         // The keydown never reached us (browser reports these on keyup
         // only) — the release *is* the press: record the chord now.
@@ -286,6 +338,7 @@ export function useChordRecorder(
       seenDown.delete(e.keyCode);
     };
     const onBlur = () => {
+      if (hookOwns) return;
       if (lastKey !== 0) {
         complete(modsNow, lastKey);
         return;
@@ -295,12 +348,20 @@ export function useChordRecorder(
     window.addEventListener("keydown", onKey, true);
     window.addEventListener("keyup", onKeyUp, true);
     window.addEventListener("blur", onBlur, true);
+    // Give the hook negotiation one tick: if it came back null (or the
+    // backend rejected the session), the DOM ear takes over at once.
+    const unlock = window.setTimeout(() => {
+      if (disposeHook === null) hookOwns = false;
+    }, 50);
+
     return () => {
+      window.clearTimeout(unlock);
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("keyup", onKeyUp, true);
       window.removeEventListener("blur", onBlur, true);
+      disposeHook?.();
     };
-  }, [active, doneRef, cancelRef, keyRef, suppressRef]);
+  }, [active, doneRef, cancelRef]);
 
   return { live, listening: active };
 }

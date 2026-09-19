@@ -234,6 +234,12 @@ interface GoApp {
   // Role elevation (meaningful on Windows): whether role processes run
   // elevated, and what stands in the way when they do not.
   RoleElevation(): Promise<RoleElevation>;
+  // Shortcut-recording key capture (Windows): a system-wide keyboard
+  // hook active only during a recording session, so OS-bound chords
+  // (Win+Tab) can be seen and swallowed before the shell acts.
+  StartKeyCapture(token: string): Promise<string>;
+  StopKeyCapture(token: string): Promise<void>;
+  RenewKeyCapture(token: string): Promise<void>;
 }
 
 interface WailsCall {
@@ -333,4 +339,7 @@ export const api = (): GoApp => ({
   DisableLaunchAtStartup: () => call<void>("DisableLaunchAtStartup"),
   LaunchAtStartupEnabled: () => call<boolean>("LaunchAtStartupEnabled"),
   RoleElevation: () => call<RoleElevation>("RoleElevation"),
+  StartKeyCapture: (token) => call<string>("StartKeyCapture", token),
+  StopKeyCapture: (token) => call<void>("StopKeyCapture", token),
+  RenewKeyCapture: (token) => call<void>("RenewKeyCapture", token),
 });

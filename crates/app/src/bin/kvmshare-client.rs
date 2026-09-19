@@ -4,6 +4,11 @@
 //! its host name, then injects the server's cursor/keyboard/clipboard
 //! events into the local desktop.
 
+// windowsgui on Windows: same reasoning as the server — a background
+// daemon must not own a console, and a task-started (elevated) client
+// with the console subsystem flashed a cmd window on the desktop.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
