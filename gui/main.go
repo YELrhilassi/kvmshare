@@ -18,8 +18,8 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
-	"kvmshare/gui/internal/sessionbus"
 	"kvmshare/gui/internal/selfupdate"
+	"kvmshare/gui/internal/sessionbus"
 	"log"
 	"log/slog"
 	"os"
@@ -223,4 +223,8 @@ func main() {
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
 	}
+	// The low-level keyboard hook (Windows) must not outlive the GUI:
+	// a leaked hook would keep suppressing keystrokes after the process
+	// is gone to a user's eye.
+	exitHookThread()
 }

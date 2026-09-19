@@ -178,4 +178,9 @@ func (a *App) stateLoop() {
 // built (before then, emission is a no-op).
 func (a *App) attachEvents(em *application.EventManager) {
 	a.events = em
+	// The key-capture registry reports through the same event manager
+	// (the chord recorder's keys travel on it), and its watchdog bounds
+	// the armed-but-page-gone case.
+	keyCapture.setSink(em)
+	go runCaptureWatchdog(keyCapture)
 }

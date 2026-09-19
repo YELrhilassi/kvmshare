@@ -168,6 +168,14 @@ export default function KeyboardPage() {
     (chord: Chord) => {
       const action = recordingFor;
       if (!action || !config) return;
+      // A held-only recording (modifiers pressed and released with no
+      // plain key) arrives as key 0: ask for the plain key and keep
+      // recording — the session stays armed, so the next chord is one
+      // keystroke away.
+      if (chord.key === 0) {
+        setErr("Now tap the key to finish the chord — e.g. hold Super, then tap Tab.");
+        return;
+      }
       // A binding must carry a modifier unless the key is app-meaningless
       // bare (Scroll Lock, Pause, F13–F24) — the same rule the engine's
       // BindSection sanitization enforces, mirrored here so the user gets
@@ -176,7 +184,7 @@ export default function KeyboardPage() {
       // keystroke away.
       const hasMods = chord.ctrl || chord.alt || chord.shift || chord.meta;
       if (!hasMods && !bareSafeKey(chord.key)) {
-        setErr("Add a modifier (Ctrl/Alt/Shift/Super) — a bare key like that is used by every app and would be swallowed.");
+        setErr("That chord needs a modifier (Ctrl/Alt/Shift/Super) — a bare key like that is used by every app and would be swallowed.");
         return;
       }
       setRecordingFor(null);

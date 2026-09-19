@@ -223,13 +223,20 @@ async function openEar(
  *    session, active only while recording. It sees the physical chord
  *    *before the OS* — Super+Tab and friends are swallowed there, so
  *    the native binding never fires. Keys arrive as canonical HID ids.
- *    If the session dies mid-recording (TTL lapse — the page stalled),
- *    `onExpired` fires and the recorder re-opens a DOM ear so a
- *    long-running recording degrades instead of going deaf.
+ *    If the session dies mid-recording (lease lapse — the page
+ *    stalled), `onExpired` fires and the recorder re-opens a DOM ear
+ *    so a long-running recording degrades instead of going deaf.
  *  - **DOM events** (fallback / other platforms): keydown/keyup with
  *    preventDefault while recording — enough for every key the OS has
  *    not bound; an OS-bound chord completes on blur (the key held when
  *    focus was stolen is what the user meant).
+ *
+ * Chord completion follows the way users actually type shortcuts: a
+ * modifier **held** counts, and the chord completes when the first
+ * non-modifier key arrives — or, when only modifiers were pressed and
+ * everything is released ("I held Super and let go"), on the release
+ * of the last modifier. A held-only recording therefore always yields
+ * a chord instead of hanging the session (and with it the keyboard).
  */
 export function useChordRecorder(
   active: boolean,
@@ -263,8 +270,16 @@ export function useChordRecorder(
     };
     const setMods = (mods: LiveMods) => {
       modsNow = mods;
+      if (anyMod(mods)) heldMods = { ...mods };
       setLive(mods);
     };
+    // anyMod: does the current live set carry at least one modifier?
+    const anyMod = (m: LiveMods) => m.ctrl || m.alt || m.shift || m.meta;
+    // heldMods: the most recent non-empty modifier snapshot — the set
+    // the user actually held. Release events report a post-release
+    // snapshot (modifiers already cleared), so held-only completion
+    // must come from here, not from the live state.
+    let heldMods: LiveMods = { ...NO_MODS };
     const asLiveMods = (m: BackendMods): LiveMods => ({
       ctrl: m.ctrl, alt: m.alt, shift: m.shift, meta: m.meta,
     });
@@ -312,6 +327,15 @@ export function useChordRecorder(
           if (hid !== 0) complete(modsNow, hid);
         }
         seenDown.delete(e.keyCode);
+        // Held-only recording: every key is back up and the user
+        // pressed only modifiers — the held set is the chord (key 0;
+        // validation asks for the plain key). Completing here keeps
+        // the recording from hanging on "held Super, released". The
+        // snapshot comes from heldMods: this very release already
+        // cleared the live state.
+        if (seenDown.size === 0 && lastKey === 0 && anyMod(heldMods)) {
+          complete(heldMods, 0);
+        }
       };
       const onBlur = () => {
         if (settled) return;
@@ -333,6 +357,10 @@ export function useChordRecorder(
       };
     };
 
+    // lastModOnly: the hook ear has seen a modifier press and nothing
+    // else yet — the held-only completion above keys off it.
+    let lastModOnly = false;
+
     // ---- Ear selection, awaited before anything listens.
     const open = async () => {
       const { ear, dispose } = await openEar(
@@ -341,13 +369,25 @@ export function useChordRecorder(
           if (cancelled || settled) return;
           const liveMods = asLiveMods(mods);
           setMods(liveMods);
-          if (!down) return;
+          if (!down) {
+            // Held-only recording on the hook ear: the last modifier
+            // came up with no plain key ever pressed — the held set is
+            // the chord (key 0; validation asks for a plain key).
+            if (!anyMod(liveMods) && lastModOnly) {
+              complete(heldMods, 0);
+            }
+            return;
+          }
           // A modifier key press updates the live chips (done above via
           // the snapshot) and nothing else: a modifier is never the
           // chord-completing key. Before this guard, Super's HID usage
           // arrived here as a "key" and the recorder completed a bare
           // chord instantly — the "Add a modifier" error.
-          if (isModifierHid(hid)) return;
+          if (isModifierHid(hid)) {
+            lastModOnly = true;
+            return;
+          }
+          lastModOnly = false;
           if (hid === 0x29) {
             // Esc cancels (reserved for returning home).
             settled = true;
@@ -360,10 +400,10 @@ export function useChordRecorder(
         (mods) => {
           if (!cancelled) setMods(asLiveMods(mods));
         },
-        // hook dead: TTL expired the session mid-recording. Re-arm on
-        // the DOM ear — degraded (OS-bound chords now unreachable) but
-        // never deaf. A dead session cannot fire more events, so there
-        // is no double-ear window.
+        // hook dead: the lease expired the session mid-recording.
+        // Re-arm on the DOM ear — degraded (OS-bound chords now
+        // unreachable) but never deaf. A dead session cannot fire more
+        // events, so there is no double-ear window.
         () => {
           if (cancelled || settled) return;
           disposeHook = null;
