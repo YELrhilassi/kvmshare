@@ -47,14 +47,17 @@ func (a *App) startRoleProcess(bin, logPath string, env []string, args ...string
 	if err == nil {
 		return nil, nil
 	}
-	// Task missing or refused to run: try creating it through the
-	// elevated installer once (one UAC prompt, only when actually
-	// needed), then start again.
-	slog.Warn("elevation task start failed — relaying creation through the elevated installer", "err", err)
-	if relayErr := installer.EnsureElevationTasksViaInstaller(a.stateDir); relayErr == nil {
+	// Task missing or refused to run: try creating it once — task
+	// creation needs Administrators membership (not an elevated token,
+	// so an admin's filtered GUI token works with no UAC prompt), and
+	// this covers a portable copy or a policy wipe. Then start again.
+	slog.Warn("elevation task start failed — attempting direct task creation", "err", err)
+	if createErr := installer.EnsureElevationTasks(a.stateDir); createErr == nil {
 		if err2 := startRoleElevated(a.stateDir, role, full, alive); err2 == nil {
 			return nil, nil
 		}
+	} else {
+		slog.Warn("elevation task creation unavailable", "err", createErr)
 	}
 	// Fallback: direct spawn with the full environment, exactly as
 	// before this layer existed.

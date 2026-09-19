@@ -21,15 +21,20 @@ package installer
 //
 // ## The mechanism
 //
-// A per-user scheduled task with run level HIGHEST per role launches
-// the role binary. **Creation and running are different privileges**:
-// creating a HIGHEST task requires an elevated caller (schtasks refuses
-// with "(6,27):RunLevel:Highest ... out of range" otherwise — measured
-// on this exact error), while *running* an existing task needs no
-// elevation at all. The tasks are therefore created once by the
-// elevated installer — the same UAC prompt that opens the firewall —
-// and the GUI afterwards only ever `schtasks /Run`s them: no prompt,
-// ever, at role start.
+// A per-user scheduled task with run level HighestAvailable per role
+// launches the role binary. **Creation and running are different
+// privileges**: creating a HIGHEST task requires Administrators
+// membership (a standard user is refused), while *running* an existing
+// task needs no elevation at all. The tasks are created once at install
+// time (the installer runs elevated anyway) and self-heal from the GUI
+// when missing — an admin user's filtered token is enough, no prompt.
+//
+// Measured, and worth recording: schtasks rejects the XML value
+// "Highest" with "(6,27):RunLevel:Highest ... incorrectly formatted or
+// out of range" — the CLI's /RL HIGHEST maps to the XML value
+// **HighestAvailable**, and that error says nothing about the caller's
+// token. The invalid value once masqueraded as an elevation failure and
+// pushed the design into an unnecessary UAC relay.
 //
 // A task's command line is fixed at creation, so it cannot carry the
 // values that change per run (the client's server address, log paths).
@@ -86,15 +91,16 @@ func ArgsFilePath(stateDir, role string) string {
 	return filepath.Join(stateDir, role+"-args.txt")
 }
 
-// elevationTaskXML is the task definition: run level HIGHEST (the whole
-// point), logon type InteractiveToken (runs in the operator's session,
-// where the input must land), no time limit, on-demand only.
+// elevationTaskXML is the task definition: run level HighestAvailable
+// (the whole point — see the measured note above for why the value is
+// not "Highest"), logon type InteractiveToken (runs in the operator's
+// session, where the input must land), no time limit, on-demand only.
 const elevationTaskXML = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Principals>
     <Principal id="Author">
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>Highest</RunLevel>
+      <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -118,12 +124,13 @@ const elevationTaskXML = `<?xml version="1.0" encoding="UTF-16"?>
 `
 
 // EnsureElevationTasks creates (or re-creates) the per-role elevation
-// tasks for this user. Requires an elevated caller — the installer runs
-// elevated at install/update time (and via the --elevation-task CLI
-// subcommand). Idempotent.
+// tasks for this user. Requires Administrators membership (a standard
+// user cannot register a HighestAvailable task) — not an elevated
+// token: an admin's filtered token is accepted, which is what lets the
+// GUI self-heal without a UAC prompt. Idempotent.
 //
-// The task points at the role binary in the install dir (where this
-// elevated installer itself lives) and passes the state-dir args file;
+// The task points at the role binary in the install dir (where the
+// installer — and the GUI — live) and passes the state-dir args file;
 // the GUI stages the actual argv there before every run.
 func EnsureElevationTasks(stateDir string) error {
 	exeDir := ""
