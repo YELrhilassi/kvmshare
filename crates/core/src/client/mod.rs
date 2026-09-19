@@ -138,10 +138,12 @@ impl Client {
 
         let (own_id, layout, server_id) = match transport.recv()? {
             RecvResult::Msg(Message::Welcome { server_version, server_id, layout, own_screen_id }) => {
-                if server_version != kvmshare_protocol::VERSION {
+                if !kvmshare_protocol::compatible(server_version) {
                     return Err(io::Error::other(format!(
-                        "server speaks v{server_version}, client speaks v{}",
-                        kvmshare_protocol::VERSION
+                        "this client speaks protocol v{} (accepts v{}–v{}) and the server speaks v{server_version} — update the older machine",
+                        kvmshare_protocol::VERSION,
+                        kvmshare_protocol::MIN_PROTOCOL,
+                        kvmshare_protocol::MAX_PROTOCOL,
                     )));
                 }
                 (own_screen_id, layout, server_id)

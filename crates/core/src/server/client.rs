@@ -274,15 +274,20 @@ fn exchange_hello(
 ) -> io::Result<(u8, String, String, ScreenInfo, bool)> {
     let (machine_id, name, info) = match transport.recv()? {
         RecvResult::Msg(Message::Hello { version, id, name, info }) => {
-            if version != kvmshare_protocol::VERSION {
+            if !kvmshare_protocol::compatible(version) {
                 let _ = transport.send(&Message::Error {
                     code: errors::VERSION_MISMATCH,
                     text: format!(
-                        "server speaks v{}, client speaks v{version}",
-                        kvmshare_protocol::VERSION
+                        "this server speaks protocol v{} (accepts v{}–v{}) and the client speaks v{version} — update the older machine",
+                        kvmshare_protocol::VERSION,
+                        kvmshare_protocol::MIN_PROTOCOL,
+                        kvmshare_protocol::MAX_PROTOCOL,
                     ),
                 });
-                return Err(io::Error::other("version mismatch"));
+                return Err(io::Error::other(format!(
+                    "client refused: protocol version mismatch (server v{}, client v{version})",
+                    kvmshare_protocol::VERSION
+                )));
             }
             (id, name, info)
         }

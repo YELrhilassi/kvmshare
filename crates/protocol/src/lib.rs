@@ -41,8 +41,34 @@ pub mod wire;
 pub use frame::{Frame, HEADER_LEN, LEN_OFFSET};
 pub use message::{KeyKind, Message, ScreenInfo};
 
-/// Current protocol version. Bump on any breaking wire change.
+/// The wire protocol version this build speaks. Bump on any breaking
+/// wire change.
 pub const VERSION: u16 = 3;
+
+/// The oldest wire protocol this build can interoperate with. A peer
+/// is compatible when its version is in `[MIN_PROTOCOL, MAX_PROTOCOL]`.
+/// The range is what makes upgrades and downgrades survivable: a new
+/// build speaks to an old one as long as nothing each side actually
+/// sends has changed meaning, and the handshake refuses honestly (with
+/// the exact versions on both ends in the error text) when they cannot.
+///
+/// Today the wire has never broken (VERSION 3 since the first release
+/// with versioning), so the floor equals the current version. When a
+/// breaking change lands: bump VERSION, set MIN_PROTOCOL to the oldest
+/// version whose messages this build still reads correctly, and teach
+/// the encoders to speak `min(peer, VERSION)` if the floor is below
+/// the peer's version.
+pub const MIN_PROTOCOL: u16 = 3;
+
+/// The newest wire protocol this build can interoperate with. Equals
+/// VERSION except while a future build stages an unreleased protocol
+/// (it would advertise a higher MAX before flipping VERSION).
+pub const MAX_PROTOCOL: u16 = VERSION;
+
+/// Are two protocol versions interoperable under this build's range?
+pub fn compatible(peer_version: u16) -> bool {
+    (MIN_PROTOCOL..=MAX_PROTOCOL).contains(&peer_version)
+}
 
 /// Maximum payload we will accept on the wire. Guards against
 /// corrupt length fields allocating absurd buffers.

@@ -10,6 +10,12 @@
 //! owner can write to. See `kvmshare_platform::x11::wheel_daemon` for
 //! the protocol and `wheel_server` for the injection side.
 
+// windowsgui on Windows too: the file ships in the Windows archive as
+// a --version stub for the manifest check, and a console-subsystem stub
+// flashed a cmd window if anything ever ran it there. It exits with a
+// clear error on non-Linux, printing nothing on the desktop.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[cfg(target_os = "linux")]
 fn main() {
     // --version before anything else: the GUI's install check reads the
