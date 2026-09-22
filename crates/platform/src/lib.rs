@@ -77,14 +77,9 @@ pub fn server(
 ///
 /// A kvmshare role owns the user's cursor: its motion loop wakes every
 /// few milliseconds and every recovery watchdog depends on being
-/// scheduled. At normal priority a busy app can starve it for seconds;
-/// at the priority Task Scheduler launches processes with (BelowNormal
-/// on some configurations) it is starved constantly — the exact failure
-/// behind "the cursor freezes whenever I click or start something on the
-/// client". High priority (not realtime — that could stall the whole
+/// High priority (not realtime — that could stall the whole
 /// machine) keeps the motion and watchdog threads scheduled without
 /// risking the OS. Best effort everywhere: failing is never fatal.
-#[allow(dead_code)]
 pub fn raise_priority() {
     #[cfg(target_os = "windows")]
     windows::raise_priority();

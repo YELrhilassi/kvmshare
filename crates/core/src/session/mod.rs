@@ -32,13 +32,16 @@
 
 mod boundary;
 mod motion;
-
 use kvmshare_protocol::message::{Message, Rect, Screen, ScreenInfo};
 
 use crate::layout::Layout;
 use crate::Mode;
 
-pub use boundary::{EDGE_BAND, EDGE_PUSH_FALLBACK, EDGE_PUSH_FRESH, ENTRY_INSET, REMOTE_BEACON_FRESH};
+// Re-exported for the e2e test suite, which asserts on entry insets.
+// (The other boundary constants are consumed inside boundary/motion via
+// `use super::*` — they stay private to the module tree.)
+#[cfg(test)]
+pub use boundary::{EDGE_BAND, ENTRY_INSET};
 
 /// Something the caller must do in response to an input event.
 #[derive(Debug, Clone, PartialEq)]
