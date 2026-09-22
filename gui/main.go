@@ -20,6 +20,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -45,6 +46,12 @@ func main() {
 	if raised {
 		return // the running instance is now in front
 	}
+
+	// Capture everything this process writes to stderr (Go panics,
+	// WebKit diagnostics, framework logs) into the state dir. Launched
+	// from autostart or a launcher there is no terminal — without this
+	// the evidence of a crash or a misbehavior is simply lost.
+	redirectStderr(filepath.Join(core.stateDir, "gui-stderr.log"))
 
 	// A D-Bus session bus must exist before anything touches D-Bus: the
 	// tray, the notify watcher, and the WebKitGTK webview (its child
@@ -110,14 +117,23 @@ func main() {
 	core.stateLoop()
 
 	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name:             "main",
-		Title:            "kvmshare",
-		Width:            1200,
-		Height:           800,
-		MinWidth:         880,
-		MinHeight:        560,
-		URL:              "/",
-		Linux:            application.LinuxWindow{Icon: windowIcon},
+		Name:      "main",
+		Title:     "kvmshare",
+		Width:     1200,
+		Height:    800,
+		MinWidth:  880,
+		MinHeight: 560,
+		URL:       "/",
+		Linux: application.LinuxWindow{
+			Icon: windowIcon,
+			// Hardware acceleration must be explicit: Wails can fall back
+			// to WebviewGpuPolicyNever, and a software-rendered WebKit burns
+			// a full CPU core per paint thread while the window is merely
+			// open — the "high CPU while doing nothing" report. With
+			// acceleration on, an idle page costs nothing; machines without
+			// a GPU fall back to software rendering on their own.
+			WebviewGpuPolicy: application.WebviewGpuPolicyAlways,
+		},
 		BackgroundColour: application.NewRGBA(10, 10, 12, 255),
 	})
 

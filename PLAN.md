@@ -153,6 +153,12 @@ Logging off (`client.logctl enabled=0`). Every loop verified blocking — no bus
 
 **Conclusion:** the 40% burn is state-dependent — trace logging left on after debug sessions, the server role, or HP/Windows. Windows measurement queued for when HP is reachable again.
 
+**Follow-up (2026-09-22, live occurrence caught at ~101% CPU, ~15 min after HP vanished):** burn was pure user-space CPU in GUI threads (utime 4318 vs stime 22 — no syscalls), starting exactly when the client flipped to `disconnected`; Go loops were all verified ticker-paced, so the spin was in WebKit rendering. Two causes addressed:
+1. **Wails GPU policy** — Wails can default the Linux webview to `WebviewGpuPolicyNever` (software rendering → WebKit burns a core per paint thread while the window is open). `WebviewGpuPolicyAlways` is now set explicitly in `gui/main.go`; machines without a GPU fall back on their own.
+2. **Invisible evidence** — launched from autostart, GUI stderr (Go panics, WebKit diagnostics) was lost. `gui/errlog_unix.go` now redirects fd 2 to `~/.local/state/kvmshare/gui-stderr.log`; verified working live.
+
+Not yet reproduced synthetically (kill-client and client-retry simulations both stayed ≤3%); if the burn recurs, the stderr log will now name the culprit.
+
 **Structural costs to trim in the rewrite (B-track):** cursor beacons at 8 ms = 125 wakeups/s per side while merely connected (replace with edge-triggered sends in the QUIC rewrite); `udp.rs` error-path 10 ms sleep (error-only); wheel-daemon 25 ms startup wait (startup-only, fine).
 
 Target after: every row "event" except keepalive (a single low-frequency
