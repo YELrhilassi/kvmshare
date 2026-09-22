@@ -58,23 +58,48 @@ gui/
 Key methods the frontend calls: `GetSettings`/`SetSettings`,
 `GetPaths`, `LoadConfig`/`SaveConfig`, `ServerStart`/`ServerStop`/
 `ServerRunning`, `ClientStart`/`ClientStop`/`ClientRunning`,
-`StartActive`/`StopActive`, `ListInterfaces`, `TailLog`,
+`ClientStatus`, `StartActive`/`StopActive`, `ListInterfaces`, `TailLog`,
 `GetLogSettings`/`SetLogSettings`, `ClearLog`, `GetVersion`,
 `CheckForUpdate`, `ApplyUpdate`, `ConnectedClients`,
-`ListClients`, `ClientCommand`, `DiscoverServers`, `ConnectToServer`,
-`TrustClient`, `StartDiscovery`, `AutoConnectEnabled`.
+`ListClients`, `ClientCommand`, `DiscoverPeers`, `SendConnectRequest`,
+`TrustClient`, `RevokeClient`, `StartDiscovery`, `AutoConnectEnabled`.
+
+Live state is **pushed**, not polled: a single 1 s re-check loop
+(`live.go`) emits a `kvmshare:state` event only when the JSON snapshot
+actually changed. The frontend subscribes once (`lib/bridge.ts
+onState`) and never polls the bridge; every process/thread in the GUI
+is event- or ticker-driven, so idle CPU cost is a fraction of a percent.
+
+**Webview GPU policy**: the Linux window sets
+`WebviewGpuPolicy: application.WebviewGpuPolicyAlways` explicitly —
+Wails' implicit default can be `Never`, and a software-rendered WebKit
+burns a full core per paint thread while the window is open. Machines
+without a GPU fall back to software on their own.
+
+**stderr capture**: the GUI redirects fd 2 to
+`<state>/gui-stderr.log` (`errlog_unix.go`, size-capped) so panics and
+WebKit diagnostics survive being launched from autostart/launcher.
 
 ## 8.1a Discovery & pairing
 
 **Files: `gui/discovery.go`, `gui/trust.go`, `gui/machine_id.go`**
 
-- Every kvmshare advertises its role over **mDNS** (`_kvmshare._tcp`,
-  service name = the machine id + role). Servers also publish their
-  port and display geometry as TXT records. No IP/port typing.
+- Two discovery channels, both always on: **UDP broadcast** (primary —
+  a tiny beacon every 2 s to the subnet broadcast address, carrying id,
+  name, role, port; forwarded by essentially every home/office router)
+  and **mDNS** (`_kvmshare._tcp`, secondary for networks where
+  multicast works and broadcast is filtered). A **unicast subnet
+  probe** every 10 s keeps peers alive where both broadcast and
+  multicast are filtered (AP client isolation). Peers from any channel
+  land in the same map and age out after 15 s of silence.
+- Pairing rides the same UDP port: a server operator clicks
+  "connect here" on a discovered client and the client starts its own
+  client process pointed at that server. Trust is first-use; pairing
+  can be disabled entirely in Client settings.
 - The **Client page** lists nearby servers with one-click connect and
-  an **auto-connect** toggle for a chosen server; the watcher also
-  reconnects when a server returns. Discovery failing means even a
-  manual address would fail — it is the same local network.
+  an **auto-connect** toggle; the watcher also reconnects when a server
+  returns. Discovery failing means even a manual address would fail —
+  it is the same local network.
 - **Trusted ids make pairing headless**: add a machine's id (shown on
   its own Home page) to `trusted_ids`, or accept its connect when the
   server asks — the client is admitted dynamically on first connect

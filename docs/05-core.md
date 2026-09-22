@@ -199,12 +199,13 @@ executes the queue at its own cadence, confining any block to the thread
 the supervisor can recover. Queue is bounded (512); when full the newest
 event is dropped.
 
-**Cursor-pin detection** (`MotionState::probe_window`): if the cursor
-was commanded to move but did not travel (away from a screen edge) for
-~6 consecutive windows, injected input is being eaten by the OS — the
-client releases local input and restarts the session. The Windows
-isolation watchdog is the same idea at the OS level
-([Platform](06-platform.md#63-windows)).
+Recovery from a genuinely wedged input path is the **supervisor's** job
+(`client/supervisor.rs`): it watches the motion thread's heartbeat while
+this machine is controlled and force-releases local input on a stall.
+There is deliberately **no telemetry-based "cursor looks stuck"
+heuristic**: such heuristics false-trip on transient OS stalls (a busy
+deck, a slow popup) and restart healthy sessions — jank caused by the
+cure.
 
 ## 5.6 Motion accumulation and calibration
 
