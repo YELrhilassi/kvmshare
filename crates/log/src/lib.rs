@@ -92,7 +92,10 @@ static SINK: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
 
 /// How often the control file is re-read. Cheap (one tiny file), and
 /// 400 ms keeps level changes feeling instant.
-const CONTROL_POLL: std::time::Duration = std::time::Duration::from_millis(400);
+/// How often the control file is re-read. The file is written by a
+/// human (or the GUI's log page) — seconds of latency are invisible —
+/// so this poll is deliberately slow; it must never register as load.
+const CONTROL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Configure the process-wide logger.
 ///

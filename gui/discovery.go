@@ -117,9 +117,13 @@ type discovery struct {
 	core *App
 
 	mu    sync.Mutex
-	peers map[string]*Peer  // keyed by machine id
+	peers map[string]*Peer     // keyed by machine id
 	seen  map[string]time.Time // last beacon heard per id (liveness)
 
+	// pubMu serializes mDNS (re)publishes. It is deliberately separate
+	// from mu: publishing does network I/O, and mu is read on every
+	// peer-list read from the frontend.
+	pubMu  sync.Mutex
 	reg    *zeroconf.Server
 	cancel context.CancelFunc
 
@@ -448,16 +452,27 @@ func (d *discovery) republish() {
 	if !d.active.Load() {
 		return
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.reg != nil {
-		d.reg.Shutdown()
-		d.reg = nil
-	}
+	// Serialize republishes against each other (a rapid role flip must
+	// not interleave two registrations).
+	d.pubMu.Lock()
+	defer d.pubMu.Unlock()
+	// Read everything that can block on other locks BEFORE taking d.mu:
+	// GetSettings takes the app lock, and holding d.mu while reaching
+	// for it inverts the lock order every other path uses (app →
+	// discovery). Register/Shutdown do network I/O and must not run
+	// under d.mu either — they would stall the frontend's peer list for
+	// the length of an mDNS announce.
 	s := d.core.GetSettings()
 	port := d.core.serverPort()
 	id := d.core.GetMachineId()
-
+	running := d.core.roleActive(string(s.Mode))
+	d.mu.Lock()
+	old := d.reg
+	d.reg = nil
+	d.mu.Unlock()
+	if old != nil {
+		old.Shutdown()
+	}
 	reg, err := zeroconf.Register(
 		"kvmshare-"+id,
 		discoveryService,
@@ -468,15 +483,17 @@ func (d *discovery) republish() {
 			"name=" + d.core.displayName(),
 			"role=" + string(s.Mode),
 			"port=" + itoa(port),
-			"running=" + strconv.FormatBool(d.core.roleActive(string(s.Mode))),
+			"running=" + strconv.FormatBool(running),
 		},
 		nil,
 	)
+	d.mu.Lock()
 	if err != nil {
-		d.reg = nil
+		d.mu.Unlock()
 		return
 	}
 	d.reg = reg
+	d.mu.Unlock()
 }
 
 // browse runs until `stop`, maintaining the peer map from mDNS.

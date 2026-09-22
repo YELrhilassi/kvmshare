@@ -25,8 +25,10 @@ use crate::udp;
 const CURSOR_BEACON_INTERVAL: Duration = Duration::from_millis(8);
 /// UDP socket read timeout: the cursor stream thread blocks on `recv`
 /// and wakes at this cadence when idle (to notice shutdown). Frames
-/// themselves wake it immediately — this is not a poll.
-pub(crate) const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(8);
+/// themselves wake it immediately — this is not a poll, and the value
+/// only bounds how long a stop is noticed, never cursor latency. 25 ms
+/// keeps an active session's idle wakes at 40/s instead of 125/s.
+pub(crate) const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(25);
 /// How often the sync thread re-checks the display geometry (rare
 /// event; the poll exists so a resolution change is noticed without
 /// restarting). Kept long so this thread rarely touches the injector
@@ -46,8 +48,7 @@ const CLIPBOARD_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) fn motion_loop(shared: Arc<Shared>, own_id: u8) {
     let mut last_beacon = Instant::now();
     let mut beacon_failed = false;
-    let mut recover = false;
-    while !shared.stop.load(Ordering::Relaxed) && !recover {
+    while !shared.stop.load(Ordering::Relaxed) {
         // Event-driven idle: while this machine is not being controlled
         // the motion thread has no duties at all (the supervisor only
         // guards active sessions and the heartbeat is only read while
@@ -93,15 +94,9 @@ pub(crate) fn motion_loop(shared: Arc<Shared>, own_id: u8) {
         shared.drain_events(&mut inj);
         // Telemetry is collected under the locks but logged only
         // after they are released — a slow log sink must never hold
-        // up the next placement. The screen query stays lazy: it is
-        // only needed to disambiguate a pin, and it is a user32 call
-        // that can stall on a busy desktop — never on the hot path.
-        let report = m.probe_window(rx, ry, || inj.screen_info());
-        if report.pinned {
-            inj.emergency_release();
-            shared.stop.store(true, Ordering::Relaxed);
-            recover = true;
-        }
+        // up the next placement. Diagnostic only: recovery is the
+        // supervisor's job, never a telemetry heuristic.
+        let report = m.probe_window(rx, ry);
         drop(m);
         drop(inj);
         if let Some(line) = report.trace {
@@ -217,9 +212,6 @@ pub(crate) fn sync_loop(shared: Arc<Shared>, tx: Sender<Message>) {
 pub(crate) fn apply_motion_frame(shared: &Shared, dx: i32, dy: i32) {
     let mut m = shared.motion.lock().unwrap();
     m.frames_win += 1;
-    // Feed the cursor-pin detector: how much motion was commanded this
-    // probe window, compared against the real cursor's travel.
-    m.win_cmd_px += dx.abs() as i64 + dy.abs() as i64;
     {
         let mut inj = shared.injector.lock().unwrap();
         if inj.absolute_motion() {

@@ -110,11 +110,26 @@ controlled — declared by session, implemented by platform; Linux: XI2
 grab, Windows: BlockInput). Implement for X11 now, stub Wayland-ready;
 Windows via SendInput + hooks. No logic behind the traits.
 
-### B4. Transport
-QUIC (quinn): one connection, two framings — reliable ordered control
-stream, unreliable datagrams for cursor motion. Replaces the TCP+UDP
-split. Failure modes are explicit: connect timeout, silent-drop
-detection via keepalive, clean reconnect with session resume.
+### B4. Transport — DECIDED (2026-09-22): keep TCP control + UDP cursor datagrams
+
+QUIC was evaluated and declined, with evidence:
+- The current split already provides QUIC's two framings: the TCP
+  control channel is the reliable ordered stream; the UDP cursor stream
+  is the unreliable-datagram lane. Head-of-line blocking is a non-issue
+  because the latency-sensitive traffic (cursor) never shares a lane
+  with control — that was the point of the split.
+- The last two-machine session with the current stack crossed smoothly
+  both directions; churn would risk regressions for zero measured gain.
+- QUIC adds TLS/certificate provisioning to a LAN-only, trust-by-id
+  protocol — new failure modes (cert expiry, clock skew) for nothing
+  the user asked for.
+- QUIC's userspace retransmit/timer loop costs more CPU than kernel
+  TCP/UDP sockets that sleep in the kernel — directly against the
+  idle-cost goal.
+
+Kept instead: explicit failure modes in the harnesses (connect timeout,
+keepalive, clean reconnect with pacing). Revisit only if a measured
+problem appears that TCP+UDP cannot fix.
 
 ### B5. Harnesses
 `kvmshare-server` and `kvmshare-client` become thin: own threads/tasks,

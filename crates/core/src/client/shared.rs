@@ -6,24 +6,10 @@ use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Condvar, Mutex};
 
-use kvmshare_log::log_error;
-use kvmshare_protocol::message::{KeyKind, ScreenInfo};
+use kvmshare_protocol::message::KeyKind;
 
 use crate::client::injector::{Clipboard, Injector};
 use crate::motion::{MotionProbe, PositionFollower};
-
-/// Consecutive 100 ms probe windows where the cursor was commanded to
-/// move but did not (away from a screen edge) before the client treats
-/// injected input as blocked and recovers. ~600 ms: long enough that a
-/// single hiccup never trips it, short enough that a genuinely blocked
-/// cursor recovers in about a second.
-const PIN_WINDOWS_TO_TRIP: u32 = 6;
-/// Minimum commanded motion (pixels) within one probe window for the
-/// cursor to count as "commanded to move".
-const PIN_MIN_COMMANDED_PX: i64 = 60;
-/// Maximum real travel (pixels) within one probe window for the cursor
-/// to still count as pinned (not following the command).
-const PIN_MAX_TRAVEL_PX: i64 = 6;
 
 /// State shared by the client's worker threads. Every thread touches
 /// only the fields it needs, and every critical section is short —
@@ -142,91 +128,40 @@ pub(crate) struct MotionState {
     pub(crate) frames_win: u32,
     /// Steering ticks since the last telemetry window (loop health).
     pub(crate) ticks_win: u32,
-    /// Pixels commanded since the last probe window (accumulated in
-    /// `apply_motion_frame`). Compared against the real cursor's travel
-    /// to detect a cursor the OS refuses to move.
-    pub(crate) win_cmd_px: i64,
-    /// Real cursor position when the current probe window opened.
-    pub(crate) win_real_start: (i32, i32),
-    /// Consecutive windows where the cursor was commanded to move but
-    /// did not. Enough of them, away from a screen edge, means injected
-    /// motion is being eaten by the OS — the recovery path releases
-    /// local input and restarts the session (see the probe block).
-    pub(crate) pin_windows: u32,
 }
 
-/// Commands issued during a probe window: how much motion was commanded
-/// (compared with real travel) and how many windows the cursor has been
-/// pinned for. Returned by [`MotionState::probe_window`] for the caller
-/// to act on (release + restart) after the locks are dropped.
+/// One telemetry window's summary. Returned by
+/// [`MotionState::probe_window`] for the caller to log after the locks
+/// are dropped.
 pub(crate) struct ProbeReport {
     /// Trace line describing the window, if the probe sample is due.
     pub(crate) trace: Option<String>,
-    /// True when injected motion is being eaten by the OS: the cursor
-    /// was commanded well away from any screen edge yet did not travel.
-    pub(crate) pinned: bool,
 }
 
 impl MotionState {
-    /// Collect one telemetry window and decide whether the cursor is
-    /// pinned (commanded to move but not moving, away from any edge).
-    /// Pure computation on this state plus the real position: the caller
-    /// holds the locks and releases them before logging, so a slow log
-    /// sink can never hold up the next placement.
+    /// Collect one telemetry window: requested-vs-real cursor motion,
+    /// frames and ticks. Pure computation on this state plus the real
+    /// position; the caller holds the locks and releases them before
+    /// logging, so a slow log sink can never hold up the next placement.
     ///
-    /// `screen` is queried lazily — only when the pin threshold is
-    /// reached — because on Windows it is a user32 call that can stall
-    /// on a busy desktop. It must never run on every tick of the cursor
-    /// hot path.
-    pub(crate) fn probe_window(
-        &mut self,
-        rx: i32,
-        ry: i32,
-        screen: impl FnOnce() -> ScreenInfo,
-    ) -> ProbeReport {
+    /// Deliberately *diagnostic only*: it decides nothing. A wedged
+    /// input path is recovered by the supervisor (which watches the
+    /// motion thread's heartbeat) — heuristics that guess "the cursor
+    /// looks stuck" from telemetry false-trip on transient OS stalls
+    /// and restart healthy sessions, so they do not belong here.
+    pub(crate) fn probe_window(&mut self, rx: i32, ry: i32) -> ProbeReport {
         let mut trace = None;
-        let mut pinned = false;
         if self.probe.due() {
             let (ex, ey) = self.follower.error((rx, ry));
             let (frames, ticks) = (self.frames_win, self.ticks_win);
             self.frames_win = 0;
             self.ticks_win = 0;
-            // Cursor-pin detection: this window commanded real motion
-            // (`win_cmd_px`, accumulated as UDP frames arrived) yet the
-            // real cursor did not travel. That means the OS is silently
-            // eating injected motion — the supervisor cannot see it (the
-            // motion thread is healthy; the cursor just never moves). A
-            // few such windows away from a screen edge is the signature
-            // of blocked input.
-            let travel = ((rx - self.win_real_start.0).abs()
-                + (ry - self.win_real_start.1).abs()) as i64;
-            let is_pinned = self.win_cmd_px > PIN_MIN_COMMANDED_PX && travel < PIN_MAX_TRAVEL_PX;
-            self.pin_windows = if is_pinned { self.pin_windows + 1 } else { 0 };
-            let pin_age_ms = self.pin_windows as u64 * 100;
-            self.win_cmd_px = 0;
-            self.win_real_start = (rx, ry);
-            if self.pin_windows >= PIN_WINDOWS_TO_TRIP {
-                // A cursor legitimately parked at a screen edge is a
-                // wall push (the clamp holds the command), not a
-                // block — only trip away from the edges.
-                let screen = screen();
-                let at_edge = rx <= 1
-                    || ry <= 1
-                    || rx as i64 >= screen.width as i64 - 2
-                    || ry as i64 >= screen.height as i64 - 2;
-                if !at_edge {
-                    log_error!(
-                        "cursor pinned ~{pin_age_ms} ms while {frames} frames/tick commanded motion — injected input is being eaten; releasing local input and restarting the session"
-                    );
-                    pinned = true;
-                }
-            }
             self.probe.sample((rx, ry), &mut |rx, ry, ax, ay, _exp_x, _exp_y, gx, gy| {
                 trace = Some(format!(
                     "motion req=({rx},{ry}) act=({ax},{ay}) err=({ex},{ey}) real=({gx},{gy}) frames={frames} ticks={ticks}"
                 ));
             });
         }
-        ProbeReport { trace, pinned }
+        ProbeReport { trace }
     }
 }

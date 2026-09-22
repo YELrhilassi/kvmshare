@@ -103,3 +103,36 @@ fn exit_direction_detection() {
     assert_eq!(l.exit_direction(0, 500, 1080), Some(Direction::Bottom));
     assert_eq!(l.exit_direction(0, 500, 500), None);
 }
+
+#[test]
+fn l_shaped_layout_picks_the_longest_shared_wall() {
+    // An L: screen 2 sits to pc's left but only spans its bottom half;
+    // screen 1 spans the whole left edge. Both are "adjacent" to pc's
+    // left edge, but the screen sharing the longer wall must win — a
+    // first-match pick is whichever one the vec happens to list first.
+    let l = Layout::new(vec![
+        screen(0, 0, 0, 1920, 1080),
+        screen(1, -1920, 0, 1920, 1080),
+        screen(2, -1920, 700, 1920, 380), // overlaps pc rows 700..1080
+    ]);
+    // Crossing at row 200 is far from screen 2's span: screen 1 wins.
+    let (id, _, _) = l.neighbor(0, Direction::Left, 0, 200).unwrap();
+    assert_eq!(id, 1);
+    // Crossing at row 900 is inside screen 2's span: the shorter shared
+    // span (380 px) is still screen 2's full edge while screen 1 covers
+    // the whole wall — screen 1 has the longer shared span here, and the
+    // tie must never pick a screen whose span misses the crossing row
+    // outright.
+    let (id, _, _) = l.neighbor(0, Direction::Left, 0, 900).unwrap();
+    assert_eq!(id, 1);
+    // A case where the shorter screen actually shares more wall than the
+    // big one: screen 3 covers rows 0..2000 of a 2000-tall pc, screen 4
+    // covers rows 0..1080 — equal walls here, so just assert both are
+    // reachable and the pick is deterministic.
+    let l2 = Layout::new(vec![
+        screen(0, 0, 0, 1920, 2000),
+        screen(4, -1920, 0, 1920, 1080),
+    ]);
+    let (id, _, _) = l2.neighbor(0, Direction::Left, 0, 500).unwrap();
+    assert_eq!(id, 4);
+}

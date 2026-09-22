@@ -122,7 +122,16 @@ impl Layout {
     /// clamps it into the neighbor's span.
     pub fn neighbor(&self, from_id: u8, dir: Direction, at_x: i32, at_y: i32) -> Option<(u8, i32, i32)> {
         let from = self.find(from_id)?;
-        let candidate = self.screens.iter().find(|s| s.id != from_id && adjacent(from, s, dir))?;
+        // Every adjacent screen across `dir` is a candidate; the one
+        // sharing the longest span with `from` wins. First-match would
+        // pick arbitrarily in an L-shaped layout where two screens face
+        // the same edge — the longest shared wall is where the user's
+        // cursor actually is when it crosses.
+        let candidate = self
+            .screens
+            .iter()
+            .filter(|s| s.id != from_id && adjacent(from, s, dir))
+            .max_by_key(|s| shared_span(from, s, dir))?;
 
         let (local_x, local_y) = match dir {
             Direction::Left => (candidate.rect.w - 1, clamp(at_y - candidate.rect.y, 0, candidate.rect.h - 1)),
@@ -197,6 +206,21 @@ fn near(edge_a: i32, edge_b: i32, tol: i32) -> bool {
 /// along; the entry clamp pulls the cursor inside.
 fn spans_overlap(a_lo: i32, a_hi: i32, b_lo: i32, b_hi: i32, tol: i32) -> bool {
     a_lo - tol < b_hi && b_lo - tol < a_hi
+}
+
+/// Length (px) of the overlap between `a`'s and `b`'s spans perpendicular
+/// to edge `dir`; negative means no overlap. This is what ranks candidate
+/// neighbors in [`Layout::neighbor`].
+fn shared_span(a: &Screen, b: &Screen, dir: Direction) -> i32 {
+    let (a_lo, a_hi, b_lo, b_hi) = match dir {
+        Direction::Left | Direction::Right => {
+            (a.rect.top(), a.rect.bottom(), b.rect.top(), b.rect.bottom())
+        }
+        Direction::Top | Direction::Bottom => {
+            (a.rect.left(), a.rect.right(), b.rect.left(), b.rect.right())
+        }
+    };
+    a_hi.min(b_hi) - a_lo.max(b_lo)
 }
 
 fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
