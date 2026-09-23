@@ -160,7 +160,7 @@ func main() {
 		MinWidth:         880,
 		MinHeight:        560,
 		URL:              "/",
-		Linux:            application.LinuxWindow{Icon: windowIcon},
+		Linux:            application.LinuxWindow{Icon: windowIcon, WebviewGpuPolicy: application.WebviewGpuPolicyAlways},
 		BackgroundColour: application.NewRGBA(10, 10, 12, 255),
 	}
 	// Start quietly only when this launch came from the login session

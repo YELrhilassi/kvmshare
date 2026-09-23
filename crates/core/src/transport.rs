@@ -305,8 +305,8 @@ mod tests {
                 RecvResult::NoData => continue,
                 RecvResult::Msg(_) => panic("unexpected message"),
             }
-            assert!(started.elapsed() < DEAD_PEER_TIMEOUT * 2, "detection took too long");
         }
+        assert!(started.elapsed() < DEAD_PEER_TIMEOUT * 2, "detection took too long");
     }
 
     fn panic(msg: &str) -> ! {

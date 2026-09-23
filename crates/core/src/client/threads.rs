@@ -25,8 +25,10 @@ use crate::udp;
 const CURSOR_BEACON_INTERVAL: Duration = Duration::from_millis(8);
 /// UDP socket read timeout: the cursor stream thread blocks on `recv`
 /// and wakes at this cadence when idle (to notice shutdown). Frames
-/// themselves wake it immediately — this is not a poll.
-pub(crate) const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(8);
+/// themselves wake it immediately — this is not a poll, and the value
+/// only bounds how long a stop is noticed, never cursor latency. 25 ms
+/// keeps idle wakes at 40/s instead of 125/s.
+pub(crate) const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(25);
 /// How often the sync thread re-checks the display geometry (rare
 /// event; the poll exists so a resolution change is noticed without
 /// restarting). Kept long so this thread rarely touches the injector
