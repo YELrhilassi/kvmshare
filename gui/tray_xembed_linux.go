@@ -685,19 +685,39 @@ func kvmTrayState() *C.char {
 }
 
 //export kvmTrayOpen
-func kvmTrayOpen() { if xembedAct.open != nil { xembedAct.open() } }
+func kvmTrayOpen() {
+	if xembedAct.open != nil {
+		xembedAct.open()
+	}
+}
 
 //export kvmTrayStart
-func kvmTrayStart() { if xembedAct.start != nil { xembedAct.start() } }
+func kvmTrayStart() {
+	if xembedAct.start != nil {
+		xembedAct.start()
+	}
+}
 
 //export kvmTrayStop
-func kvmTrayStop() { if xembedAct.stop != nil { xembedAct.stop() } }
+func kvmTrayStop() {
+	if xembedAct.stop != nil {
+		xembedAct.stop()
+	}
+}
 
 //export kvmTrayRestart
-func kvmTrayRestart() { if xembedAct.restart != nil { xembedAct.restart() } }
+func kvmTrayRestart() {
+	if xembedAct.restart != nil {
+		xembedAct.restart()
+	}
+}
 
 //export kvmTrayQuit
-func kvmTrayQuit() { if xembedAct.quit != nil { xembedAct.quit() } }
+func kvmTrayQuit() {
+	if xembedAct.quit != nil {
+		xembedAct.quit()
+	}
+}
 
 // trayPixels is a decoded icon as raw RGBA.
 type trayPixels struct {

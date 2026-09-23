@@ -223,4 +223,3 @@ func waitStarted(cmd *exec.Cmd, d time.Duration) bool {
 		return true
 	}
 }
-

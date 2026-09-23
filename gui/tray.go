@@ -18,8 +18,8 @@
 package main
 
 import (
-	_ "embed"
 	"context"
+	_ "embed"
 	"fmt"
 	"log/slog"
 	"runtime"
@@ -39,9 +39,9 @@ var trayIcon []byte
 type trayBackend int
 
 const (
-	trayNone  trayBackend = iota // no tray host on this desktop
-	traySNI                      // org.kde.StatusNotifierItem (Wails)
-	trayXEmbed                   // legacy XEmbed via raw Xlib (X11 only)
+	trayNone   trayBackend = iota // no tray host on this desktop
+	traySNI                       // org.kde.StatusNotifierItem (Wails)
+	trayXEmbed                    // legacy XEmbed via raw Xlib (X11 only)
 )
 
 var (
@@ -117,7 +117,7 @@ const trayProbeTimeout = 500 * time.Millisecond
 
 // trayState is the live role status both tray backends render.
 type trayState struct {
-	role    Mode   // ModeServer | ModeClient
+	role    Mode // ModeServer | ModeClient
 	running bool
 	detail  string // "" | " · N clients" for a running server
 }

@@ -23,9 +23,9 @@ func TestNewer(t *testing.T) {
 		{"v0.1.0", "v0.0.9", true},
 		{"v0.1.0", "v0.1.0-rc1", true}, // a plain release beats its prerelease
 		{"v0.1.0-rc1", "v0.1.0", false},
-		{"v0.2.0-rc1", "v0.1.0", true}, // a newer prerelease is still newer
+		{"v0.2.0-rc1", "v0.1.0", true},      // a newer prerelease is still newer
 		{"v0.1.0-rc2", "v0.1.0-rc1", false}, // same-version prereleases do not auto-upgrade
-		{"v0.4.0", "v0.0.0-dev", true}, // the Makefile's dev label sees releases
+		{"v0.4.0", "v0.0.0-dev", true},      // the Makefile's dev label sees releases
 	}
 	for _, c := range cases {
 		if got := Newer(c.a, c.b); got != c.want {

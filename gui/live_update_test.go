@@ -61,10 +61,10 @@ func TestLiveInstallPipeline(t *testing.T) {
 		t.Fatalf("cannot resolve the installed GUI at %s: %v", guiPath, err)
 	}
 	replacements := map[string]string{
-		guiPath:         extracted["kvmshare-gui"],
-		a.serverPath:    extracted["kvmshare-server"],
-		a.clientPath:    extracted["kvmshare-client"],
-		a.installPath:   extracted["kvmshare-install"],
+		guiPath:       extracted["kvmshare-gui"],
+		a.serverPath:  extracted["kvmshare-server"],
+		a.clientPath:  extracted["kvmshare-client"],
+		a.installPath: extracted["kvmshare-install"],
 	}
 	if err := selfupdate.ReplaceSet(replacements); err != nil {
 		t.Fatalf("replace: %v", err)
