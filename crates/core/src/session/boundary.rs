@@ -19,8 +19,10 @@
 //! 2. **Fire** — an outward push (raw deltas toward that edge) while
 //!    armed. At the wall, outward deltas are unambiguous intent.
 //!
-//! This module owns that state machine's vocabulary — the band width,
-//! the freshness windows, the direction bits and the push latches.
+//! Both sides of the session — the server's own screen and each remote
+//! screen — run the *same* machine, [`BoundarySide`]. The session owns
+//! two instances and a per-side "what happens on a confirmed crossing"
+//! callback; nothing about the logic is written twice.
 
 use std::time::{Duration, Instant};
 
@@ -91,12 +93,11 @@ pub const REMOTE_BEACON_FRESH: Duration = Duration::from_millis(120);
 
 // Direction bits for the "which walls is the real cursor on" mask. A
 // corner can set two bits at once; the push direction picks which one
-// fires. `pub(super)` so the session's tests can assert `wall_bits`
-// output directly.
-pub(super) const BIT_LEFT: u8 = 1 << 0;
-pub(super) const BIT_RIGHT: u8 = 1 << 1;
-pub(super) const BIT_TOP: u8 = 1 << 2;
-pub(super) const BIT_BOTTOM: u8 = 1 << 3;
+// fires.
+const BIT_LEFT: u8 = 1 << 0;
+const BIT_RIGHT: u8 = 1 << 1;
+const BIT_TOP: u8 = 1 << 2;
+const BIT_BOTTOM: u8 = 1 << 3;
 
 /// The bit for `dir` in the wall mask.
 pub fn bit(dir: Direction) -> u8 {
@@ -158,6 +159,105 @@ pub(super) fn wall_bits(rect: &Rect, x: i32, y: i32) -> u8 {
     bits
 }
 
+/// One side of the session's boundary state: everything the arm/push/
+/// fire machine needs for **one screen** the cursor can be on. The
+/// session keeps two instances — [`Session::local_side`] for the
+/// server's own screen and [`Session::remote_side`] for the client
+/// screen the cursor is on — and feeds them through the same handlers,
+/// so the crossing logic exists exactly once.
+///
+/// The fields are an implementation unit; nothing outside `session`
+/// reads them.
+#[derive(Default)]
+pub(super) struct BoundarySide {
+    /// Walls the *real* cursor currently sits on (a beacon armed them).
+    pub(super) at_wall: u8,
+    /// The most recent outward push through each edge (used to give a
+    /// park beacon the "is the user mid-sweep?" answer).
+    pub(super) last_out: Option<Push>,
+    /// A stalled-stream fallback in progress.
+    pub(super) pushing: Option<Pushing>,
+    /// When the last real-position beacon arrived (`None` = none yet).
+    /// Only meaningful on the remote side (locally the capture streams
+    /// beacons continuously); the machine consults it for freshness.
+    pub(super) beacon_at: Option<Instant>,
+}
+
+impl BoundarySide {
+    /// Reset every latch: the cursor has just arrived somewhere new (or
+    /// the layout changed), and any arm from before is meaningless.
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A beacon reported the real cursor at local `(x, y)` inside
+    /// `rect`. Re-arms the wall bits; returns the directions whose wall
+    /// was **newly** armed while the user was mid-push (the park-fire
+    /// candidates, freshest-intent first logic lives with the caller).
+    pub(super) fn on_beacon(&mut self, rect: &Rect, x: i32, y: i32) -> u8 {
+        self.beacon_at = Some(Instant::now());
+        let bits = wall_bits(rect, x, y);
+        let newly = bits & !self.at_wall;
+        self.at_wall = bits;
+        if bits == 0 {
+            // The real cursor is back inside: any wall-arm or push
+            // attempt was a transient overshoot, and it is over.
+            self.pushing = None;
+        }
+        newly
+    }
+
+    /// Is the wall for `dir` armed right now?
+    pub(super) fn armed(&self, dir: Direction) -> bool {
+        self.at_wall & bit(dir) != 0
+    }
+
+    /// Is there a *fresh* outward push through `dir` (the user was
+    /// mid-sweep within [`EDGE_PUSH_FRESH`])?
+    pub(super) fn push_fresh(&self, dir: Direction) -> bool {
+        self.last_out.is_some_and(|p| p.dir == dir && p.at.elapsed() < EDGE_PUSH_FRESH)
+    }
+
+    /// Record one delta's push/disarm effect on the wall-arm state.
+    /// Returns `true` when the delta is an outward push through an
+    /// **armed** wall — the immediate-fire case.
+    pub(super) fn on_delta(&mut self, dir: Direction, dx: i32, dy: i32) -> bool {
+        if pushes_outward(dir, dx, dy) {
+            self.last_out = Some(Push { dir, at: Instant::now() });
+            self.armed(dir)
+        } else if pulls_inward(dir, dx, dy) {
+            // Leaving the edge: the next push must re-arm from a beacon.
+            // This is what makes the seam placement on entry never
+            // bounce.
+            self.at_wall &= !bit(dir);
+            false
+        } else {
+            false
+        }
+    }
+
+    /// Advance the stalled-stream fallback for `dir` (the virtual
+    /// cursor is outside the rect and raw deltas keep pushing). Returns
+    /// `true` exactly when the sustained push has lasted
+    /// [`EDGE_PUSH_FALLBACK`] — the fire signal.
+    pub(super) fn tick_fallback(&mut self, dir: Direction, fresh_beacon: bool) -> bool {
+        let sustained = !fresh_beacon
+            && self.pushing.is_some_and(|p| p.dir == dir && p.since.elapsed() >= EDGE_PUSH_FALLBACK);
+        if !sustained {
+            self.pushing = match self.pushing {
+                Some(p) if p.dir == dir => self.pushing,
+                _ => Some(Pushing { dir, since: Instant::now() }),
+            };
+        }
+        sustained
+    }
+
+    /// The fallback latch is over (a fire or an inward move ended it).
+    pub(super) fn stop_fallback(&mut self) {
+        self.pushing = None;
+    }
+}
+
 /// One outward push: which edge it pushed through and when. Used to give
 /// a beacon that parks the cursor on a wall the "is the user mid-sweep?"
 /// answer ([`EDGE_PUSH_FRESH`]).
@@ -174,3 +274,7 @@ pub struct Pushing {
     pub dir: Direction,
     pub since: Instant,
 }
+
+#[cfg(test)]
+#[path = "boundary_tests.rs"]
+mod tests;

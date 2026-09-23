@@ -125,6 +125,7 @@ impl Harness {
 fn start_server() -> Harness {
     let session = Session::new(two_screen_layout(), 0);
     let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let _ = &control_tx; // harness may not drive controls
     // The e2e harness keeps the legacy open behavior (allowlist off) so
     // every pre-existing scenario works unchanged; the allowlist itself
     // is exercised by its own dedicated test.
@@ -139,6 +140,7 @@ fn start_server() -> Harness {
     let port = server.local_addr().unwrap().port();
 
     let (input_tx, input_rx) = mpsc::channel::<Message>();
+    let _ = &input_tx; // harness may not drive local input
     let engine_calls = Arc::new(Mutex::new(Vec::new()));
     let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: engine_calls.clone() }) as Box<dyn Engine>));
 
@@ -460,6 +462,7 @@ fn unknown_client_is_admitted_dynamically() {
 fn allowlist_refuses_unknown_and_admits_trusted() {
     let session = Session::new(two_screen_layout(), 0);
     let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let _ = &control_tx; // harness may not drive controls
     let policy = Policy {
         allowlist: true,
         local_only: false, // localhost must pass the network check
@@ -475,6 +478,7 @@ fn allowlist_refuses_unknown_and_admits_trusted() {
     );
     let port = server.local_addr().unwrap().port();
     let (input_tx, input_rx) = mpsc::channel::<Message>();
+    let _ = &input_tx; // harness may not drive local input
     let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
     let clipboard: kvmshare_core::server::ServerClipboard =
         Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));
@@ -523,6 +527,7 @@ fn allowlist_refuses_unknown_and_admits_trusted() {
 fn allowlist_admits_by_short_id_prefix() {
     let session = Session::new(two_screen_layout(), 0);
     let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let _ = &control_tx; // harness may not drive controls
     let full = "70b97d38631dda4b8f6ef627d753022d";
     let policy = Policy {
         allowlist: true,
@@ -539,6 +544,7 @@ fn allowlist_admits_by_short_id_prefix() {
     );
     let port = server.local_addr().unwrap().port();
     let (input_tx, input_rx) = mpsc::channel::<Message>();
+    let _ = &input_tx; // harness may not drive local input
     let engine = Arc::new(Mutex::new(Box::new(MockEngine { calls: Arc::new(Mutex::new(Vec::new())) }) as Box<dyn Engine>));
     let clipboard: kvmshare_core::server::ServerClipboard =
         Arc::new(Mutex::new(Box::new(NoClipboard) as Box<dyn Clipboard>));

@@ -586,6 +586,15 @@ impl InputCapture {
                 (Some(true), Some(true)) => true,
                 (p, k) => {
                     log_warn!("input grab not acquired (pointer: {p:?}, keyboard: {k:?})");
+                    // A partial grab (one device succeeded) must be
+                    // undone: leaving one device grabbed while `grabbed`
+                    // reports false would silently pin that device —
+                    // input the user cannot recover — until a later
+                    // release happens to run. Release both here; a
+                    // release without a grab is a harmless no-op.
+                    let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
+                    let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+                    let _ = self.conn.flush();
                     false
                 }
             }

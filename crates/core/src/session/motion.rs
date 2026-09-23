@@ -123,13 +123,10 @@ impl Session {
         // The beacon is the truth about where the visible cursor is.
         self.cursor.x = self.local.x + x;
         self.cursor.y = self.local.y + y;
-        let bits = wall_bits(&self.local, x, y);
-        let newly = bits & !self.at_wall;
-        self.at_wall = bits;
-        if bits == 0 {
+        let newly = self.local_side.on_beacon(&self.local, x, y);
+        if self.local_side.at_wall == 0 {
             // The real cursor is back inside: any wall-arm or push
             // attempt was a transient overshoot, and it is over.
-            self.pushing = None;
             return vec![];
         }
         // A beacon that parks the cursor on a wall the user is pushing
@@ -138,11 +135,7 @@ impl Session {
         // exactly at the wall still crosses. A beacon alone (resting at
         // the edge) only arms: the next outward push fires.
         for dir in DIRS {
-            if newly & bit(dir) != 0
-                && self
-                    .last_out
-                    .is_some_and(|p| p.dir == dir && p.at.elapsed() < EDGE_PUSH_FRESH)
-            {
+            if newly & bit(dir) != 0 && self.local_side.push_fresh(dir) {
                 let actions = self.switch_out(dir);
                 if !actions.is_empty() {
                     return actions;
@@ -156,8 +149,6 @@ impl Session {
 
     /// Cursor is on the local screen and moving.
     fn handle_local_motion(&mut self, dx: i32, dy: i32) -> Vec<Action> {
-        let now = Instant::now();
-
         // Beacon-confirmed crossings. A delta pushing outward through a
         // wall the *real* cursor sits on (a beacon armed it) IS the
         // crossing intent — fire immediately: the OS has already pinned
@@ -166,43 +157,35 @@ impl Session {
         // leaving the edge, and the next push must re-arm from a beacon
         // (this is what makes the seam placement on entry never bounce).
         for dir in DIRS {
-            if pushes_outward(dir, dx, dy) {
-                self.last_out = Some(Push { dir, at: now });
-                if self.at_wall & bit(dir) != 0 {
-                    let actions = self.switch_out(dir);
-                    if !actions.is_empty() {
-                        return actions;
-                    }
-                    // Dead edge: stop trying to cross here.
-                    self.at_wall &= !bit(dir);
+            if self.local_side.on_delta(dir, dx, dy) {
+                let actions = self.switch_out(dir);
+                if !actions.is_empty() {
+                    return actions;
                 }
-            } else if pulls_inward(dir, dx, dy) {
-                self.at_wall &= !bit(dir);
+                // Dead edge: stop trying to cross here.
+                self.local_side.at_wall &= !bit(dir);
             }
         }
 
         // Fallback for a stalled beacon stream (see the module docs). The
         // virtual cursor must have actually crossed the rect — raw deltas
         // ran past the edge — so an interior real cursor can never trip
-        // it, and the outward pushing must be sustained.
+        // it, and the outward pushing must be sustained. Locally the
+        // beacon stream never goes stale-stalled (the capture emits
+        // continuously), but the machine stays uniform.
         let dir = match self.layout.exit_direction(0, self.cursor.x, self.cursor.y) {
             Some(d) => d,
             None => {
-                self.pushing = None;
+                self.local_side.stop_fallback();
                 return vec![];
             }
         };
         let local = self.local;
         self.clamp_to(&local);
-        let sustained = self.pushing.is_some_and(|p| p.dir == dir && p.since.elapsed() >= EDGE_PUSH_FALLBACK);
-        if !sustained {
-            self.pushing = match self.pushing {
-                Some(p) if p.dir == dir => self.pushing,
-                _ => Some(Pushing { dir, since: now }),
-            };
+        if !self.local_side.tick_fallback(dir, false) {
             return vec![];
         }
-        self.pushing = None;
+        self.local_side.stop_fallback();
         self.switch_out(dir)
     }
 
@@ -253,7 +236,6 @@ impl Session {
     /// deltas no longer equal real travel. The hidden local cursor never
     /// moves while we are away.
     fn handle_remote_motion(&mut self, id: u8, dx: i32, dy: i32) -> Vec<Action> {
-        let now = Instant::now();
         let rect = match self.layout.find(id) {
             Some(s) => s.rect,
             None => return vec![], // layout changed under us
@@ -261,22 +243,26 @@ impl Session {
 
         // Beacon-confirmed crossings, mirroring the local side. An
         // outward push through a wall the client's *real* cursor sits on
-        // (a fresh beacon armed it) crosses back — immediately.
+        // (a fresh beacon armed it) crosses back — immediately. Unlike
+        // the local side, a stale beacon stream must not fire: on a
+        // remote screen the raw deltas are pre-acceleration and can run
+        // far ahead of reality.
         let fresh = self
-            .remote_beacon_at
-            .is_some_and(|t| now.duration_since(t) < REMOTE_BEACON_FRESH);
+            .remote_side
+            .beacon_at
+            .is_some_and(|t| t.elapsed() < REMOTE_BEACON_FRESH);
         for dir in DIRS {
             if pushes_outward(dir, dx, dy) {
-                self.remote_last_out = Some(Push { dir, at: now });
-                if fresh && self.remote_at_wall & bit(dir) != 0 {
+                self.remote_side.last_out = Some(Push { dir, at: Instant::now() });
+                if fresh && self.remote_side.armed(dir) {
                     if self.layout.neighbor(id, dir, self.cursor.x, self.cursor.y).is_some() {
                         return self.cross_from_remote(id, dir);
                     }
                     // Dead edge (outer wall of the desktop): stop trying.
-                    self.remote_at_wall &= !bit(dir);
+                    self.remote_side.at_wall &= !bit(dir);
                 }
             } else if pulls_inward(dir, dx, dy) {
-                self.remote_at_wall &= !bit(dir);
+                self.remote_side.at_wall &= !bit(dir);
             }
         }
 
@@ -292,23 +278,15 @@ impl Session {
         let dir = match self.layout.exit_direction(id, self.cursor.x, self.cursor.y) {
             Some(d) => d,
             None => {
-                self.remote_pushing = None;
+                self.remote_side.stop_fallback();
                 return actions;
             }
         };
         self.clamp_to(&rect);
-        let sustained = !fresh
-            && self
-                .remote_pushing
-                .is_some_and(|p| p.dir == dir && p.since.elapsed() >= EDGE_PUSH_FALLBACK);
-        if !sustained {
-            self.remote_pushing = match self.remote_pushing {
-                Some(p) if p.dir == dir => self.remote_pushing,
-                _ => Some(Pushing { dir, since: now }),
-            };
+        if !self.remote_side.tick_fallback(dir, fresh) {
             return actions;
         }
-        self.remote_pushing = None;
+        self.remote_side.stop_fallback();
         match self.cross_from_remote(id, dir) {
             actions if actions.is_empty() => {
                 // Dead edge after all (layout changed): keep the motion.
@@ -336,8 +314,6 @@ impl Session {
             return vec![];
         }
         let Some(screen) = self.layout.find(id) else { return vec![] };
-        let now = Instant::now();
-        self.remote_beacon_at = Some(now);
         // Clamp the report into the rect: the OS pins the cursor at the
         // last pixel, but a report in flight can be a hair past it. The
         // `.max(0)` keeps a degenerate zero-size rect from panicking.
@@ -348,24 +324,17 @@ impl Session {
         // deltas that acceleration ran far ahead of.
         self.cursor.x = screen.rect.x + x;
         self.cursor.y = screen.rect.y + y;
-        let bits = wall_bits(&screen.rect, x, y);
-        let newly = bits & !self.remote_at_wall;
-        self.remote_at_wall = bits;
-        if bits == 0 {
+        let newly = self.remote_side.on_beacon(&screen.rect, x, y);
+        if self.remote_side.at_wall == 0 {
             // The client's real cursor is back inside its screen: any
             // edge-push attempt was a transient overshoot.
-            self.remote_pushing = None;
             return vec![];
         }
         // A beacon parking the real cursor on a wall mid-push crosses on
         // the park itself — mirror [`Session::on_local_beacon`]. The
         // caller (the client's connection thread) executes the actions.
         for dir in DIRS {
-            if newly & bit(dir) != 0
-                && self
-                    .remote_last_out
-                    .is_some_and(|p| p.dir == dir && p.at.elapsed() < EDGE_PUSH_FRESH)
-            {
+            if newly & bit(dir) != 0 && self.remote_side.push_fresh(dir) {
                 let actions = self.cross_from_remote(id, dir);
                 if !actions.is_empty() {
                     return actions;
@@ -413,13 +382,8 @@ impl Session {
     /// forced returns home). `pub(super)` because the session root calls
     /// it from `swap_layout`.
     pub(super) fn clear_boundary_state(&mut self) {
-        self.at_wall = 0;
-        self.last_out = None;
-        self.pushing = None;
-        self.remote_at_wall = 0;
-        self.remote_beacon_at = None;
-        self.remote_last_out = None;
-        self.remote_pushing = None;
+        self.local_side.clear();
+        self.remote_side.clear();
     }
 
     /// Clamp the virtual cursor inside `rect` (in virtual coords).

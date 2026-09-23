@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use super::*;
-use super::boundary::{wall_bits, BIT_LEFT, BIT_RIGHT, BIT_TOP};
+use crate::layout::Direction;
+use super::boundary::{bit, wall_bits, EDGE_PUSH_FALLBACK, EDGE_PUSH_FRESH, REMOTE_BEACON_FRESH};
 use kvmshare_protocol::message::{KeyKind, Rect, Screen};
 
 fn two_screens() -> Session {
@@ -676,12 +677,12 @@ fn swap_layout_rejects_missing_local_screen() {
 #[test]
 fn wall_bits_marks_the_outer_band_only() {
     let rect = Rect { x: 0, y: 0, w: 1920, h: 1080 };
-    assert_eq!(wall_bits(&rect, 0, 540), BIT_LEFT);
-    assert_eq!(wall_bits(&rect, 1, 540), BIT_LEFT); // band slack
+    assert_eq!(wall_bits(&rect, 0, 540), bit(Direction::Left));
+    assert_eq!(wall_bits(&rect, 1, 540), bit(Direction::Left)); // band slack
     assert_eq!(wall_bits(&rect, 2, 540), 0);
-    assert_eq!(wall_bits(&rect, 1918, 540), BIT_RIGHT);
-    assert_eq!(wall_bits(&rect, 1919, 540), BIT_RIGHT);
-    assert_eq!(wall_bits(&rect, 1919, 0), BIT_RIGHT | BIT_TOP); // corner
+    assert_eq!(wall_bits(&rect, 1918, 540), bit(Direction::Right));
+    assert_eq!(wall_bits(&rect, 1919, 540), bit(Direction::Right));
+    assert_eq!(wall_bits(&rect, 1919, 0), bit(Direction::Right) | bit(Direction::Top)); // corner
     assert_eq!(wall_bits(&rect, 960, 540), 0);
 }
 

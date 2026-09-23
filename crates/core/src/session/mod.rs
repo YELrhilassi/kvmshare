@@ -78,26 +78,13 @@ pub struct Session {
     /// The local screen's rectangle in virtual coordinates.
     local: Rect,
 
-    // Local-mode boundary state.
-    //
-    // `at_wall` mirrors what the *real* (beacon-reported) cursor is doing
-    // on the local screen. A crossing fires when outward motion follows a
-    // beacon that put the cursor on a wall — never on motion alone and
-    // never on a beacon alone.
-    at_wall: u8,
-    /// The most recent outward push through each shared edge (used to
-    /// fire on a park beacon mid-sweep).
-    last_out: Option<boundary::Push>,
-    /// A stalled-stream fallback in progress on the local screen.
-    pushing: Option<boundary::Pushing>,
-
-    // Remote-mode boundary state (mirrors the local side, fed by the
-    // active client's real-cursor beacons).
-    remote_at_wall: u8,
-    /// When the last remote beacon arrived (`None` = none yet).
-    remote_beacon_at: Option<std::time::Instant>,
-    remote_last_out: Option<boundary::Push>,
-    remote_pushing: Option<boundary::Pushing>,
+    /// Boundary state for the server's own screen (fed by the local
+    /// capture's beacons) — see `boundary::BoundarySide`.
+    local_side: boundary::BoundarySide,
+    /// Boundary state for the client screen the cursor is on (fed by
+    /// that client's real-cursor beacons). Same machine, second
+    /// instance: the crossing logic exists exactly once.
+    remote_side: boundary::BoundarySide,
 
     /// The server's measured pointer gain (pixels of real cursor travel
     /// per raw device count), applied to forwarded remote motion so the
@@ -137,13 +124,8 @@ impl Session {
             cursor: Cursor { x: cx, y: cy, mode: Mode::Local },
             layout,
             local,
-            at_wall: 0,
-            last_out: None,
-            pushing: None,
-            remote_at_wall: 0,
-            remote_beacon_at: None,
-            remote_last_out: None,
-            remote_pushing: None,
+            local_side: boundary::BoundarySide::default(),
+            remote_side: boundary::BoundarySide::default(),
             gain: 1.0,
             gain_rem: (0.0, 0.0),
             dynamic: Vec::new(),
