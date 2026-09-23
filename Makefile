@@ -201,14 +201,15 @@ publish: release
 ## time. The generated .syso files are committed, so normal builds don't
 ## need this. Both must be bumped on every release — the installer's
 ## resource is what Explorer's Properties dialog and Add/Remove show.
-winres: VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$tag" ]; then echo "$$tag"; else echo v0.0.0-dev; fi)
+winres: VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$tag" ]; then echo "$$tag"; else echo v0.8.7; fi)
 # The rewrites key on the JSON field names, not the value shape: a
 # dev run writes 0.0.0-dev, which a value-shaped numeric pattern could
 # never match again — the files would stay poisoned until hand-edited.
 winres:
 	@v=$$(echo $(VERSION) | sed 's/^v//'); \
+	num=$$(echo "$$v" | sed 's/[^0-9.].*$$//; s/\.$$//'); \
 	for f in gui/winres/winres.json gui/installer/winres.json gui/cmd/kvmshare-install/winres.json; do \
-		sed -i "s/\(\"FileVersion\": *\"\)[^,]*/\1$$v\"/g; s/\(\"ProductVersion\": *\"\)[^,]*/\1$$v\"/g; s/\(\"file_version\": *\"\)[^,]*/\1$$v.0\"/g; s/\(\"product_version\": *\"\)[^,]*/\1$$v.0\"/g; s/\(\"version\": *\"\)[^,]*/\1$$v.0\"/g" $$f; \
+		sed -i "s/\(\"FileVersion\": *\"\)[^,]*/\1$$v\"/g; s/\(\"ProductVersion\": *\"\)[^,]*/\1$$v\"/g; s/\(\"file_version\": *\"\)[^,]*/\1$$num\"/g; s/\(\"product_version\": *\"\)[^,]*/\1$$num\"/g; s/\(\"version\": *\"\)[^,]*/\1$$num\"/g" $$f; \
 	done
 	cd gui && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres/winres.json --arch amd64
 	cd gui/installer && go run github.com/tc-hib/go-winres@v0.3.1 make --in winres.json --arch amd64
