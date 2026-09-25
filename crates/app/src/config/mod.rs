@@ -164,6 +164,15 @@ pub struct AudioConfig {
     /// router's `last_active_source` policy needs.
     #[serde(default = "default_activity_floor")]
     pub activity_floor_db: f32,
+    /// Which machine to share audio with, as a machine id (a prefix is
+    /// accepted, like the trust policy).
+    ///
+    /// Empty means "the only connected client" — an audio link describes
+    /// one pair of machines, so with more than one client the choice stops
+    /// being obvious, and the link is dropped rather than streaming this
+    /// machine's output to a machine the user never picked.
+    #[serde(default)]
+    pub peer: String,
 }
 
 impl Default for AudioConfig {
@@ -174,7 +183,27 @@ impl Default for AudioConfig {
             capture_device: String::new(),
             playback_device: String::new(),
             activity_floor_db: default_activity_floor(),
+            peer: String::new(),
         }
+    }
+}
+
+impl AudioConfig {
+    /// The running audio settings, in the form the runtime consumes. One
+    /// mapping, so the startup path and a hot reload cannot drift.
+    pub fn to_options(&self) -> kvmshare_core::audio::runtime::AudioOptions {
+        kvmshare_core::audio::runtime::AudioOptions {
+            send: self.send,
+            receive: self.receive,
+            capture_device: self.capture_device.clone(),
+            playback_device: self.playback_device.clone(),
+            activity_floor_db: self.activity_floor_db,
+        }
+    }
+
+    /// Whether this section asks for anything at all.
+    pub fn is_active(&self) -> bool {
+        self.send || self.receive
     }
 }
 

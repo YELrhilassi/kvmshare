@@ -117,10 +117,10 @@ pub(crate) fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, ms
         // the control loop (a blocking device write would wedge input),
         // so the TCP loop routes these messages before dispatch — the
         // same pattern as `Control`.
-        Message::AudioStart { .. }
+        Message::AudioOffer { .. }
+        | Message::AudioStart { .. }
         | Message::AudioStop
-        | Message::AudioState { .. }
-        | Message::AudioFrame { .. } => {}
+        | Message::AudioState { .. } => {}
         // Not valid client-side traffic; ignore defensively. `Control`
         // is intercepted by the TCP loop before dispatch (the reconnect
         // loop needs the reason), so it can only reach here as a bug.

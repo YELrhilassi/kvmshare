@@ -278,7 +278,13 @@ fn allowlist_refuses_unknown_and_admits_trusted() {
         Server::with_options(
             session,
             0,
-            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+            Options {
+                control: Some(control_rx),
+                policy,
+                events: None,
+                server_id: "server-pc".into(),
+                audio: None,
+            },
         )
         .unwrap(),
     );
@@ -346,7 +352,13 @@ fn allowlist_admits_by_short_id_prefix() {
         Server::with_options(
             session,
             0,
-            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+            Options {
+                control: Some(control_rx),
+                policy,
+                events: None,
+                server_id: "server-pc".into(),
+                audio: None,
+            },
         )
         .unwrap(),
     );
@@ -520,7 +532,13 @@ fn revoked_machine_is_refused_even_when_named_in_the_layout() {
         Server::with_options(
             session,
             0,
-            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+            Options {
+                control: Some(control_rx),
+                policy,
+                events: None,
+                server_id: "server-pc".into(),
+                audio: None,
+            },
         )
         .unwrap(),
     );
@@ -644,7 +662,13 @@ fn unrevoked_machine_is_readmitted_fresh() {
         Server::with_options(
             session,
             0,
-            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+            Options {
+                control: Some(control_rx),
+                policy,
+                events: None,
+                server_id: "server-pc".into(),
+                audio: None,
+            },
         )
         .unwrap(),
     );
@@ -710,7 +734,13 @@ fn operator_disconnect_then_reconnect_is_admitted() {
         Server::with_options(
             session,
             0,
-            Options { control: Some(control_rx), policy, events: None, server_id: "server-pc".into() },
+            Options {
+                control: Some(control_rx),
+                policy,
+                events: None,
+                server_id: "server-pc".into(),
+                audio: None,
+            },
         )
         .unwrap(),
     );

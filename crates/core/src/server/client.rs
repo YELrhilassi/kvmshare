@@ -56,6 +56,12 @@ pub struct Client {
     /// (TCP) and cursor-stream frames (UDP), in enqueue order. Bounded
     /// ([`OUT_QUEUE_CAP`]) and drained by the writer thread.
     pub out: SyncSender<Outbound>,
+    /// This client's audio link, when it is the audio peer. Lives here so
+    /// it is torn down with the client — dropping the runtime stops its
+    /// threads and untrusts the peer, so a departed client can never keep
+    /// streaming audio into the next session. See
+    /// [`crate::server::audio`].
+    pub audio: Mutex<Option<crate::audio::runtime::AudioRuntime>>,
 }
 
 /// One outbound item for a client.
@@ -137,6 +143,9 @@ pub struct ClientCtx {
     /// id from a claim into a verified identity. Cleaned up wherever the
     /// client itself is (teardown, operator disconnect).
     pub tcp_ips: Arc<Mutex<HashMap<u8, IpAddr>>>,
+    /// Audio sharing setup, when `[audio]` asked for it. `None` = off; the
+    /// whole feature then costs nothing. See [`crate::server::audio`].
+    pub audio: Option<Arc<crate::server::audio::ServerAudio>>,
 }
 
 impl ClientCtx {
@@ -297,6 +306,7 @@ impl Client {
             machine_id: machine_id.clone(),
             since_ms: crate::time::now_ms(),
             out: out_tx,
+            audio: Mutex::new(None),
         });
         // A client with this id is already registered (same name): the
         // machine reconnected before the old socket's death was noticed,
@@ -340,6 +350,20 @@ impl Client {
                 info,
             });
         }
+        // Audio: settle the link now that the client set has changed. A
+        // no-op unless `[audio]` asks for something.
+        {
+            let others: Vec<Arc<Client>> = {
+                let clients = ctx.clients.lock().unwrap();
+                clients
+                    .values()
+                    .filter(|c| c.id != id)
+                    .cloned()
+                    .collect()
+            };
+            crate::server::audio::reconcile(&ctx, &client, tcp_peer.ip(), &others);
+        }
+
         if admitted {
             // The client was not in the layout and was admitted
             // dynamically. Every already-connected client must learn the
@@ -515,6 +539,21 @@ fn service_client(client: Arc<Client>, mut reader: Transport, ctx: Arc<ClientCtx
 
 /// Dispatch one inbound control message from a client.
 fn handle_client_message(client: &Client, msg: Message, ctx: &ClientCtx) {
+    // Audio first: these belong to the client's audio runtime, not to the
+    // session. `AudioState` is the one with a second consumer — its answer
+    // is what the media router's `last_active_source` policy follows.
+    match &msg {
+        Message::AudioOffer { .. } | Message::AudioStart { .. } | Message::AudioStop => {
+            crate::server::audio::handle_message(client, &msg);
+            return;
+        }
+        Message::AudioState { playing } => {
+            crate::server::audio::handle_message(client, &msg);
+            ctx.session.lock().unwrap().on_audio_state(client.id, *playing);
+            return;
+        }
+        _ => {}
+    }
     match msg {
         Message::KeepAlive => {}
         Message::ScreenInfo { info } => {

@@ -34,17 +34,18 @@ pub mod types {
     /// by cursor focus. See [`crate::message::MediaCommand`].
     pub const MEDIA_CONTROL: u8 = 0x31;
     pub const CLIPBOARD: u8 = 0x40;
-    /// Sender is starting an audio stream; carries its accepted formats
-    /// for negotiation. See [`crate::message::AudioFormat`].
-    pub const AUDIO_START: u8 = 0x50;
+    /// "My audio socket is on this port, and these are the formats I can
+    /// receive." Each side announces independently, so audio can flow in
+    /// one direction, the other, or both.
+    pub const AUDIO_OFFER: u8 = 0x50;
+    /// "I am now sending you audio, from my port, in this format." Sent
+    /// only once the sender has the peer's offer and a common format.
+    pub const AUDIO_START: u8 = 0x51;
     /// The audio stream is ending.
-    pub const AUDIO_STOP: u8 = 0x51;
-    /// Whether the sender currently has something playing — the input to
+    pub const AUDIO_STOP: u8 = 0x52;
+    /// Whether this machine currently has something playing — the input to
     /// the media router's `last_active_source` policy.
-    pub const AUDIO_STATE: u8 = 0x52;
-    /// One packet of audio payload. Rides UDP (loss-tolerant), never the
-    /// reliable control stream.
-    pub const AUDIO_FRAME: u8 = 0x53;
+    pub const AUDIO_STATE: u8 = 0x53;
     pub const KEEPALIVE: u8 = 0x7e;
     pub const ERROR: u8 = 0x7f;
 }

@@ -67,21 +67,27 @@ pub enum Message {
     /// The command is *semantic*, not a key code: the receiver presses
     /// whatever its own OS calls play/pause. See [`MediaCommand`].
     MediaControl { command: MediaCommand },
-    /// Sender is starting to stream its audio output. `formats` is the
-    /// sender's accepted set, in preference order; the peer answers with
-    /// a chosen [`AudioFormat`] that both support.
-    AudioStart { formats: Vec<AudioFormat> },
+    /// "My audio socket is on `port`, and these are the formats I can
+    /// receive." Sent by a machine that is willing to play the peer's
+    /// audio, so the peer knows where to send and what it may send.
+    ///
+    /// Announcing a port rather than reusing the control link's address is
+    /// what keeps audio on its own socket: the two streams have opposite
+    /// pacing requirements and must not share a queue (see
+    /// [`crate::audio::transport`]).
+    AudioOffer { port: u16, formats: Vec<AudioFormat> },
+    /// "I am now sending you audio from `port`, encoded as `format`." Sent
+    /// once an offer proved a common format exists; the receiver replies
+    /// with nothing — a stream needs no acknowledgement, and requiring one
+    /// would add a round trip to every start.
+    AudioStart { port: u16, format: AudioFormat },
     /// The audio stream is ending (capture stopped, config changed, role
     /// shutting down).
     AudioStop,
-    /// Whether the sender currently has audio playing. Drives the media
+    /// Whether this machine currently has audio playing. Drives the media
     /// router's `last_active_source` policy, and the GUI's indication of
     /// which machine is making sound.
     AudioState { playing: bool },
-    /// One packet of audio payload, riding UDP. `timestamp_ms` is the
-    /// sender's capture clock, for jitter measurement and for dropping
-    /// packets that arrive too late to play.
-    AudioFrame { timestamp_ms: u32, samples: Vec<u8> },
     KeepAlive,
     Error { code: u8, text: String },
     /// Local only, never serialized to a peer: the user pressed the
@@ -110,10 +116,10 @@ impl Message {
             Message::Key { .. } => types::KEY,
             Message::Clipboard { .. } => types::CLIPBOARD,
             Message::MediaControl { .. } => types::MEDIA_CONTROL,
+            Message::AudioOffer { .. } => types::AUDIO_OFFER,
             Message::AudioStart { .. } => types::AUDIO_START,
             Message::AudioStop => types::AUDIO_STOP,
             Message::AudioState { .. } => types::AUDIO_STATE,
-            Message::AudioFrame { .. } => types::AUDIO_FRAME,
             Message::KeepAlive => types::KEEPALIVE,
             Message::Error { .. } => types::ERROR,
             Message::Escape => types::ESCAPE,
@@ -175,14 +181,16 @@ impl Message {
                 w.put_bytes(data);
             }
             Message::MediaControl { command } => command.encode(&mut w),
-            Message::AudioStart { formats } => audio::encode_list(&mut w, formats),
+            Message::AudioOffer { port, formats } => {
+                w.put_u16(*port);
+                audio::encode_list(&mut w, formats);
+            }
+            Message::AudioStart { port, format } => {
+                w.put_u16(*port);
+                format.encode(&mut w);
+            }
             Message::AudioStop => {}
             Message::AudioState { playing } => w.put_u8(*playing as u8),
-            Message::AudioFrame { timestamp_ms, samples } => {
-                w.put_u32(*timestamp_ms);
-                w.put_u32(samples.len() as u32);
-                w.put_bytes(samples);
-            }
             Message::KeepAlive => {}
             Message::Error { code, text } => {
                 w.put_u8(*code);
@@ -237,15 +245,16 @@ impl Message {
                 Message::Clipboard { mime, data }
             }
             types::MEDIA_CONTROL => Message::MediaControl { command: MediaCommand::decode(&mut r)? },
-            types::AUDIO_START => Message::AudioStart { formats: audio::decode_list(&mut r)? },
+            types::AUDIO_OFFER => Message::AudioOffer {
+                port: r.get_u16()?,
+                formats: audio::decode_list(&mut r)?,
+            },
+            types::AUDIO_START => Message::AudioStart {
+                port: r.get_u16()?,
+                format: AudioFormat::decode(&mut r)?,
+            },
             types::AUDIO_STOP => Message::AudioStop,
             types::AUDIO_STATE => Message::AudioState { playing: r.get_u8()? != 0 },
-            types::AUDIO_FRAME => {
-                let timestamp_ms = r.get_u32()?;
-                let len = r.get_u32()? as usize;
-                let samples = r.get_bytes(len, "audio samples")?.to_vec();
-                Message::AudioFrame { timestamp_ms, samples }
-            }
             types::KEEPALIVE => Message::KeepAlive,
             types::ERROR => Message::Error { code: r.get_u8()?, text: r.get_str()?.to_owned() },
             types::ESCAPE => Message::Escape,
@@ -355,7 +364,8 @@ mod tests {
 
     #[test]
     fn audio_messages_roundtrip() {
-        roundtrip(Message::AudioStart {
+        roundtrip(Message::AudioOffer {
+            port: 51_234,
             formats: vec![AudioFormat::default(), AudioFormat {
                 sample_rate: 44_100,
                 channels: 1,
@@ -363,13 +373,18 @@ mod tests {
                 codec: crate::id::codecs::PCM_S16LE,
             }],
         });
+        roundtrip(Message::AudioStart { port: 51_234, format: AudioFormat::default() });
         roundtrip(Message::AudioStop);
         roundtrip(Message::AudioState { playing: true });
         roundtrip(Message::AudioState { playing: false });
-        roundtrip(Message::AudioFrame {
-            timestamp_ms: 12_345,
-            samples: vec![0u8, 1, 2, 3, 255],
-        });
+    }
+
+    /// An offer with no formats is legal ("I can receive, but support
+    /// nothing you might send") and must survive the wire, because that is
+    /// how a machine with no usable audio backend answers.
+    #[test]
+    fn an_empty_audio_offer_roundtrips() {
+        roundtrip(Message::AudioOffer { port: 1, formats: Vec::new() });
     }
 
     /// A media command this build does not know is refused rather than
@@ -387,10 +402,25 @@ mod tests {
     /// malformed offer can never size a buffer.
     #[test]
     fn unsupported_audio_format_is_rejected() {
-        let mut bytes = Message::AudioStart { formats: vec![AudioFormat::default()] }.encode();
-        // Corrupt the sample rate (the first four payload bytes after the
-        // frame header and the 1-byte format count) to zero.
-        let rate_at = crate::frame::HEADER_LEN + 1;
+        let mut bytes = Message::AudioStart { port: 1, format: AudioFormat::default() }.encode();
+        // Corrupt the sample rate: past the frame header, the 2-byte port,
+        // and the 1-byte format count.
+        let rate_at = crate::frame::HEADER_LEN + 2 + 1;
+        bytes[rate_at..rate_at + 4].copy_from_slice(&0u32.to_be_bytes());
+        assert!(Message::decode(&bytes).is_err());
+    }
+
+    /// A start naming an unsupported format is refused too — the same
+    /// validation must hold on both audio messages, or a peer could stream
+    /// in a format this build cannot play.
+    #[test]
+    fn an_unsupported_format_in_an_offer_is_rejected() {
+        let mut bytes = Message::AudioOffer {
+            port: 1,
+            formats: vec![AudioFormat::default()],
+        }
+        .encode();
+        let rate_at = crate::frame::HEADER_LEN + 2 + 1;
         bytes[rate_at..rate_at + 4].copy_from_slice(&0u32.to_be_bytes());
         assert!(Message::decode(&bytes).is_err());
     }

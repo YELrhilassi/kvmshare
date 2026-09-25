@@ -139,6 +139,11 @@ pub struct Session {
     /// User input preferences (pointer/wheel feel) applied to the
     /// forwarded stream — see [`crate::input`].
     prefs: InputPrefs,
+    /// Which screen most recently reported that it has audio playing
+    /// (`None` = nothing is playing anywhere, or nothing has said so).
+    /// Fed by `AudioState`, consumed by the media router's
+    /// `last_active_source` policy — see [`crate::media`].
+    last_active: Option<u8>,
 }
 
 impl Session {
@@ -163,6 +168,42 @@ impl Session {
             actions: ActionEngine::new(BindSection::default()),
             walls_locked: false,
             prefs: InputPrefs::default(),
+            last_active: None,
+        }
+    }
+
+    /// The screen the cursor is on, or `None` when it is home. This is what
+    /// the media router's `follow_focus` policy follows.
+    pub fn focus(&self) -> Option<u8> {
+        match self.cursor.mode {
+            Mode::Remote(id) => Some(id),
+            Mode::Local => None,
+        }
+    }
+
+    /// The screen that most recently reported audio playing.
+    pub fn last_active(&self) -> Option<u8> {
+        self.last_active
+    }
+
+    /// Record a peer's answer to "do you have audio playing?".
+    ///
+    /// A machine that starts playing becomes the last active source; a
+    /// machine that *stops* keeps the title until another one starts. That
+    /// asymmetry is deliberate: media keys should keep controlling the
+    /// machine the user was just listening to (to resume it, to skip the
+    /// next track), and a pause must not mean "you have no target now".
+    pub fn on_audio_state(&mut self, screen_id: u8, playing: bool) {
+        if playing {
+            self.last_active = Some(screen_id);
+        }
+    }
+
+    /// Forget a departed client's claim to being the last active source, so
+    /// routing does not aim at a machine that is gone.
+    pub fn on_client_departed(&mut self, screen_id: u8) {
+        if self.last_active == Some(screen_id) {
+            self.last_active = None;
         }
     }
 

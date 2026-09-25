@@ -170,6 +170,7 @@ fn start_server() -> Harness {
                 policy: Policy { allowlist: false, ..Policy::default() },
                 events: Some(events_tx),
                 server_id: "server-pc".into(),
+                audio: None,
             },
         )
         .unwrap(),

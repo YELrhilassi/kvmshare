@@ -117,10 +117,15 @@ fn run() -> Result<(), String> {
                 policy,
                 events: Some(evt_tx),
                 server_id: machine_id(&state),
+                audio: server_audio(&cfg),
             },
         )
         .map_err(|e| format!("bind: {e}"))?,
     );
+    // Media routing: the router decides where a media key goes, so its
+    // policy has to reach the session that sees the key. Applied here so
+    // the very first key press is routed, not the second.
+    server.set_media_prefs(media_prefs(&cfg));
 
     // Clipboard: local changes are broadcast to every client.
     spawn_server_clipboard(clipboard.clone(), server.clone());
@@ -162,6 +167,29 @@ fn run() -> Result<(), String> {
     let _ = std::fs::remove_file(state.join("control.state"));
 
     result.map_err(|e| format!("server: {e}"))
+}
+
+/// The audio setup for this server, or `None` when `[audio]` asks for
+/// nothing — in which case no socket is bound and the feature is inert.
+fn server_audio(cfg: &Config) -> Option<Arc<kvmshare_core::server::audio::ServerAudio>> {
+    if !cfg.audio.is_active() {
+        return None;
+    }
+    Some(Arc::new(kvmshare_core::server::audio::ServerAudio {
+        backend: kvmshare_platform::audio::backend(),
+        options: cfg.audio.to_options(),
+        peer_machine_id: Some(cfg.audio.peer.clone())
+            .filter(|p| !p.trim().is_empty()),
+    }))
+}
+
+/// The media routing policy, resolved from the config. A config that
+/// cannot be parsed is a hard error at load time (see
+/// [`Config::validate`]), so reaching here means it is valid; an
+/// unexpected failure falls back to the behaviour-preserving default
+/// rather than leaving the router with no policy at all.
+fn media_prefs(cfg: &Config) -> kvmshare_core::media::MediaPrefs {
+    cfg.media.to_prefs().unwrap_or_default()
 }
 
 /// How often the config watcher polls the file for changes.

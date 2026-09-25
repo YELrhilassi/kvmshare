@@ -38,6 +38,38 @@ pub trait Engine: Send {
     /// through the action engine when the event reaches the session —
     /// it may just lose a race against an OS binding.
     fn set_bound_chords(&mut self, _chords: Vec<(u8, u32)>) {}
+
+    /// Suppress (or stop suppressing) the media keys on this machine.
+    ///
+    /// While the media router is armed it consumes every media key —
+    /// routing one to a client, or performing it here — and it can only do
+    /// that coherently if the local OS does *not* also act on the physical
+    /// press. Without suppression, pressing play while the music is on the
+    /// other machine would toggle playback on **both**. With it, the local
+    /// case must be performed explicitly (see [`Engine::media`]).
+    ///
+    /// Best-effort, like the other grabs: a platform that cannot suppress
+    /// reports `Err`, the server logs it, and media keys keep working (they
+    /// merely also act locally). Default: nothing to suppress.
+    fn set_media_capture(&mut self, _active: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Whether media-key suppression is actually armed. The server checks
+    /// this rather than assuming: it is what tells a log line "media keys
+    /// also act on this machine" apart from "media keys are routed".
+    fn media_capture_active(&self) -> bool {
+        false
+    }
+
+    /// Perform a media command on this machine.
+    ///
+    /// Used for the router's `Local` outcome, which exists precisely
+    /// because the physical key was suppressed. Backends implement it as a
+    /// tap of their platform's own media key, so a routed-and-returned
+    /// command is indistinguishable from the user pressing the key.
+    /// Default: no media support (the command has no effect).
+    fn media(&mut self, _command: kvmshare_protocol::message::MediaCommand) {}
 }
 
 /// A shared handle to the server's clipboard service.

@@ -15,6 +15,51 @@
 //! The shared, testable logic (device naming and the parsing of the
 //! Linux tools' output) lives here, so it can be tested on any host.
 
+use std::sync::Arc;
+
+use kvmshare_core::audio::device::{AudioCapture, AudioPlayback};
+use kvmshare_core::audio::runtime::AudioBackend;
+use kvmshare_protocol::message::AudioFormat;
+
+/// This platform's audio, in the form the core's runtime consumes.
+///
+/// The runtime is platform-independent and never names an OS type; this is
+/// the single place that turns "open capture" into `parec` on Linux or a
+/// WASAPI client on Windows. One implementation, so both roles (server and
+/// client) get identical behaviour for free.
+pub struct PlatformAudio;
+
+impl PlatformAudio {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for PlatformAudio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioBackend for PlatformAudio {
+    fn open_capture(
+        &self,
+        device: &str,
+        format: AudioFormat,
+    ) -> Result<Box<dyn AudioCapture>, String> {
+        crate::audio_capture(device, format)
+    }
+
+    fn open_playback(&self, device: &str) -> Box<dyn AudioPlayback> {
+        crate::audio_playback(device)
+    }
+}
+
+/// The shared handle the app passes to the runtime.
+pub fn backend() -> Arc<dyn AudioBackend> {
+    Arc::new(PlatformAudio::new())
+}
+
 /// The **monitor** (loopback) source that carries a sink's output.
 ///
 /// PulseAudio and PipeWire name the loopback of a sink by appending

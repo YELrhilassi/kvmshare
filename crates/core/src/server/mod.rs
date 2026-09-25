@@ -41,7 +41,9 @@
 //! * [`udp`] — the cursor-stream receiver and its beacon watchdog.
 
 mod actions;
+pub mod audio;
 mod client;
+mod media;
 mod engine;
 mod liveness;
 mod udp;
@@ -63,6 +65,7 @@ use crate::time::now_ms;
 
 use actions::apply_action;
 use client::{Client, ClientCtx};
+pub use client::{Outbound, route};
 use liveness::{supervisor_loop, CONTROL_POLL};
 
 pub use engine::{Engine, ServerClipboard};
@@ -184,6 +187,10 @@ pub struct Options {
     /// This machine's stable id, sent to clients in `Welcome` so they can
     /// trust the server (discovery, auto-connect).
     pub server_id: String,
+    /// Audio sharing, when `[audio]` asks for it. `None` means the feature
+    /// is off and costs nothing — no socket is bound and no announcement is
+    /// sent.
+    pub audio: Option<Arc<audio::ServerAudio>>,
 }
 
 pub struct Server {
@@ -232,6 +239,13 @@ pub struct Server {
     /// This machine's stable id, sent to clients in `Welcome` so they can
     /// trust the server (discovery, auto-connect).
     server_id: String,
+    /// Audio sharing setup, when `[audio]` asked for it. `None` = off.
+    /// Handed to every [`ClientCtx`] so the per-client decide-and-attach
+    /// step sees the same configuration.
+    audio: Option<Arc<audio::ServerAudio>>,
+    /// The media routing policy. Shared (and hot-reloadable) so a policy
+    /// edit applies to the next key press rather than the next restart.
+    media: Arc<Mutex<crate::media::MediaPrefs>>,
     /// Measures the server's pointer transform (px per device count)
     /// from the capture stream; the session scales forwarded motion by
     /// it so the client's cursor mirrors the server's (see
@@ -258,7 +272,13 @@ impl Server {
         Self::with_options(
             session,
             port,
-            Options { control, policy: Policy::default(), events: None, server_id: String::new() },
+            Options {
+                control,
+                policy: Policy::default(),
+                events: None,
+                server_id: String::new(),
+                audio: None,
+            },
         )
     }
 
@@ -291,12 +311,21 @@ impl Server {
             policy: Arc::new(Mutex::new(opts.policy)),
             events: Mutex::new(opts.events),
             server_id: opts.server_id,
+            audio: opts.audio,
+            media: Arc::new(Mutex::new(crate::media::MediaPrefs::default())),
             gain: Arc::new(std::sync::Mutex::new(crate::motion::GainTracker::new())),
         })
     }
 
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// Adopt a media routing policy. Called before `run` for the startup
+    /// configuration and afterwards by the hot-reload path; the grab is
+    /// then re-armed by the running loop, which owns the engine.
+    pub fn set_media_prefs(&self, prefs: crate::media::MediaPrefs) {
+        *self.media.lock().unwrap() = prefs;
     }
 
     /// How many clients are currently connected (useful for the GUI's
@@ -349,6 +378,11 @@ impl Server {
                 }
             }
         }
+        // Arm or leave alone the media-key grab to match the configured
+        // policy. Routing-enabled and grabbed are the same decision: keys
+        // are consumed either way, and a consumed key that was not grabbed
+        // would simply be lost. See [`media`].
+        media::arm_capture(&engine, media::wants_capture(&self.media.lock().unwrap()));
         // Accept clients on a background thread.
         let listener = self.listener.try_clone()?;
         let ctx = Arc::new(ClientCtx {
@@ -364,6 +398,7 @@ impl Server {
             policy: self.policy.clone(), // shared: hot policy changes apply
             events: self.events.lock().unwrap().clone(),
             server_id: self.server_id.clone(),
+            audio: self.audio.clone(),
         });
         let udp_accept = self.udp.clone();
         let ctx_accept = ctx.clone();
@@ -433,6 +468,36 @@ impl Server {
         msg: Message,
         engine: &Mutex<Box<dyn Engine>>,
     ) -> io::Result<()> {
+        // Media keys are routed by policy rather than by cursor focus (see
+        // [`crate::media`]), so they are intercepted *before* the session —
+        // a routed key must never also reach a client as an ordinary
+        // keystroke.
+        if let Message::Key { kind, key } = &msg {
+            if let Some(command) = kvmshare_protocol::message::MediaCommand::from_hid(*key) {
+                let prefs = self.media.lock().unwrap().clone();
+                if prefs.route_media_keys {
+                    // Only a press acts. The matching release is swallowed
+                    // too: the destination machine performs the command as
+                    // a complete tap of its own (see `Injector::media`), so
+                    // forwarding a release would be a second, spurious
+                    // event. A held media key repeating is likewise one
+                    // command per press, not one per repeat.
+                    if matches!(kind, kvmshare_protocol::message::KeyKind::Down) {
+                        let routed = media::route_command(
+                            &media::MediaRoute {
+                                prefs: &prefs,
+                                session: &self.session,
+                                clients: &self.clients,
+                                engine,
+                            },
+                            command,
+                        );
+                        kvmshare_log::log_trace!("media: {command:?} -> {routed:?}");
+                    }
+                    return Ok(());
+                }
+            }
+        }
         // First, feed the pointer-gain measurement: raw deltas vs the
         // real-position beacons give the server's own px-per-count,
         // which the session applies to forwarded motion so the client's
