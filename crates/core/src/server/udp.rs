@@ -109,28 +109,44 @@ pub fn udp_receiver(udp: Arc<std::net::UdpSocket>, ctx: Arc<ClientCtx>) {
         match udp.recv_from(&mut buf) {
             Ok((n, from)) => {
                 let Some(d) = udp::unpack(&buf[..n]) else { continue };
-                // Only datagrams from a known client count. Learning the
-                // address happens here too — the first datagram is the
-                // registration the client sends right after the
-                // handshake.
-                if !ctx.clients.lock().unwrap().contains_key(&d.id) {
-                    continue;
+                // Only datagrams from a known client count — and the
+                // client id in a datagram is just a claim; the **source
+                // IP** is what the transport authenticates. A datagram is
+                // accepted only when it (a) names a connected client and
+                // (b) comes from the same IP that client's TCP handshake
+                // came from. Anything else (a forged id from another
+                // machine, an unconnected peer guessing ids) is dropped
+                // before it can refresh liveness, (re)learn an address,
+                // or feed a beacon to the session — a forged CursorPos
+                // could otherwise drive edge crossings.
+                {
+                    let known_ip = ctx.tcp_ips.lock().unwrap().get(&d.id).copied();
+                    let known_ip = match known_ip {
+                        Some(ip) => ip,
+                        None => continue, // no such connected client
+                    };
+                    if from.ip() != known_ip {
+                        // Not from the handshaked machine: a spoofed id
+                        // (or a second NAT leg). Ignore silently — logging
+                        // every probe would hand attackers a cheap oracle.
+                        continue;
+                    }
                 }
-                // Any datagram from a known client proves its cursor
-                // stream is alive (beacons flow continuously while it is
-                // active). Tracked for the staleness watchdog above.
+                // Any surviving datagram proves its cursor stream is
+                // alive (beacons flow continuously while it is active).
+                // Tracked for the staleness watchdog above.
                 ctx.last_heard.lock().unwrap().insert(d.id, now_ms());
-                // Learn or verify the datagram's source. The first
-                // datagram from a client teaches us its address; a
-                // datagram from a *different* address is either a stale
-                // frame from a previous session (still draining the
-                // socket buffer after a disconnect) or a fresh
-                // registration from a reconnect. Either way the old
-                // sequence space belongs to the old address — reset it
-                // and adopt the new source. Without this, a late frame
-                // from a dead session re-creates the seq tracker at its
-                // high value and every fresh beacon (starting at 1) is
-                // judged stale: the live session is deafened.
+                // Learn or verify the datagram's source **port**. The IP
+                // was already matched against the handshake above; the
+                // port is learned from the client's first datagram (its
+                // registration, sent right after the handshake) and can
+                // legitimately change when the client reconnects from a
+                // new port. Either way the old sequence space belongs to
+                // the old address — reset it and adopt the new source.
+                // Without this, a late frame from a dead session
+                // re-creates the seq tracker at its high value and every
+                // fresh beacon (starting at 1) is judged stale: the live
+                // session is deafened.
                 {
                     let mut addrs = ctx.addrs.lock().unwrap();
                     match addrs.get(&d.id) {

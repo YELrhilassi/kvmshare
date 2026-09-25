@@ -147,6 +147,28 @@ impl Config {
             if !seen.insert(s.name.clone()) {
                 return Err(format!("duplicate screen name {:?}", s.name));
             }
+            // Geometry sanity: these values become the session's edge
+            // math. A zero, negative, or absurd dimension once produced
+            // a screen the cursor could enter but never leave; NaN or
+            // ±Inf scale would poison every coordinate normalization it
+            // touches. Bounds mirror ScreenInfo::MAX_DIMENSION (the wire
+            // clamp) so config and handshake agree on what a screen is.
+            if s.width == 0 || s.height == 0 {
+                return Err(format!("screen {:?} must have non-zero dimensions", s.name));
+            }
+            let max = kvmshare_protocol::message::ScreenInfo::MAX_DIMENSION;
+            if s.width > max || s.height > max {
+                return Err(format!(
+                    "screen {:?} dimensions exceed the maximum ({max})",
+                    s.name
+                ));
+            }
+            if !s.scale.is_finite() || s.scale <= 0.0 || s.scale > 10.0 {
+                return Err(format!(
+                    "screen {:?} scale must be finite, positive, and at most 10.0 (got {})",
+                    s.name, s.scale
+                ));
+            }
         }
         Ok(())
     }

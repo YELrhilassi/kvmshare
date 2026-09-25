@@ -193,16 +193,31 @@ const stateEventName = "kvmshare:state";
 // `kvmshare:state` snapshot only when something actually changed, so the
 // page renders real transitions without polling the bridge. Returns an
 // unsubscribe function.
+//
+// The subscription is genuinely removable: Wails v3's `Events.Off(name)`
+// removes the listeners registered for a name, and this app has exactly
+// one subscriber per name (AppProvider owns `kvmshare:state`), so
+// Off(name) is a full unsubscribe, not a clobber of other consumers.
+// The async race is covered too: a disposer called before the runtime
+// finished loading also cancels the pending `On` (the old version only
+// set a flag, so mount/unmount cycles accumulated listeners forever
+// once the runtime had loaded).
 export function onState(cb: (s: LiveSnapshot) => void): () => void {
   let disposed = false;
+  let handler: ((e: WailsEvent<LiveSnapshot>) => void) | undefined;
   void runtime().then(() => {
     if (disposed) return;
     const ev = window.wails?.Events;
     if (!ev?.On) return;
-    ev.On(stateEventName, (e: WailsEvent<LiveSnapshot>) => cb(e.data));
+    handler = (e: WailsEvent<LiveSnapshot>) => cb(e.data);
+    ev.On(stateEventName, handler);
   });
   return () => {
     disposed = true;
+    if (handler) {
+      window.wails?.Events?.Off(stateEventName);
+      handler = undefined;
+    }
   };
 }
 

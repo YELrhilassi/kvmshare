@@ -158,4 +158,30 @@ UDP datagram:
 
 ---
 
+## 4.7 The trust model — what an id proves (and what it does not)
+
+Honesty here matters more than comfort: kvmshare's machine ids are
+**convenience identities, not credentials**, and `local_only` means
+"private-address", not "same subnet".
+
+- **Machine ids are self-claimed.** A client announces `Hello { id,
+  name, info }` and the server believes it. `trusted_ids` and
+  `revoked_ids` therefore express *operator intent about names*
+  ("the machine I know as `98980a4d…` may connect"), not authenticated
+  identity: a peer that knows a trusted id can present it. On a hostile
+  LAN this is a real gap. The roadmap fix is key-based identity
+  (machine id = hash of a public key, `Hello` carries a signature over
+  the handshake; then `trusted_ids` refers to something provable).
+  Until then, treat kvmshare as appropriate for networks where every
+  device is yours or trusted.
+- **`local_only` = RFC1918 + loopback + link-local.** A VPN adapter or
+  a routed private network also presents these ranges; the check does
+  not (and cannot, from an IP alone) prove physical adjacency.
+- **What *is* enforced:** every UDP datagram must come from the IP its
+  client's TCP handshake came from (the server records the handshake
+  peer and drops datagrams whose claimed client id belongs to a
+  different IP — a forged `CursorPos` from another machine cannot drive
+  edge crossings). Unknown frame flags are rejected rather than
+  ignored, and declared frame lengths are capped before buffering.
+
 **Next:** [5. Core crate](05-core.md) — the platform-independent brain.

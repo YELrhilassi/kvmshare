@@ -268,8 +268,21 @@ impl Injector for Win32Injector {
     fn key(&mut self, kind: KeyKind, key: u32) {
         // Canonical HID usage -> set-1 scancode (with the E0 extended
         // flag). Unknown usages are dropped: a wrong key would be worse
-        // than no key.
+        // than no key. The drop is logged (at most once per 30 s) —
+        // silently swallowing keys made every "some keys do nothing on
+        // this client" report a mystery.
         let Some((scan, extended)) = crate::keys::scancode_from_hid(key) else {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_WARNED: AtomicU64 = AtomicU64::new(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now >= LAST_WARNED.swap(now, Ordering::Relaxed) + 30 {
+                kvmshare_log::log_warn!(
+                    "client keyboard: HID usage 0x{key:03x} has no scancode mapping — key dropped (unknown key on the sending machine?)"
+                );
+            }
             return;
         };
         // Track down-state so `leave` can release whatever the server

@@ -2,8 +2,11 @@
 //!
 //! A [`Frame`] is the raw unit on the wire: a fixed header followed by a
 //! payload. [`Frame::decode_from`] reads from an arbitrary reader one frame
-//! at a time, handling partial reads; if the magic is ever wrong it resyncs
-//! by scanning for the next valid magic instead of erroring out.
+//! at a time, handling partial reads, and is a **strict** parser: a bad
+//! magic or an unknown flag is an error, never a silent resync —
+//! resynchronization lives in the transport layer (which scans its
+//! buffer for the next magic; see `Transport::try_decode`), and the two
+//! layers must not both guess at where frames end.
 
 use std::io::{self, Read};
 
@@ -43,8 +46,14 @@ impl Frame {
     /// Read one frame from `reader`, buffering partial reads.
     ///
     /// Returns `Ok(None)` on a clean EOF between frames.
-    /// If the stream is desynced (bad magic) we scan for the next magic
-    /// and keep going — a corrupt frame is discarded, not fatal.
+    ///
+    /// Strict by design: a bad magic or an out-of-range length is an
+    /// error (resync from arbitrary corruption is the transport's job —
+    /// it holds a byte buffer to scan, which this reader-based API does
+    /// not). Unknown **flag bits** are also rejected: the flags field is
+    /// part of the wire contract, and ignoring unknown bits would let a
+    /// future sender's "payload is transformed" frames be decoded as
+    /// raw bytes.
     pub fn decode_from<R: Read>(reader: &mut R) -> io::Result<Option<Frame>> {
         let mut header = [0u8; HEADER_LEN];
         match read_full(reader, &mut header)? {
@@ -89,6 +98,12 @@ fn decode_header(header: &[u8; HEADER_LEN]) -> Result<(u8, u8, usize), &'static 
     }
     let msg_type = header[4];
     let flags = header[5];
+    // Unknown flag bits are a protocol violation, not a curiosity:
+    // failing here keeps the "flags mean nothing" trap out of the wire
+    // format (see [`crate::id::flags::KNOWN`]).
+    if flags & !crate::id::flags::KNOWN != 0 {
+        return Err("unknown frame flags");
+    }
     let len = u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
     if len > MAX_PAYLOAD as usize {
         return Err("payload too large");
@@ -140,5 +155,30 @@ mod tests {
         let mut cur = io::Cursor::new(h.to_vec());
         let res = Frame::decode_from(&mut cur);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn unknown_flags_rejected() {
+        let mut h = vec![0u8; HEADER_LEN];
+        h[0..4].copy_from_slice(&MAGIC);
+        h[4] = 0x01;
+        h[5] = 0x04; // a bit no decoder knows
+        h[6..10].copy_from_slice(&1u32.to_be_bytes());
+        h.push(0u8); // the (fake) payload byte
+        let mut cur = io::Cursor::new(h);
+        let res = Frame::decode_from(&mut cur);
+        assert!(res.is_err(), "unknown flag bits must fail the decode");
+    }
+
+    #[test]
+    fn reserved_compressed_flag_rejected_while_unimplemented() {
+        let mut h = vec![0u8; HEADER_LEN];
+        h[0..4].copy_from_slice(&MAGIC);
+        h[4] = 0x01;
+        h[5] = crate::id::flags::COMPRESSED; // defined, not implemented
+        h[6..10].copy_from_slice(&1u32.to_be_bytes());
+        h.push(0u8);
+        let mut cur = io::Cursor::new(h);
+        assert!(Frame::decode_from(&mut cur).is_err());
     }
 }

@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +32,16 @@ const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// 2 s; this is five missed keepalives.
 const CLIENT_SILENT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many outbound items may queue per client before sends start
+/// dropping. Generous — healthy control traffic is a handful of frames
+/// per second. The bound exists so a wedged writer (a stalled TCP peer,
+/// a vanished UDP target) can never grow memory without limit: the old
+/// unbounded channel turned a stuck writer into unbounded memory growth./// Cursor motion (UDP) is loss-tolerant by design and simply drops when
+/// the queue is full; a *reliable* frame dropped here means the writer
+/// is this many frames behind — a dead connection in practice — and the
+/// existing silence timeouts reap the client shortly after.
+const OUT_QUEUE_CAP: usize = 1024;
+
 /// The server's view of one connected client.
 pub struct Client {
     pub id: u8,
@@ -43,9 +53,9 @@ pub struct Client {
     /// Monotonic ms when the client connected (for the client list).
     pub since_ms: u64,
     /// Everything destined for this client: reliable control frames
-    /// (TCP) and cursor-stream frames (UDP), in enqueue order. Drained
-    /// by the writer thread.
-    pub out: Sender<Outbound>,
+    /// (TCP) and cursor-stream frames (UDP), in enqueue order. Bounded
+    /// ([`OUT_QUEUE_CAP`]) and drained by the writer thread.
+    pub out: SyncSender<Outbound>,
 }
 
 /// One outbound item for a client.
@@ -67,10 +77,26 @@ pub fn route(msg: Message) -> Outbound {
 }
 
 /// Push a message onto a client's outbound queue (never blocks — the
-/// queue is unbounded; the writer drains it). Unknown client = gone.
+/// queue is bounded and full queues drop; see [`OUT_QUEUE_CAP`]).
+/// Unknown client = gone.
 pub fn enqueue(clients: &Arc<Mutex<HashMap<u8, Arc<Client>>>>, id: u8, msg: Message) {
     let Some(client) = clients.lock().unwrap().get(&id).cloned() else { return };
-    let _ = client.out.send(route(msg));
+    match route(msg) {
+        Outbound::Udp(m) => {
+            // Motion is loss-tolerant by design: a full queue drops the
+            // frame, the next one self-heals.
+            let _ = client.out.try_send(Outbound::Udp(m));
+        }
+        Outbound::Tcp(m) => {
+            if client.out.try_send(Outbound::Tcp(m)).is_err() {
+                // A full *reliable* queue means the writer is wedged
+                // far behind. Dropping keeps the input path live — it
+                // must never block on a stuck client — and the silence
+                // timeouts end the session shortly after.
+                log_warn!("client {id}: outbound queue full — dropping a control frame");
+            }
+        }
+    }
 }
 
 /// Shared state one connected client's threads need. Bundled once at
@@ -101,6 +127,16 @@ pub struct ClientCtx {
     pub events: Option<Sender<ServerEvent>>,
     /// This machine's stable id, sent to clients in `Welcome`.
     pub server_id: String,
+    /// The **authenticated** transport peers: client id → the IP its TCP
+    /// handshake came from, recorded at handshake time. The UDP cursor
+    /// stream is accepted only from these: the id inside a UDP datagram
+    /// is client-supplied (anyone on the network can put a connected
+    /// client's id in a packet and forge beacons that drive edge
+    /// crossings), but the source *IP* of a datagram cannot be chosen by
+    /// the sender — so binding datagrams to the handshake's IP turns the
+    /// id from a claim into a verified identity. Cleaned up wherever the
+    /// client itself is (teardown, operator disconnect).
+    pub tcp_ips: Arc<Mutex<HashMap<u8, IpAddr>>>,
 }
 
 impl ClientCtx {
@@ -168,14 +204,35 @@ impl ClientCtx {
         //
         // The reader thread for this connection ends right after this
         // (teardown is its tail), so nothing can enqueue behind these.
-        let _ = client.out.send(route(Message::Leave { screen_id: id }));
-        let _ = client.out.send(route(Message::Control {
+        let _ = client.out.try_send(route(Message::Leave { screen_id: id }));
+        let _ = client.out.try_send(route(Message::Control {
             command: kvmshare_protocol::id::control::RECONNECT,
         }));
-        self.clients.lock().unwrap().remove(&id);
-        self.addrs.lock().unwrap().remove(&id);
-        self.seqs.lock().unwrap().remove(&id);
-        self.last_heard.lock().unwrap().remove(&id);
+        // Unregister atomically: the identity check and the removals must
+        // share one `clients` lock acquisition. The removals used to be
+        // separate by-id deletes after a dropped-lock identity check — a
+        // replacement connection that registered in that window was
+        // wiped out by the stale connection's teardown (its fresh
+        // `tcp_ips` entry included), leaving a "connected" client the
+        // cursor stream could never reach.
+        {
+            let mut clients = self.clients.lock().unwrap();
+            match clients.get(&id) {
+                Some(c) if Arc::ptr_eq(c, client) => {
+                    clients.remove(&id);
+                    self.tcp_ips.lock().unwrap().remove(&id);
+                    self.addrs.lock().unwrap().remove(&id);
+                    self.seqs.lock().unwrap().remove(&id);
+                    self.last_heard.lock().unwrap().remove(&id);
+                }
+                _ => {
+                    // Superseded while the farewell messages were being
+                    // queued — the fresh registration owns the id now.
+                    log_debug!("client {}: superseded during teardown — fresh registration wins", client.name);
+                    return;
+                }
+            }
+        }
         if let Some(tx) = &self.events {
             let _ = tx.send(ServerEvent::ClientDisconnected { name: client.name.clone() });
         }
@@ -209,10 +266,16 @@ impl Client {
         // Timed reads: a client that stops sending (sleep, wedge, crash)
         // must be noticed and dropped so the session returns home — see
         // [`CLIENT_SILENT_TIMEOUT`].
-        let addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+        let tcp_peer = stream.peer_addr()?;
+        let addr = tcp_peer.to_string();
         let mut transport = Transport::with_read_timeout(stream, Some(CLIENT_READ_TIMEOUT))?;
-        let (id, machine_id, name, info, admitted) = exchange_hello(&mut transport, &ctx, &addr)?;
+        let (id, machine_id, name, info, admitted) = exchange_hello(&mut transport, &ctx, tcp_peer)?;
         ctx.session.lock().unwrap().update_screen_info(id, info.clone());
+        // The transport identity is now proven: from here the UDP stream
+        // for this id is accepted only from this peer's IP (see
+        // [`ClientCtx::tcp_ips`]). The mapping is recorded *with* the
+        // registration below (one lock scope), so a stale connection's
+        // teardown can never delete it mid-handshake.
 
         // Send Welcome + current layout, then split the transport: the
         // writer keeps the sending half; the reader gets its own lock-
@@ -225,7 +288,7 @@ impl Client {
             own_screen_id: id,
         })?;
         let reader = transport.reader()?;
-        let (out_tx, out_rx) = mpsc::channel::<Outbound>();
+        let (out_tx, out_rx) = mpsc::sync_channel::<Outbound>(OUT_QUEUE_CAP);
         spawn_writer(id, transport, udp, ctx.addrs.clone(), out_rx);
 
         let client = Arc::new(Client {
@@ -247,10 +310,15 @@ impl Client {
         // dead, the writer drops it on the next send.
         {
             let mut clients = ctx.clients.lock().unwrap();
+            // Registration and the UDP-identity mapping land together:
+            // a teardown that runs before this sees no registered client
+            // under this id (its by-id cleanup is harmless), and one that
+            // runs after sees a different Arc and touches nothing.
+            ctx.tcp_ips.lock().unwrap().insert(id, tcp_peer.ip());
             if let Some(old) = clients.insert(id, client.clone()) {
                 log_info!("client {}: replacing stale connection with the same id", old.name);
-                let _ = old.out.send(route(Message::Leave { screen_id: id }));
-                let _ = old.out.send(route(Message::Control {
+                let _ = old.out.try_send(route(Message::Leave { screen_id: id }));
+                let _ = old.out.try_send(route(Message::Control {
                     command: kvmshare_protocol::id::control::DISCONNECT,
                 }));
             }
@@ -282,7 +350,10 @@ impl Client {
             );
             let layout = ctx.layout_snapshot();
             for c in ctx.clients.lock().unwrap().values() {
-                let _ = c.out.send(route(Message::Layout { layout: layout.clone() }));
+                // try_send: a full queue must never block a handshake —
+                // a dropped Layout is refreshed by the next reload or
+                // ScreenInfo exchange.
+                let _ = c.out.try_send(route(Message::Layout { layout: layout.clone() }));
             }
         }
         service_client(client, reader, ctx);
@@ -301,7 +372,7 @@ impl Client {
 fn exchange_hello(
     transport: &mut Transport,
     ctx: &ClientCtx,
-    addr: &str,
+    peer: SocketAddr,
 ) -> io::Result<(u8, String, String, ScreenInfo, bool)> {
     let (machine_id, name, info) = match transport.recv()? {
         RecvResult::Msg(Message::Hello { version, id, name, info }) => {
@@ -345,13 +416,15 @@ fn exchange_hello(
 
     // Only accept connections from the local network (RFC1918 private
     // ranges, loopback, link-local). A bridged/WAN peer is refused
-    // before any layout state is touched.
-    if ctx.policy.lock().unwrap().local_only && !is_local_addr(addr) {
+    // before any layout state is touched. The peer's SocketAddr is used
+    // as-is — parsing "host:port" strings by hand breaks on IPv6
+    // ("[::1]:24800" splits at the first ':'), the typed value cannot.
+    if ctx.policy.lock().unwrap().local_only && !is_local_ip(peer.ip()) {
         let _ = transport.send(&Message::Error {
             code: errors::NOT_LOCAL,
-            text: format!("connection from {addr} refused — only local-network peers are accepted"),
+            text: format!("connection from {peer} refused — only local-network peers are accepted"),
         });
-        return Err(io::Error::other(format!("client {addr} is not on the local network")));
+        return Err(io::Error::other(format!("client {peer} is not on the local network")));
     }
 
     // Allowlist: the name must be in the layout, or the machine id must
@@ -389,22 +462,22 @@ fn exchange_hello(
     Ok((id, machine_id, name, info, admitted))
 }
 
-/// Is `addr` (a `peer_addr()` string, possibly with port) on the local
-/// network? Accepts IPv4 RFC1918 private ranges (10/8, 172.16/12,
-/// 192.168/16), loopback and link-local, plus IPv6 loopback, ULA
-/// (fc00::/7) and link-local (fe80::/10). Anything else is "remote".
-fn is_local_addr(addr: &str) -> bool {
-    let ip = addr.split(':').next().unwrap_or(addr);
-    if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
-        return v4.is_private() || v4.is_loopback() || v4.is_link_local();
+/// Is this IP on the local network? Accepts IPv4 RFC1918 private ranges
+/// (10/8, 172.16/12, 192.168/16), loopback and link-local, plus IPv6
+/// loopback, ULA (fc00::/7) and link-local (fe80::/10). Anything else is
+/// "remote". Note the honest meaning: **private-address**, not provably
+/// same-subnet — a VPN or a routed private network also presents these
+/// ranges (see the trust-model notes in the wire-protocol docs).
+fn is_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80)
+        }
     }
-    if let Ok(v6) = ip.parse::<std::net::Ipv6Addr>() {
-        let octets = v6.octets();
-        return v6.is_loopback()
-            || v6.is_unique_local()
-            || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80);
-    }
-    false
 }
 
 /// The reader thread: services one client's TCP control channel until it

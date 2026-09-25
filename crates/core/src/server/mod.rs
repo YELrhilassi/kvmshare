@@ -48,7 +48,7 @@ mod udp;
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -213,6 +213,11 @@ pub struct Server {
     /// activates a client, so the client's first beacons (which only
     /// flow while it is active) can never be judged late.
     last_heard: Arc<Mutex<HashMap<u8, u64>>>,
+    /// Client id → the IP its TCP handshake came from. The UDP cursor
+    /// stream is accepted only from this IP — the id inside a datagram
+    /// is a client-supplied claim, the handshake's source IP is not
+    /// (see [`ClientCtx::tcp_ips`]).
+    tcp_ips: Arc<Mutex<HashMap<u8, IpAddr>>>,
     /// App-layer control messages (hot reload). `None` disables them.
     /// In a `Mutex` so `Server` stays `Sync` (the channel itself is not).
     control: Mutex<Option<Receiver<Control>>>,
@@ -281,6 +286,7 @@ impl Server {
             udp_addrs: Arc::new(Mutex::new(HashMap::new())),
             udp_seqs: Arc::new(Mutex::new(HashMap::new())),
             last_heard: Arc::new(Mutex::new(HashMap::new())),
+            tcp_ips: Arc::new(Mutex::new(HashMap::new())),
             control: Mutex::new(opts.control),
             policy: Arc::new(Mutex::new(opts.policy)),
             events: Mutex::new(opts.events),
@@ -354,6 +360,7 @@ impl Server {
             addrs: self.udp_addrs.clone(),
             seqs: self.udp_seqs.clone(),
             last_heard: self.last_heard.clone(),
+            tcp_ips: self.tcp_ips.clone(),
             policy: self.policy.clone(), // shared: hot policy changes apply
             events: self.events.lock().unwrap().clone(),
             server_id: self.server_id.clone(),
@@ -365,9 +372,21 @@ impl Server {
                 match stream {
                     Ok(s) => {
                         let addr = s.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
-                        if let Err(e) = Client::spawn(s, ctx_accept.clone(), udp_accept.clone()) {
-                            log_warn!("client {addr}: {e}");
-                        }
+                        let ctx = ctx_accept.clone();
+                        let udp = udp_accept.clone();
+                        // The handshake is network I/O with a read
+                        // timeout: run it on its own thread so one
+                        // slow (or silent, or hostile) peer can never
+                        // stall the accept loop — under the old inline
+                        // path, connections that sent no Hello backed
+                        // up every later client behind their timeout.
+                        // Threads here are short-lived (handshake,
+                        // then the reader takes over) and LAN-scoped.
+                        thread::spawn(move || {
+                            if let Err(e) = Client::spawn(s, ctx, udp) {
+                                log_warn!("client {addr}: {e}");
+                            }
+                        });
                     }
                     Err(e) => log_warn!("accept error: {e}"),
                 }
@@ -602,6 +621,7 @@ impl Server {
         self.udp_addrs.lock().unwrap().remove(&id);
         self.udp_seqs.lock().unwrap().remove(&id);
         self.last_heard.lock().unwrap().remove(&id);
+        self.tcp_ips.lock().unwrap().remove(&id);
 
         // Session first: it decides whether the cursor must come home.
         let action = if remove_screen {
@@ -702,7 +722,10 @@ impl Server {
         let clients = self.clients.lock().unwrap();
         for c in clients.values() {
             let item = client::route(msg.clone());
-            let _ = c.out.send(item);
+            // try_send: a wedged client's full queue must not block the
+            // broadcast (or the main loop) — one dropped frame beats a
+            // stalled input path.
+            let _ = c.out.try_send(item);
         }
         Ok(())
     }

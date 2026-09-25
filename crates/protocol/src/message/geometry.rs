@@ -22,6 +22,13 @@ impl Default for ScreenInfo {
 }
 
 impl ScreenInfo {
+    /// The envelope a wire-supplied ScreenInfo must fit. Dimensions are
+    /// clamped at decode time (a 0 or absurd size would poison edge
+    /// math downstream), and `scale` must be a finite positive number —
+    /// NaN/±Inf arrive here as raw IEEE bits from the wire and are
+    /// rejected outright.
+    pub const MAX_DIMENSION: u32 = 32_768;
+
     pub(crate) fn encode(&self, w: &mut WriteBuf) {
         w.put_u32(self.width);
         w.put_u32(self.height);
@@ -29,11 +36,13 @@ impl ScreenInfo {
     }
 
     pub(crate) fn decode(r: &mut ReadBuf<'_>) -> Result<Self, WireError> {
-        Ok(Self {
-            width: r.get_u32()?,
-            height: r.get_u32()?,
-            scale: f32::from_bits(r.get_u32()?),
-        })
+        let width = r.get_u32()?.min(Self::MAX_DIMENSION).max(1);
+        let height = r.get_u32()?.min(Self::MAX_DIMENSION).max(1);
+        let scale = f32::from_bits(r.get_u32()?);
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(WireError { what: "invalid screen scale (must be finite and positive)" });
+        }
+        Ok(Self { width, height, scale })
     }
 }
 

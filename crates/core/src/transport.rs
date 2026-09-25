@@ -25,7 +25,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use kvmshare_protocol::{id::MAGIC, Frame, Message, HEADER_LEN, LEN_OFFSET};
+use kvmshare_protocol::{id::MAGIC, Frame, Message, HEADER_LEN, LEN_OFFSET, MAX_PAYLOAD};
 
 // Keepalive cadence (see the module docs). The socket may idle for
 // seconds between control messages, so the idle probe must be shorter
@@ -161,6 +161,18 @@ impl Transport {
         let len = u32::from_be_bytes(
             self.read_buf[LEN_OFFSET..HEADER_LEN].try_into().expect("header slice is 4 bytes"),
         ) as usize;
+        // Enforce the payload cap **before** waiting for the body: the
+        // length field arrives first, and a peer that declares 4 GiB
+        // would otherwise have this buffer grow to whatever it keeps
+        // sending (a memory-exhaustion DoS from one header byte pair).
+        // `Frame::decode_from` re-checks this, but only after the bytes
+        // are already here — too late to be the guard.
+        if len > MAX_PAYLOAD as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame payload too large",
+            ));
+        }
         let total = HEADER_LEN + len;
         if self.read_buf.len() < total {
             return Ok(None);
@@ -311,5 +323,39 @@ mod tests {
 
     fn panic(msg: &str) -> ! {
         std::panic::panic_any(msg.to_string())
+    }
+
+    // A length field beyond MAX_PAYLOAD must be refused **before** any
+    // body bytes are buffered: the declared size arrives first, and
+    // buffering toward a 4 GiB claim was a memory-exhaustion DoS. The
+    // error must surface even though the promised body never arrives —
+    // exactly what a real attacker would send.
+    #[test]
+    fn oversized_length_rejected_before_buffering() {
+        let (a, b) = loopback_pair();
+        let mut b = b;
+        let mut t = Transport::with_read_timeout(a, Some(Duration::from_millis(500))).unwrap();
+        // A valid magic + type + flags + len = u32::MAX, and nothing else.
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        header.extend_from_slice(&MAGIC);
+        header.push(0x01); // type (arbitrary)
+        header.push(0x00); // flags
+        header.extend_from_slice(&u32::MAX.to_be_bytes());
+        use std::io::Write;
+        b.write_all(&header).unwrap();
+        b.flush().unwrap();
+        // The header alone is enough to trigger the rejection: recv must
+        // return an error, not sit buffering forever.
+        let res = t.recv();
+        match res {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("too large"),
+                    "expected a payload-size rejection, got: {msg}"
+                );
+            }
+            Ok(other) => panic!("oversized frame header was not rejected: {other:?}"),
+        }
     }
 }

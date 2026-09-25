@@ -36,8 +36,19 @@ pub mod types {
 
 /// Frame flags.
 pub mod flags {
-    /// Payload is compressed (reserved; not used yet).
+    /// Payload is compressed. **Defined but not implemented**: no peer
+    /// sets it, and the decoders reject it so a future implementation
+    /// cannot silently send frames older peers misread as raw payload.
     pub const COMPRESSED: u8 = 0x01;
+
+    /// Every flag bit any decoder accepts today — **none**, while
+    /// compression above is unimplemented. Accepting the COMPRESSED bit
+    /// while every decoder ignores it would let a future sender's
+    /// "payload is transformed" frames be silently decoded as raw
+    /// bytes; rejecting it keeps the semantics honest. When compression
+    /// lands, this becomes `COMPRESSED` and the decoders grow the
+    /// decompress step in the same change.
+    pub const KNOWN: u8 = 0x00;
 }
 
 /// Canonical mouse button ids. The wire always uses these; each platform
