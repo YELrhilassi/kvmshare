@@ -211,7 +211,7 @@ publish: release
 ## time. The generated .syso files are committed, so normal builds don't
 ## need this. Both must be bumped on every release — the installer's
 ## resource is what Explorer's Properties dialog and Add/Remove show.
-winres: VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$tag" ]; then echo "$$tag"; else echo v0.8.8; fi)
+winres: VERSION ?= $(shell tag=$$(git describe --tags --exact-match 2>/dev/null); if [ -n "$$tag" ]; then echo "$$tag"; else echo v0.8.9; fi)
 # The rewrites key on the JSON field names, not the value shape: a
 # dev run writes 0.0.0-dev, which a value-shaped numeric pattern could
 # never match again — the files would stay poisoned until hand-edited.

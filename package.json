@@ -1,6 +1,6 @@
 {
   "name": "kvmshare",
-  "version": "0.8.8",
+  "version": "0.8.9",
   "private": true,
   "description": "Share one keyboard and mouse across your machines. This package only bootstraps the platform installer - the binaries come from the verified GitHub release.",
   "bin": {
