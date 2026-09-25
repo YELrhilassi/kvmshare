@@ -10,8 +10,11 @@ use kvmshare_protocol::message::Message;
 
 use crate::server::client::{enqueue, Client};
 use crate::server::engine::Engine;
+use crate::server::ServerEvent;
 use crate::session::Action;
 use crate::time::now_ms;
+
+use std::sync::mpsc::Sender;
 
 /// Apply a session [`Action`] to the world. A free function so it can
 /// run from the main loop and from the client/UDP threads (which hold
@@ -22,7 +25,11 @@ pub fn apply_action(
     clients: &Arc<Mutex<HashMap<u8, Arc<Client>>>>,
     last_heard: &Mutex<HashMap<u8, u64>>,
     engine: &mut MutexGuard<'_, Box<dyn Engine>>,
+    events: Option<&Sender<ServerEvent>>,
 ) -> io::Result<()> {
+    // Control transitions happen inside the two Switch arms below; the
+    // event goes out when they end.
+    let mut control: Option<bool> = None;
     match action {
         Action::Nothing => {}
         Action::Send(msg) => {
@@ -70,6 +77,7 @@ pub fn apply_action(
             // design did, visibly dashed the cursor to the screen
             // center on every crossing.
             engine.show_local_cursor(false);
+            control = Some(true);
         }
         Action::SwitchToLocal { x, y } => {
             if let Some(old) = active.lock().unwrap().take() {
@@ -83,7 +91,14 @@ pub fn apply_action(
             engine.grab_input(false);
             engine.warp_local(x, y);
             engine.show_local_cursor(true);
+            control = Some(false);
         }
+    }
+    // One event per actual transition, after the world settled. The
+    // channel's receiver is the app's event sink; its loss must never
+    // take the input path down.
+    if let (Some(away), Some(tx)) = (control, events) {
+        let _ = tx.send(ServerEvent::ControlChanged { away });
     }
     Ok(())
 }

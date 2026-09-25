@@ -147,6 +147,7 @@ impl Harness {
             match evt {
                 ServerEvent::ClientConnected { name, .. } => out.push(format!("connected:{name}")),
                 ServerEvent::ClientDisconnected { name } => out.push(format!("disconnected:{name}")),
+                ServerEvent::ControlChanged { away } => out.push(format!("control:{}", if away { "away" } else { "home" })),
             }
         }
         out

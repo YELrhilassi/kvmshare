@@ -119,12 +119,25 @@ func (s *Service) sessionLoop() {
 }
 
 // anyPeerHeard reports whether any live peer has been contacted inside
-// the current TTL window — the "the session found something" signal the
+// its freshness window — the "the session found something" signal the
 // renewal decision needs. Read-only on the peer map.
+//
+// Stale entries do not count: a peer that stopped transmitting ages
+// past its expiry cutoff (see [`expiryCutoff`]), so a dead map can
+// never renew a dead session. The pre-fix code took `len(seen) > 0` —
+// a single entry from minutes ago kept the sessionLoop renewing an
+// empty map forever, which froze the peer list with exactly the stale
+// machine the user was looking at.
 func (s *Service) anyPeerHeard() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.seen) > 0
+	now := time.Now()
+	for id, last := range s.seen {
+		if peer := s.peers[id]; peer != nil && last.After(expiryCutoff(now, peer.Source)) {
+			return true
+		}
+	}
+	return false
 }
 
 // Status is the operator-visible truth about the duty cycle: what the

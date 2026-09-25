@@ -54,6 +54,13 @@ type LiveSnapshot struct {
 	Clients     []ConnectedClient `json:"clients"`
 	Trusted     []string          `json:"trusted"`
 	Revoked     []string          `json:"revoked"`
+	// ControlAway is true while this machine's physical input devices
+	// are grabbed away (driven from another machine). The input pages
+	// gate key recording on it: the recorder cannot hear keys that the
+	// kernel never delivers to this desktop. A merely *connected*
+	// client with control at home does NOT set this — recording works
+	// normally then.
+	ControlAway bool `json:"controlAway"`
 }
 
 // snapshot assembles the current picture. Locking is deliberately
@@ -75,6 +82,7 @@ func (a *App) snapshot() LiveSnapshot {
 		ClientState: a.reconciledClientState(client),
 		Peers:       a.DiscoverPeers(),
 		Clients:     a.ListClients(),
+		ControlAway: controlAway(a.stateDir, server || client),
 	}
 	// The ids this machine trusts, matching the peer map by prefix: the
 	// server trusts what is in its config, the client what is in its

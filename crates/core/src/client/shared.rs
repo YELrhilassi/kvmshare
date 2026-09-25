@@ -46,6 +46,12 @@ pub(crate) struct Shared {
     /// thread on Enter/Leave; read every tick by the motion and UDP
     /// threads.
     pub(crate) active: AtomicBool,
+    /// Control-ownership observer (`Some(true)` on Enter, `Some(false)`
+    /// on Leave) — the app layer persists the transition so the GUI can
+    /// show "this machine is being controlled" truthfully. Fired *after*
+    /// `active` flips, from the TCP thread; must stay cheap (a file
+    /// write at most — never a lock the input path needs).
+    pub(crate) on_control: Option<crate::client::ControlObserver>,
     /// Wake channel for the motion thread: while this machine is not
     /// being controlled the motion thread has no duties at all, so it
     /// blocks on [`Self::wake_cv`] instead of ticking forever. Enter,

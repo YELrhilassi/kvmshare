@@ -217,6 +217,12 @@ async function openEar(
  * as keys are held, the first non-modifier key press completes the
  * chord, Esc cancels.
  *
+ * `onDone` returns whether the chord was **accepted**. Returning false
+ * (a declined chord — validation error, clash, held-only "tap a key
+ * next") keeps the session armed: the next keystroke is still heard.
+ * Returning true (or an absent onDone) ends the capture; the parent
+ * then clears `active`.
+ *
  * One ear is attached — never both, decided before attaching:
  *
  *  - **The backend hook** (Windows): a system-wide WH_KEYBOARD_LL
@@ -240,7 +246,7 @@ async function openEar(
  */
 export function useChordRecorder(
   active: boolean,
-  onDone?: (chord: Chord) => void,
+  onDone?: (chord: Chord) => boolean,
   onCancel?: () => void,
 ): { live: LiveMods; listening: boolean } {
   const [live, setLive] = useState<LiveMods>(NO_MODS);
@@ -262,11 +268,19 @@ export function useChordRecorder(
     // The live modifier state, tracked synchronously (React state lags
     // one render — the blur handler needs it *now*).
     let modsNow: LiveMods = { ...NO_MODS };
-    let settled = false; // one chord per recording session
-    const complete = (mods: LiveMods, hid: number) => {
-      if (settled) return;
-      settled = true;
-      doneRef.current?.({ ...mods, key: hid });
+    // Whether the session is still listening. A completed chord ends
+    // the *capture*, but the page decides what happens next: onDone
+    // returning false means the chord was declined (validation, clash,
+    // held-only "now tap a key") and the session stays armed — the
+    // next keystroke must still be heard. Without this, one declined
+    // chord bricked the recorder until the page was remounted ("it
+    // thinks I released and never reads the next key").
+    let listening = true;
+    const complete = (mods: LiveMods, hid: number): boolean => {
+      if (!listening) return false;
+      const accepted = doneRef.current?.({ ...mods, key: hid }) ?? true;
+      listening = accepted;
+      return accepted;
     };
     const setMods = (mods: LiveMods) => {
       modsNow = mods;
@@ -295,14 +309,14 @@ export function useChordRecorder(
         setMods({ ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey });
       };
       const onKey = (e: KeyboardEvent) => {
-        if (settled) return;
+        if (!listening) return;
         // While recording, suppress everything: no default behavior,
         // no bubbling — a recorded chord is captured, never acted on.
         e.preventDefault();
         e.stopPropagation();
         sync(e);
         if (e.key === "Escape") {
-          settled = true;
+          listening = false;
           cancelRef.current?.();
           return;
         }
@@ -316,7 +330,7 @@ export function useChordRecorder(
         complete(modsNow, hid);
       };
       const onKeyUp = (e: KeyboardEvent) => {
-        if (settled) return;
+        if (!listening) return;
         e.preventDefault();
         e.stopPropagation();
         sync(e);
@@ -338,7 +352,7 @@ export function useChordRecorder(
         }
       };
       const onBlur = () => {
-        if (settled) return;
+        if (!listening) return;
         if (lastKey !== 0) {
           // The OS stole focus mid-chord (Win+Tab's switcher): the
           // chord the user was holding is what they meant.
@@ -366,7 +380,7 @@ export function useChordRecorder(
       const { ear, dispose } = await openEar(
         // hook key: arrives as a canonical HID id already
         (hid, down, mods) => {
-          if (cancelled || settled) return;
+          if (cancelled || !listening) return;
           const liveMods = asLiveMods(mods);
           setMods(liveMods);
           if (!down) {
@@ -390,7 +404,7 @@ export function useChordRecorder(
           lastModOnly = false;
           if (hid === 0x29) {
             // Esc cancels (reserved for returning home).
-            settled = true;
+            listening = false;
             cancelRef.current?.();
             return;
           }
@@ -405,7 +419,7 @@ export function useChordRecorder(
         // unreachable) but never deaf. A dead session cannot fire more
         // events, so there is no double-ear window.
         () => {
-          if (cancelled || settled) return;
+          if (cancelled || !listening) return;
           disposeHook = null;
           setMods(NO_MODS);
           attachDom();

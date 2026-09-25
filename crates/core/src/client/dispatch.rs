@@ -51,6 +51,10 @@ pub(crate) fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, ms
             // Wake the motion thread from its idle wait: control is on
             // this machine now, so steering starts immediately.
             shared.wake_cv.notify_all();
+            // Observability last: the state is already live.
+            if let Some(cb) = &shared.on_control {
+                cb(true);
+            }
             // Report where we are right away so the server's edge
             // state is fresh from the first moment.
             let (x, y) = shared.injector.lock().unwrap().cursor_position();
@@ -67,6 +71,12 @@ pub(crate) fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, ms
             m.probe.leave();
             let mut inj = shared.injector.lock().unwrap();
             inj.leave();
+            drop(m);
+            drop(inj);
+            // Observability last: local input is already restored.
+            if let Some(cb) = &shared.on_control {
+                cb(false);
+            }
         }
         // Buttons, keys and wheel are ordering-critical: the cursor
         // must sit on the command point before the event fires. The

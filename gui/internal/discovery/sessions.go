@@ -32,6 +32,17 @@ const (
 	connectedInterval = 15 * time.Second
 )
 
+// mdnsPeerTTL is how long a peer heard *only* over mDNS stays listed.
+// The mDNS channel cannot keep up the broadcast cadence: the responder
+// announces on its own schedule (role changes, boot), not per session
+// tick, so a live mDNS peer can easily go a minute between contacts
+// while healthy. Expiring it at peerTTL froze such a peer in the list —
+// shown active long after it left, gone the instant it was actually
+// needed. Three broadcast windows (3× peerTTL) rides that cadence out;
+// the broadcast/probe channels keep the tight TTL for everyone they
+// can hear.
+const mdnsPeerTTL = 3 * peerTTL
+
 // listenRetry is how long listenLoop waits before rebuilding its socket
 // after a bind failure (port taken by another app — including another
 // kvmshare instance a previous session left behind). Long enough to let

@@ -174,6 +174,11 @@ export interface LiveSnapshot {
   trusted: string[];
   /** Machine ids this machine refuses (revoked wins over trusted). */
   revoked: string[];
+  /** True while this machine's physical input devices are grabbed away
+   *  (driven from another machine). Written by the role process on
+   *  every crossing; the resting state (control at home) is a missing
+   *  file, so it reads false. */
+  controlAway: boolean;
 }
 
 /** The Wails event object delivered to `Events.On` callbacks. */

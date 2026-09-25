@@ -24,6 +24,11 @@ interface AppContextValue {
   /** Machine ids this machine refuses. Independent of `trusted`; a
    *  revoked id is always refused, even when also trusted. */
   revoked: string[];
+  /** True while this machine's physical keyboard/mouse are grabbed
+   *  away (driven from another machine). Input pages gate recording on
+   *  this — a merely connected client with control at home does not
+   *  set it. */
+  controlAway: boolean;
   /** One-shot re-read after a user action (a response to a click, not polling). */
   refresh: () => Promise<void>;
 }
@@ -43,6 +48,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [peers, setPeers] = useState<Peer[]>([]);
   const [trusted, setTrusted] = useState<string[]>([]);
   const [revoked, setRevoked] = useState<string[]>([]);
+  const [controlAway, setControlAway] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -77,6 +83,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setPeers(s.peers);
       setTrusted(s.trusted ?? []);
       setRevoked(s.revoked ?? []);
+      setControlAway(s.controlAway ?? false);
     });
     void refresh(); // seed before the first event arrives
     return () => {
@@ -99,8 +106,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ mode, clientName, setMode, running, clientState, clients, peers, trusted, revoked, refresh }),
-    [mode, clientName, setMode, running, clientState, clients, peers, trusted, revoked, refresh],
+    () => ({ mode, clientName, setMode, running, clientState, clients, peers, trusted, revoked, controlAway, refresh }),
+    [mode, clientName, setMode, running, clientState, clients, peers, trusted, revoked, controlAway, refresh],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

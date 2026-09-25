@@ -5,6 +5,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"kvmshare/gui/internal/discovery/zeroconf"
 )
 
 // fakeHost records what the engine asks and hands back pairing
@@ -152,6 +154,111 @@ func TestPeersExpireAfterTTL(t *testing.T) {
 	if got := s.List(); len(got) != 0 {
 		t.Fatalf("silent peer must expire: %+v", got)
 	}
+}
+
+// Expiry must run on every read, not only inside Refresh: between
+// sweeps the map is what every UI renders, and a row frozen at its
+// last datagram showed a machine as connected long after it left
+// (the observed "discovery shows a state that is not there").
+func TestListExpiresStalePeersWithoutRefresh(t *testing.T) {
+	s, _ := newTestService(t)
+	from := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 72), Port: Port}
+	beacon, _ := json.Marshal(beaconPayload{ID: "bbbbbbbb11111111", Name: "laptop", Role: "client", Port: 24800, Running: true})
+	s.handleDatagram(beacon, from)
+	if got := s.List(); len(got) != 1 {
+		t.Fatalf("fresh beacon must list: %+v", got)
+	}
+
+	// The peer's machine went away: backdate its last contact. No
+	// Refresh is called — the state loop's List (via DiscoverPeers,
+	// once a second) is the only reader.
+	s.mu.Lock()
+	s.seen["bbbbbbbb11111111"] = time.Now().Add(-peerTTL - time.Second)
+	s.mu.Unlock()
+
+	if got := s.List(); len(got) != 0 {
+		t.Fatalf("stale peer must vanish from a plain List, got: %+v", got)
+	}
+}
+
+// An mDNS-only peer legitimately goes minutes between announcements
+// (the responder announces on its own schedule, not per session tick),
+// so it must outlive the broadcast TTL — expiring it at peerTTL froze
+// live machines out of the list. It still expires at the wider mDNS
+// window, so a machine that closed its GUI cannot linger forever.
+func TestMDNSPeerUsesItsOwnTTL(t *testing.T) {
+	s, _ := newTestService(t)
+
+	entry := zeroconf.NewServiceEntry("kvmshare-bbbbbbbb11111111", serviceType, "local.")
+	entry.Port = 24800
+	entry.AddrIPv4 = []net.IP{net.IPv4(192, 168, 1, 72)}
+	entry.Text = []string{"id=bbbbbbbb11111111", "name=laptop", "role=client", "port=24800", "running=true"}
+	entry.TTL = 3600
+	s.upsertMDNS(entry)
+	if got := s.List(); len(got) != 1 || got[0].Source != SourceMDNS {
+		t.Fatalf("mDNS announcement must list as an mDNS peer: %+v", got)
+	}
+
+	// Past the broadcast TTL but well inside the mDNS window: must stay.
+	s.mu.Lock()
+	s.seen["bbbbbbbb11111111"] = time.Now().Add(-peerTTL - time.Second)
+	s.mu.Unlock()
+	if got := s.List(); len(got) != 1 {
+		t.Fatalf("mDNS peer must outlive the broadcast TTL: %+v", got)
+	}
+
+	// Past the mDNS window: gone.
+	s.mu.Lock()
+	s.seen["bbbbbbbb11111111"] = time.Now().Add(-mdnsPeerTTL - time.Second)
+	s.mu.Unlock()
+	if got := s.List(); len(got) != 0 {
+		t.Fatalf("mDNS peer must expire at the mDNS window: %+v", got)
+	}
+}
+
+// The seeking-session renewal check must read freshness, not map size:
+// a stale entry must let the session end (grounding the engine), a
+// fresh one must renew it. The pre-fix code took len(seen) > 0, so one
+// aged entry renewed a dead session forever — the peer list froze with
+// the stale machine the user was looking at.
+func TestStalePeerCannotRenewSession(t *testing.T) {
+	s, _ := newTestService(t)
+
+	from := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 72), Port: Port}
+	beacon, _ := json.Marshal(beaconPayload{ID: "bbbbbbbb11111111", Name: "laptop", Role: "client", Port: 24800, Running: true})
+	s.handleDatagram(beacon, from)
+
+	// A seeking session whose deadline has passed renews while the
+	// peer is fresh — even though nothing new has arrived.
+	s.sess.mu.Lock()
+	s.sess.state = SessionSeeking
+	s.sess.deadline = time.Now().Add(-time.Second)
+	s.sess.mu.Unlock()
+	go s.sessionLoop()
+	time.Sleep(2500 * time.Millisecond) // > sessionCheckInterval
+	if st := s.Status(); st.State != SessionSeeking.String() {
+		t.Fatalf("fresh peer must renew the seeking session, state = %q", st.State)
+	}
+
+	// The peer goes stale: the next deadline pass must ground the
+	// engine instead of renewing on the stale entry. (sess.mu and the
+	// peer-map mutex are taken one at a time — the sessionLoop holds
+	// sess.mu across its own s.mu read, so nesting them in the reverse
+	// order here could deadlock.)
+	s.mu.Lock()
+	s.seen["bbbbbbbb11111111"] = time.Now().Add(-peerTTL - time.Second)
+	s.mu.Unlock()
+	s.sess.mu.Lock()
+	s.sess.deadline = time.Now().Add(-time.Second)
+	s.sess.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if st := s.Status(); st.State == SessionIdle.String() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("stale peer must not renew the session, state = %q", s.Status().State)
 }
 
 // handlePairing keeps the hint's port (the only source of the

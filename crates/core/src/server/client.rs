@@ -148,6 +148,30 @@ impl ClientCtx {
             return;
         }
         log_info!("client {} disconnected", client.name);
+        // Last words on the way out, in this order:
+        //
+        // 1. `Leave` — restores this client's own input the moment the
+        //    message lands, instead of waiting for its process to end
+        //    (the fresh injector a reconnect builds would do it too,
+        //    but a person sitting at the dropped machine should not
+        //    wait even a second for their keyboard back).
+        // 2. `Control{RECONNECT}` — the client's app loop returns
+        //    SessionEnd::Reconnect for it and re-handshakes immediately
+        //    instead of after its full retry delay (and, on Wi-Fi, ~3 s
+        //    later is often already a different AP). An unattended drop
+        //    must heal itself without the operator watching a stuck
+        //    "connecting…" state. The socket is often dead by now, so
+        //    these sends usually land nowhere; they matter exactly in
+        //    the window where the link is half-alive (a silence timeout
+        //    on a dozing Wi-Fi NIC) — precisely the case where the
+        //    client is *not* already reconnecting on its own.
+        //
+        // The reader thread for this connection ends right after this
+        // (teardown is its tail), so nothing can enqueue behind these.
+        let _ = client.out.send(route(Message::Leave { screen_id: id }));
+        let _ = client.out.send(route(Message::Control {
+            command: kvmshare_protocol::id::control::RECONNECT,
+        }));
         self.clients.lock().unwrap().remove(&id);
         self.addrs.lock().unwrap().remove(&id);
         self.seqs.lock().unwrap().remove(&id);
@@ -165,7 +189,14 @@ impl ClientCtx {
         let action = self.session.lock().unwrap().on_client_disconnected(id);
         if let Action::SwitchToLocal { .. } = action {
             if let Ok(mut engine) = self.engine.lock() {
-                let _ = apply_action(action, &self.active, &self.clients, &self.last_heard, &mut engine);
+                let _ = apply_action(
+                    action,
+                    &self.active,
+                    &self.clients,
+                    &self.last_heard,
+                    &mut engine,
+                    self.events.as_ref(),
+                );
             }
         }
     }

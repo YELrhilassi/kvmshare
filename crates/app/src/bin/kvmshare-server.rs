@@ -156,8 +156,10 @@ fn run() -> Result<(), String> {
     // A killed server's leftover file used to make the GUI claim
     // connections that did not exist; the GUI now also reconciles the
     // file against the server role lock, and this keeps it truthful for
-    // anything that reads it after a graceful stop.
+    // anything that reads it after a graceful stop. Same for the
+    // control-away marker: no server, no grabbed-away devices.
     let _ = std::fs::remove_file(state.join("clients.json"));
+    let _ = std::fs::remove_file(state.join("control.state"));
 
     result.map_err(|e| format!("server: {e}"))
 }
@@ -206,10 +208,37 @@ fn spawn_event_sink(
                 ServerEvent::ClientDisconnected { name } => {
                     clients.remove(&name);
                 }
+                // Control left this machine for a client (or came back):
+                // persist it so the GUI's input pages know whether the
+                // physical devices are grabbed away. The file is written
+                // once per transition — zero cost while nothing moves.
+                ServerEvent::ControlChanged { away } => {
+                    persist_control(&state_dir, away);
+                }
             }
             persist_clients(&state_dir, &clients);
         }
     });
+}
+
+/// Write `<state_dir>/control.state` for a control transition.
+///
+/// A tiny key=value file (same shape as `client.state`): `away=1` while
+/// the cursor is on a client, `away=0` once it is back. Written
+/// atomically (tmp + rename) like every other state file, and removed
+/// on server exit (see run) — a missing file means "not controlled".
+fn persist_control(state_dir: &PathBuf, away: bool) {
+    let path = state_dir.join("control.state");
+    if !away {
+        // Home is the resting state: no file, no reads, no GUI state to
+        // reconcile.
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let tmp = path.with_extension("state.tmp");
+    if std::fs::write(&tmp, "away=1\n").is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// Record a connected client's machine id in the config's trusted list.

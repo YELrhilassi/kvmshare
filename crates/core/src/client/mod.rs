@@ -93,6 +93,12 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// Observer for control-ownership transitions (`true` = this machine
+/// is now being controlled). The app layer persists these to
+/// `control.state` so the GUI knows when the physical devices are
+/// driven from afar; tests pass `None`.
+pub type ControlObserver = Box<dyn Fn(bool) + Send + Sync>;
+
 /// Recover a [`Refusal`] from an `io::Error` that carries one (the
 /// `Client::connect` failure path wraps errors in `io::Error`). The
 /// reconnect loop uses this to tell a policy answer from a network
@@ -186,6 +192,7 @@ impl Client {
         mut injector: Box<dyn Injector>,
         clipboard: Box<dyn Clipboard>,
         outbox: &Receiver<Message>,
+        on_control: Option<ControlObserver>,
     ) -> io::Result<SessionEnd> {
         // Destructure so each field is owned independently — `udp` moves
         // into [`Shared`] while `transport` stays on this thread.
@@ -212,6 +219,7 @@ impl Client {
                 pin_windows: 0,
             }),
             active: AtomicBool::new(false),
+            on_control,
             wake_lock: Mutex::new(()),
             wake_cv: Condvar::new(),
             udp,

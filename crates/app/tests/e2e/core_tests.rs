@@ -8,7 +8,7 @@ fn cursor_enters_moves_and_crosses_back_over_tcp() {
     let h = start_server();
 
     let (client, injector, client_calls, out_rx) = connect_client(h.port);
-    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
     h.wait_for_clients(1);
 
     // -- Cross from pc onto hp (left screen). --
@@ -137,7 +137,7 @@ fn client_reconnect_is_not_deafened_by_stale_udp_sequences() {
     // The real client reconnects (same screen id) and must work normally:
     // beacons from sequence 1 on are fresh and drive the crossing back.
     let (client, injector, client_calls, out_rx) = connect_client(h.port);
-    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
     h.wait_for_clients(1);
 
     // Cross onto hp.
@@ -393,7 +393,7 @@ fn config_hot_reload_returns_cursor_home_and_broadcasts() {
     let h = start_server();
 
     let (client, injector, client_calls, out_rx) = connect_client(h.port);
-    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
     h.wait_for_clients(1);
 
     // Move onto hp, then reload a layout that no longer has hp: the
@@ -451,7 +451,7 @@ fn duplicate_connection_replaces_stale_one_without_losing_the_live_client() {
     // Second connection, same machine name → same screen id. The fresh
     // one replaces the stale registration (the map holds exactly one).
     let (client2, injector2, client_calls2, out_rx2) = connect_client(h.port);
-    let handle2 = thread::spawn(move || client2.run(Box::new(injector2), Box::new(NoClipboard), &out_rx2).unwrap());
+    let handle2 = thread::spawn(move || client2.run(Box::new(injector2), Box::new(NoClipboard), &out_rx2, None).unwrap());
     h.wait_for_clients(1);
     assert_eq!(h.server.client_count(), 1, "duplicate connection must replace, not stack");
 
@@ -564,7 +564,7 @@ fn revoked_machine_is_refused_even_when_named_in_the_layout() {
 fn hot_revoke_disconnects_a_connected_client() {
     let h = start_server();
     let (client, injector, _client_calls, out_rx) = connect_client(h.port);
-    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
     h.wait_for_clients(1);
 
     // Revoke the machine that is connected right now.
@@ -589,7 +589,7 @@ fn hot_revoke_disconnects_a_connected_client() {
 fn server_initiated_disconnect_updates_the_client_list() {
     let h = start_server();
     let (client, injector, _client_calls, out_rx) = connect_client(h.port);
-    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
     h.wait_for_clients(1);
 
     // The operator disconnects the machine from the GUI. The control
@@ -762,4 +762,115 @@ fn operator_disconnect_then_reconnect_is_admitted() {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(server.client_count(), 1, "the reconnect must be admitted");
+}
+
+/// A client whose cursor stream goes silent while it is active (a dozing
+/// Wi-Fi NIC, a wedged motion loop) must be dropped by the beacon
+/// watchdog — and the drop must carry the server's last words on the
+/// wire: `Leave` (restores the client's own input while it still runs)
+/// followed by `Control{RECONNECT}` (its app loop re-handshakes
+/// immediately instead of after the retry delay). A fresh client with
+/// the same name must then be admitted into the same layout slot, and
+/// the GUI's connected list must learn of the drop.
+///
+/// This is the regression behind the mid-use drop on the Wi-Fi laptop:
+/// the session died silently, the GUI kept claiming a connection, and
+/// the reconnect crawled back only on the client's retry timer.
+#[test]
+fn silent_active_client_is_dropped_with_leave_and_reconnect_then_readmitted() {
+    let h = start_server();
+    let info = screen_info();
+
+    // Drive one connection by hand so the exact teardown messages can
+    // be read off the wire (a full Client consumes them internally and
+    // folds them into its SessionEnd).
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", h.port)).unwrap();
+    let mut transport = Transport::with_read_timeout(stream, Some(Duration::from_millis(100))).unwrap();
+    transport
+        .send(&Message::Hello { version: VERSION, id: "machine-hp".into(), name: "hp".into(), info: info.clone() })
+        .unwrap();
+    match transport.recv().unwrap() {
+        RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => assert_eq!(own_screen_id, 1),
+        other => panic!("expected welcome, got {other:?}"),
+    }
+    h.wait_for_clients(1);
+
+    // Register the cursor stream (the client's first datagram), then
+    // cross onto hp: park the real cursor on the left wall (absolute
+    // beacon), push outward (relative motion). The client is now
+    // active — its beacons are what keeps it alive.
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.connect(format!("127.0.0.1:{}", h.port)).unwrap();
+    udp.send(&udp::pack(1, 1, &Message::KeepAlive)).unwrap();
+    thread::sleep(Duration::from_millis(80));
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+    // A couple of in-screen beacons: proof the stream was alive before
+    // it went silent (the watchdog measures silence from the last one).
+    udp.send(&udp::pack(1, 2, &Message::CursorPos { x: 100, y: 100 })).unwrap();
+    thread::sleep(Duration::from_millis(80));
+    udp.send(&udp::pack(1, 3, &Message::CursorPos { x: 120, y: 100 })).unwrap();
+
+    // Now go fully silent on the stream (no more beacons) while the TCP
+    // channel stays connected — the exact mid-use Wi-Fi shape. The
+    // watchdog fires after ACTIVE_BEACON_TIMEOUT; allow generous slack.
+    let mut last_words: Vec<Message> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while std::time::Instant::now() < deadline {
+        match transport.recv().unwrap() {
+            RecvResult::Msg(msg) => match &msg {
+                Message::Leave { .. } | Message::Control { .. } => last_words.push(msg),
+                _ => {} // Enter and friends from the crossing — expected
+            },
+            RecvResult::NoData => {}
+            RecvResult::Eof => break,
+        }
+        if last_words.iter().any(|m| matches!(m, Message::Control { .. })) {
+            break;
+        }
+        // No client-count shortcut here: teardown empties the map as
+        // soon as the messages are enqueued, and breaking on that raced
+        // the Control frame's arrival at the socket.
+    }
+    assert_eq!(
+        last_words.first(),
+        Some(&Message::Leave { screen_id: 1 }),
+        "teardown must restore the dropped client's input first, got {last_words:?}"
+    );
+    assert_eq!(
+        last_words.get(1),
+        Some(&Message::Control { command: kvmshare_protocol::id::control::RECONNECT }),
+        "teardown must command the reconnect, got {last_words:?}"
+    );
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 0, "the silent client must be dropped");
+
+    // The GUI's list must have learned of the drop (the event drives
+    // clients.json).
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        events = h.events();
+        if events.iter().any(|e| e == "disconnected:hp") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(events.iter().any(|e| e == "disconnected:hp"), "GUI must see the drop, got: {events:?}");
+
+    // The machine comes back (reconnect, wake from sleep, fresh start):
+    // admitted into the same slot by the same rule as before.
+    let client = Client::connect(&format!("127.0.0.1:{}", h.port), "hp", "machine-hp", info).unwrap();
+    assert_eq!(client.own_id(), 1, "the fresh session must reuse the layout slot");
+    for _ in 0..100 {
+        if h.server.client_count() >= 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 1, "the fresh client must be admitted");
 }

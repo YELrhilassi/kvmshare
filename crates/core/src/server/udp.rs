@@ -17,13 +17,21 @@ use crate::time::now_ms;
 use crate::udp;
 
 /// How long the active client's cursor stream may go silent before the
-/// server drops it. The client beacons every ~8 ms while active, so this
-/// is generous — a healthy stream can never trip it, and a genuinely
-/// wedged client (its motion loop stuck, even though TCP keepalives
-/// still flow) is caught in about a second. The drop returns control
-/// home instead of leaving the cursor stranded on a client that cannot
-/// move it.
-const ACTIVE_BEACON_TIMEOUT: Duration = Duration::from_millis(1500);
+/// server drops it. The client beacons every ~8 ms while active, so
+/// even 5 s of silence is a genuinely wedged client (its motion loop
+/// stuck while TCP keepalives still flow) — never a normal gap.
+/// The floor is set by radio reality, not by the healthy path: Wi-Fi
+/// power-save can blackhole unicast datagrams for one to two seconds
+/// (an AP buffering frames for a dozing NIC), and a roam (AP to AP on
+/// the same SSID) blacks them out for a few hundred milliseconds to
+/// several seconds while the client keeps beaconing into the void. A
+/// 1.5 s watchdog fired on exactly those events — the session died
+/// *mid-use* whenever the laptop's radio hiccuped, dropping the cursor
+/// home while the user was still moving it. 5 s rides out both; the
+/// cost of the extra window is a wedged client holding an isolated
+/// local machine a few seconds longer before the escape-key/teardown
+/// paths (which already existed) recover it.
+const ACTIVE_BEACON_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// The UDP socket's read timeout: the receiver blocks in `recv_from` and
 /// the OS wakes it at this cadence when the stream is idle, purely so
@@ -75,7 +83,14 @@ fn check_active_beacon_staleness(ctx: &ClientCtx) {
             let action = ctx.session.lock().unwrap().on_client_disconnected(id);
             if let Action::SwitchToLocal { .. } = action {
                 if let Ok(mut engine) = ctx.engine.lock() {
-                    let _ = apply_action(action, &ctx.active, &ctx.clients, &ctx.last_heard, &mut engine);
+                    let _ = apply_action(
+                        action,
+                        &ctx.active,
+                        &ctx.clients,
+                        &ctx.last_heard,
+                        &mut engine,
+                        ctx.events.as_ref(),
+                    );
                 }
             }
         }
@@ -153,9 +168,14 @@ pub fn udp_receiver(udp: Arc<std::net::UdpSocket>, ctx: Arc<ClientCtx>) {
                         if !actions.is_empty() {
                             if let Ok(mut engine) = ctx.engine.lock() {
                                 for a in actions {
-                                    if let Err(e) =
-                                        apply_action(a, &ctx.active, &ctx.clients, &ctx.last_heard, &mut engine)
-                                    {
+                                    if let Err(e) = apply_action(
+                                        a,
+                                        &ctx.active,
+                                        &ctx.clients,
+                                        &ctx.last_heard,
+                                        &mut engine,
+                                        ctx.events.as_ref(),
+                                    ) {
                                         log_warn!("beacon crossing for client {}: {e}", d.id);
                                     }
                                 }

@@ -59,6 +59,7 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf16"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 
@@ -189,19 +190,59 @@ func SweepDebugTasks() {
 	}
 }
 
-// AdminUser reports whether the current user holds Administrators
-// membership on its (possibly filtered) token — the predictor for
+// TOKEN_ELEVATION_TYPE values (winnt.h). The class tells an
+// unelevated process what kind of token it holds:
+//
+//	default (1)  UAC not applicable — a standard user
+//	full    (2)  an actually-elevated token (also UAC-disabled admins)
+//	limited (3)  the filtered half of a split token — an admin
+//
+// "Limited" is precisely the common case the GUI runs in: a real
+// administrator whose UAC-filtered token cannot pass the group checks
+// a full token would, but whose full token a task creation (via the
+// Task Scheduler's own consent) can still reach — no UAC prompt.
+const (
+	tokenElevationTypeDefault = 1
+	tokenElevationTypeFull    = 2
+	tokenElevationTypeLimited = 3
+)
+
+// AdminUser reports whether the current user can have a
+// HighestAvailable scheduled task created for them — the predictor for
 // whether an elevation-task creation attempt can succeed at all.
+//
+// The subtle part: the GUI runs with a UAC-filtered token, and the
+// filtered token's Administrators group is deny-only, so a naive group
+// membership check answers "no" for exactly the common case (a real
+// administrator running unelevated). The elevation *type* carries the
+// truth: Limited means a full admin token exists behind the filtered
+// one. A standard user reports Default; an elevated process already
+// returned via IsElevated.
 func AdminUser() bool {
 	if IsElevated() {
 		return true
 	}
-	admin, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	var et uint32
+	var ret uint32
+	err := windows.GetTokenInformation(
+		windows.GetCurrentProcessToken(),
+		windows.TokenElevationType,
+		(*byte)(unsafe.Pointer(&et)),
+		uint32(unsafe.Sizeof(et)),
+		&ret,
+	)
 	if err != nil {
-		return false
+		// Token info refused (very old Windows, hardened policy): fall
+		// back to the group check — it errs toward "not an admin", which
+		// merely keeps the tasks from self-healing, never breaks them.
+		admin, sidErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+		if sidErr != nil {
+			return false
+		}
+		member, memberErr := windows.GetCurrentProcessToken().IsMember(admin)
+		return memberErr == nil && member
 	}
-	member, err := windows.GetCurrentProcessToken().IsMember(admin)
-	return err == nil && member
+	return et == tokenElevationTypeLimited || et == tokenElevationTypeFull
 }
 
 // schtasks runs one schtasks verb without flashing a console window

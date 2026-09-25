@@ -141,7 +141,24 @@ fn run() -> Result<(), String> {
                 // the core run loop handles clipboard upload and
                 // keepalives itself.
                 let (_out_tx, out_rx) = mpsc::channel::<Message>();
-                match client.run(injector, clipboard, &out_rx) {
+                // Control-ownership transitions land in control.state:
+                // away=1 while the server drives this machine's devices,
+                // gone when control is back. The GUI reads it to gate
+                // key recording and show "being controlled" truthfully.
+                let state_for_control = state_dir.clone();
+                let on_control: kvmshare_core::client::ControlObserver =
+                    Box::new(move |controlled| {
+                        let path = state_for_control.join("control.state");
+                        if controlled {
+                            let tmp = path.with_extension("state.tmp");
+                            if std::fs::write(&tmp, "controlled=1\n").is_ok() {
+                                let _ = std::fs::rename(&tmp, &path);
+                            }
+                        } else {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    });
+                match client.run(injector, clipboard, &out_rx, Some(on_control)) {
                     // The server told us to disconnect: do not reconnect.
                     // The operator starts the client again when wanted.
                     Ok(SessionEnd::Disconnected) => {

@@ -162,6 +162,14 @@ pub enum ServerEvent {
         info: ScreenInfo,
     },
     ClientDisconnected { name: String },
+    /// The cursor moved between this machine and a client (`away=true`
+    /// when control left for the client). The app layer turns this into
+    /// a `control.state` file the GUI reads: the keyboard's bindable
+    /// shortcuts and the chord recorder are deaf while the physical
+    /// devices are grabbed away, and the UI must say so — but only
+    /// then. A merely *connected* client with control at home blocks
+    /// nothing.
+    ControlChanged { away: bool },
 }
 
 /// Everything the app layer can configure when binding a server.
@@ -574,19 +582,22 @@ impl Server {
         };
         log_info!("disconnecting client {name}: {why}");
 
-        // Tell the client to end its session (stays stopped) and leave
-        // the desktop. Either command may hit a dead socket — the writer
+        // Tell the client to end this session cleanly, in this order:
+        // `Leave` first (restores its local input while it is still
+        // running), then the `disconnect` command (ends the client
+        // process for good — the operator asked for a stop, not a
+        // reconnect). The reverse order used to land the commands
+        // back-to-back on one queue: the client saw `disconnect` first,
+        // exited, and only its *process teardown* released the input
+        // hooks — a full second of dead keyboard after every operator
+        // disconnect. Either command may hit a dead socket — the writer
         // drops those.
+        client::enqueue(&self.clients, id, Message::Leave { screen_id: id });
         client::enqueue(
             &self.clients,
             id,
             Message::Control { command: kvmshare_protocol::id::control::DISCONNECT },
         );
-        client::enqueue(&self.clients, id, Message::Leave { screen_id: id });
-
-        // The reader thread for this connection ends when its socket
-        // closes (or on these commands); teardown is identity-checked and
-        // idempotent, so its later cleanup is a no-op from here on.
         self.clients.lock().unwrap().remove(&id);
         self.udp_addrs.lock().unwrap().remove(&id);
         self.udp_seqs.lock().unwrap().remove(&id);
@@ -608,7 +619,8 @@ impl Server {
             let engine = self.engine.lock().unwrap().clone();
             if let Some(engine) = engine {
                 if let Ok(mut engine) = engine.lock() {
-                    let _ = apply_action(action, &self.active, &self.clients, &self.last_heard, &mut engine);
+                    let events = self.events.lock().unwrap().clone();
+                    let _ = apply_action(action, &self.active, &self.clients, &self.last_heard, &mut engine, events.as_ref());
                 }
             }
         }
@@ -697,6 +709,7 @@ impl Server {
 
     /// Apply a session [`Action`] to the world.
     fn execute(&self, action: Action, engine: &mut MutexGuard<'_, Box<dyn Engine>>) -> io::Result<()> {
-        apply_action(action, &self.active, &self.clients, &self.last_heard, engine)
+        let events = self.events.lock().unwrap().clone();
+        apply_action(action, &self.active, &self.clients, &self.last_heard, engine, events.as_ref())
     }
 }

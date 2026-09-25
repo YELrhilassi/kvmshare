@@ -142,7 +142,7 @@ fn client_handshakes_and_applies_messages() {
     let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     assert_eq!(client.own_id(), 7);
     let (_tx, rx) = mpsc::channel::<Message>();
-    client.run(Box::new(injector), Box::new(NoClipboard), &rx).unwrap();
+    client.run(Box::new(injector), Box::new(NoClipboard), &rx, None).unwrap();
 
     let calls = calls_handle.lock().unwrap().clone();
     assert!(calls.contains(&"move 100,200".to_string()));
@@ -205,7 +205,7 @@ fn resolution_change_is_reported() {
     // Run the client on its own thread and simulate a display scale
     // change while it is running.
     let client_thread =
-        thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx).unwrap());
+        thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
     thread::sleep(Duration::from_millis(200));
     *info_handle.lock().unwrap() = ScreenInfo { width: 3840, height: 2160, scale: 2.0 };
 
@@ -273,7 +273,7 @@ fn udp_motion_stream_reaches_the_command_exactly_and_dedupes() {
     let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     let (_tx, rx) = mpsc::channel::<Message>();
     // The fake server closes the TCP side after ~310ms; run until EOF.
-    let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
+    let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx, None);
     let _ = calls;
 
     let calls = calls_handle.lock().unwrap().clone();
@@ -347,7 +347,7 @@ fn absolute_backends_land_exactly_on_the_command_via_tick_placement() {
     let pos_handle = injector.pos.clone();
     let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     let (_tx, rx) = mpsc::channel::<Message>();
-    let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
+    let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx, None);
 
     let calls = calls_handle.lock().unwrap().clone();
     // Nothing is injected per datagram — the tick places the whole
@@ -396,7 +396,7 @@ fn secure_desktop_ends_the_session() {
     let (_tx, rx) = mpsc::channel::<Message>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let client_thread = thread::spawn(move || {
-        let r = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
+        let r = client.run(Box::new(injector), Box::new(NoClipboard), &rx, None);
         let _ = done_tx.send(());
         r
     });
@@ -451,7 +451,7 @@ fn button_wheel_and_key_are_injected_in_order_on_the_motion_thread() {
     let calls_handle = injector.calls.clone();
     let client = Client::connect(&format!("127.0.0.1:{port}"), "test", "machine-test", injector.screen_info()).unwrap();
     let (_tx, rx) = mpsc::channel::<Message>();
-    let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx);
+    let _ = client.run(Box::new(injector), Box::new(NoClipboard), &rx, None);
 
     let calls = calls_handle.lock().unwrap().clone();
     // The button/key events execute in wire order, interleaved with the

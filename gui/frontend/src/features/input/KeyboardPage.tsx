@@ -114,7 +114,7 @@ function ActionCard({ spec, binding, recording, live, disabled, onRecord, onCanc
 }
 
 export default function KeyboardPage() {
-  const { mode, running, clientState, clients } = useApp();
+  const { controlAway } = useApp();
   const [config, setConfig] = useState<LayoutConfig | null>(null);
   const [loadErr, setLoadErr] = useState("");
   const [err, setErr] = useState("");
@@ -165,16 +165,18 @@ export default function KeyboardPage() {
     recording,
     // onDone: a completed chord while a card records. Fires on any
     // bindable key; validation decides whether it becomes a binding.
-    (chord: Chord) => {
+    // Returns false for a declined chord — the recorder stays armed so
+    // the retry is one keystroke away (no re-click on Record).
+    (chord: Chord): boolean => {
       const action = recordingFor;
-      if (!action || !config) return;
+      if (!action || !config) return false;
       // A held-only recording (modifiers pressed and released with no
       // plain key) arrives as key 0: ask for the plain key and keep
       // recording — the session stays armed, so the next chord is one
       // keystroke away.
       if (chord.key === 0) {
         setErr("Now tap the key to finish the chord — e.g. hold Super, then tap Tab.");
-        return;
+        return false;
       }
       // A binding must carry a modifier unless the key is app-meaningless
       // bare (Scroll Lock, Pause, F13–F24) — the same rule the engine's
@@ -185,14 +187,13 @@ export default function KeyboardPage() {
       const hasMods = chord.ctrl || chord.alt || chord.shift || chord.meta;
       if (!hasMods && !bareSafeKey(chord.key)) {
         setErr("That chord needs a modifier (Ctrl/Alt/Shift/Super) — a bare key like that is used by every app and would be swallowed.");
-        return;
+        return false;
       }
-      setRecordingFor(null);
       // Esc is reserved for returning home (the recorder also treats it
       // as cancel — this is the belt-and-braces guard).
       if (chord.key === 0x29) {
         setErr("Esc is reserved for returning home — pick another key.");
-        return;
+        return false;
       }
       // Refuse a chord another action already holds: two actions on one
       // key can both fire, and which one wins would be a mystery.
@@ -203,8 +204,9 @@ export default function KeyboardPage() {
       );
       if (clash) {
         setErr(`${titleOf(clash, actions)} already uses that chord — clear it first.`);
-        return;
+        return false;
       }
+      setRecordingFor(null);
       const sep = action.indexOf(":");
       const binding: Binding = {
         mods: { ctrl: chord.ctrl, alt: chord.alt, shift: chord.shift, meta: chord.meta },
@@ -216,6 +218,7 @@ export default function KeyboardPage() {
       // The save writes only bindable bindings — the file heals.
       const rest = bindings.filter((b) => actionIdOf(b) !== action);
       void save({ shortcuts: { ...shortcuts, bindings: [...rest, binding] } });
+      return true;
     },
     // onCancel: Esc while a card records.
     () => setRecordingFor(null),
@@ -254,8 +257,10 @@ export default function KeyboardPage() {
   // While control is away on another machine the physical devices are
   // kernel-isolated: the webview sees no keys at all, so a recording
   // started now would never complete — tell the user instead of arming
-  // a recorder that cannot hear them.
-  const sessionLive = mode === "server" ? clients.length > 0 : clientState.status === "connected" && running.client;
+  // a recorder that cannot hear them. The signal is the real control
+  // ownership (a crossing that grabbed the devices), NOT "a client is
+  // connected": a connected client with control at home blocks nothing.
+  const devicesGrabbedAway = controlAway;
 
   return (
     <div className="h-full overflow-y-auto">
@@ -296,15 +301,15 @@ export default function KeyboardPage() {
                 />
               ))}
             </div>
-            {recording && !sessionLive && (
+            {recording && !devicesGrabbedAway && (
               <p className="mt-3 text-xs text-primary/80">
                 Hold modifiers, then tap the key — the chord is captured before the OS acts on it, so native bindings
                 like Win+Tab will not fire while recording. Esc cancels.
               </p>
             )}
-            {recording && sessionLive && (
+            {recording && devicesGrabbedAway && (
               <p className="mt-3 text-xs text-amber-500">
-                Recording needs local control — stop the session or bring the cursor home first.
+                Recording needs local control — bring the cursor back to this machine first.
               </p>
             )}
           </div>

@@ -29,19 +29,43 @@ func (s *Service) upsertBeacon(bp beaconPayload, from *net.UDPAddr) {
 	s.mu.Unlock()
 }
 
-// expire drops peers that went silent (their beacons, probe replies or
-// mDNS announcements stopped). Every channel stamps `seen` on every
-// contact, so a live peer keeps refreshing it and a dead one ages out
-// after peerTTL — regardless of which channel first discovered it. The
-// mDNS library delivers announcements but never tells us when a service
-// disappears, so leaving mDNS peers unaged would let a machine that
-// closed its GUI linger forever.
+// expiryCutoff is the per-peer freshness deadline: the longest silence
+// this peer's own channel can produce while healthy. Broadcast and
+// probe peers re-stamp `seen` on every contact (beacons every 2 s), so
+// peerTTL is generous for them. An mDNS-only peer is stamped only when
+// its responder announces — minutes apart while healthy — so its
+// silence window is the wider one (see mdnsPeerTTL). Everything else
+// in the file uses wall-clock reads; this helper keeps the choice in
+// one place.
+func expiryCutoff(now time.Time, source string) time.Time {
+	ttl := peerTTL
+	if source == SourceMDNS {
+		ttl = mdnsPeerTTL
+	}
+	return now.Add(-ttl)
+}
+
+// expire drops peers that went silent. Every channel stamps `seen` on
+// every contact, so a live peer keeps refreshing it and a dead one ages
+// out — regardless of which channel first discovered it. The mDNS
+// library delivers announcements but never tells us when a service
+// disappears, so mDNS peers age out too (their wider window; see
+// [`mdnsPeerTTL`]).
+//
+// It runs on every read as well as on the sweep: expiry is what keeps
+// the list *true*, and List is exactly where a stale row is about to
+// be shown or acted on. The old design only expired inside Refresh —
+// between sweeps the map (and every UI built from it) showed machines
+// as they were when their last datagram landed, not as they are. That
+// is the observed "discovery shows a machine as connected that is
+// not": the row sits frozen while the map's only reaper waits for a
+// button press.
 func (s *Service) expire() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cutoff := time.Now().Add(-peerTTL)
+	cutoff := time.Now()
 	for id := range s.peers {
-		if last, ok := s.seen[id]; ok && last.Before(cutoff) {
+		if last, ok := s.seen[id]; ok && last.Before(expiryCutoff(cutoff, s.peers[id].Source)) {
 			delete(s.peers, id)
 			delete(s.seen, id)
 		}
