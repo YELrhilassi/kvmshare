@@ -131,6 +131,41 @@ type screenFile struct {
 
 // LoadConfig returns the current layout. When no config exists yet it
 // returns a sensible default (a two-machine desktop) without writing.
+// loadConfigCached is LoadConfig with a mtime+size-keyed cache, for
+// the per-second state loop: the file is re-read only when it changed
+// (or the cache is cold), so a tick costs one stat call, not a full
+// TOML parse. Any writer (SaveConfig, a manual edit) bumps the mtime
+// and is picked up on the next tick. Errors are cached too — a missing
+// file does not turn every tick into a syscall round trip.
+func (a *App) loadConfigCached() (Config, error) {
+	var key string
+	if fi, err := os.Stat(a.configPath); err == nil {
+		key = fmt.Sprintf("%d|%d", fi.ModTime().UnixNano(), fi.Size())
+	} else {
+		key = "missing"
+	}
+
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+	if a.cfgHave && a.cfgKey == key {
+		if a.cfgMissing {
+			return defaultConfig(), nil
+		}
+		return a.cfgCached, nil
+	}
+	cfg, err := a.LoadConfig()
+	if err != nil {
+		// Do not cache unexpected errors (disk trouble, a torn write):
+		// the next tick may see a complete file.
+		return Config{}, err
+	}
+	a.cfgHave = true
+	a.cfgKey = key
+	a.cfgMissing = key == "missing"
+	a.cfgCached = cfg
+	return cfg, nil
+}
+
 func (a *App) LoadConfig() (Config, error) {
 	raw, err := os.ReadFile(a.configPath)
 	if err != nil {

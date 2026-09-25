@@ -88,7 +88,11 @@ func (a *App) snapshot() LiveSnapshot {
 	// server trusts what is in its config, the client what is in its
 	// settings (the Rust side uses the same lists).
 	if mode == ModeServer {
-		if cfg, err := a.LoadConfig(); err == nil {
+		// Cached (mtime-keyed): this runs every second, and a full TOML
+		// re-read per tick was measurable CPU for almost-never-changing
+		// data. Edits (GUI or manual) change the mtime and are visible
+		// on the next tick.
+		if cfg, err := a.loadConfigCached(); err == nil {
 			snap.Trusted = nonNilStrings(cfg.Network.TrustedIDs)
 			snap.Revoked = nonNilStrings(cfg.Network.RevokedIDs)
 		}

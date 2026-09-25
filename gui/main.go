@@ -12,6 +12,17 @@
 // machine's role processes are independent of the GUI entirely — quit
 // the GUI and they keep running; reopen and the GUI adopts them (the
 // role locks in the Rust binaries enforce one instance per role).
+//
+// Process-shape note (what Task Manager shows): the GUI is one process
+// plus the WebView2 runtime's own helper processes (browser-process
+// model — network, GPU and renderer helpers on Windows; a WebKit
+// network+web process pair on Linux). Those children are the webview
+// engine, not extra kvmshare instances, and they live and die with the
+// GUI. Killing kvmshare-gui therefore also removes its tray icon — the
+// tray item is drawn *by* the GUI process. This is deliberate coupling,
+// not a leak: the KVM session (server/client role processes) survives
+// the GUI, so a killed GUI never strands a live cross-machine session;
+// relaunching the GUI re-adopts the roles and re-creates the icon.
 package main
 
 import (

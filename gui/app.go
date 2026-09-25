@@ -73,6 +73,18 @@ type App struct {
 	stateMu   sync.Mutex
 	lastState string
 	stateOnce sync.Once
+
+	// Config cache for the state loop: snapshot() needs the trusted /
+	// revoked id lists every tick, and re-reading + re-parsing the TOML
+	// every second was measurable CPU for data that almost never
+	// changes. The cache is keyed on the file's mtime+size, so an edit
+	// (through the GUI or by hand) is picked up on the next tick — the
+	// cache can never serve stale policy for longer than one second.
+	cfgMu      sync.Mutex
+	cfgCached  Config
+	cfgHave    bool
+	cfgMissing bool // cached "no config file" answer
+	cfgKey     string
 }
 
 // NewApp locates every file the GUI needs.

@@ -222,8 +222,14 @@ func setupTray(app *application.App, core *App, win *application.WebviewWindow) 
 
 	// Keep the tray in sync with state changes that happen anywhere —
 	// this window, a previous GUI instance, or a binary started by hand.
+	// Two seconds, not one: the tick only re-renders a *changed* label
+	// (state is compared first), so the cadence trades sub-second
+	// precision nobody can perceive in a tray tooltip for half the
+	// idle wakeups on a laptop. The state loop (1 s) already pushes
+	// real transitions to the frontend; this ticker is a belt-and-
+	// braces backstop for changes that bypass it.
 	go func() {
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			t.refresh()
