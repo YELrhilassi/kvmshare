@@ -1,0 +1,20 @@
+{
+  "name": "kvmshare",
+  "version": "0.8.7",
+  "private": true,
+  "description": "Share one keyboard and mouse across your machines. This package only bootstraps the platform installer - the binaries come from the verified GitHub release.",
+  "bin": {
+    "kvmshare": "packaging/npm/kvmshare.js"
+  },
+  "files": [
+    "packaging"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YELrhilassi/kvmshare.git"
+  },
+  "license": "MIT"
+}

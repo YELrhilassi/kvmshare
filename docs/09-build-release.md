@@ -115,6 +115,63 @@ the new version.
 - `packaging/99-kvmshare-input.rules` — reference udev rule (see §9.2).
 - `packaging/kvmshare.desktop` — the application launcher
   (`Exec=kvmshare-gui`, `Categories=Utility;Network;`).
+- `packaging/install.sh` / `packaging/install.ps1` / `packaging/npm/kvmshare.js`
+  — the terminal bootstrap scripts (see §9.7); shipped into `dist/` and
+  the release by `make release`.
+
+## 9.7 Terminal one-liners (the unsigned-binary path)
+
+The one-line installs, per platform:
+
+```sh
+# Linux / macOS / WSL (sh, bash, zsh; curl or wget)
+curl -fsSL https://github.com/YELrhilassi/kvmshare/releases/latest/download/install.sh | sh
+```
+
+```powershell
+# Windows PowerShell (5.1+ or 7+)
+irm https://github.com/YELrhilassi/kvmshare/releases/latest/download/install.ps1 | iex
+```
+
+```text
+# Anywhere Node 18+ runs (also Windows without curl)
+npx github:YELrhilassi/kvmshare
+```
+
+All three are **bootstrap** scripts: resolve the latest release tag,
+download the platform's standalone `kvmshare-install` binary, verify its
+sha256 against the release's `SHA256SUMS`, then hand off. The Go
+installer downloads the platform archive, verifies it the same way,
+applies binaries atomically (rename-based, safe over a running copy),
+and performs the desktop integration (udev input access on Linux;
+shortcuts, elevation tasks and firewall rules on Windows). Pin a
+version: `sh install.sh v0.8.7`, `install.ps1 -Tag v0.8.7`,
+`npx github:YELrhilassi/kvmshare v0.8.7`. Forks: set `KVMSHARE_UPSTREAM`.
+
+Why this channel exists — and why it is the honest answer to unsigned
+executables:
+
+- **Windows SmartScreen** blocks unsigned exes downloaded through a
+  browser, because such files carry Mark-of-the-Web. Files written by a
+  script/terminal get no MOTW, so SmartScreen is never in the loop; the
+  PowerShell script additionally runs `Unblock-File` on the staged
+  binary.
+- **macOS Gatekeeper** quarantines browser downloads; terminal-created
+  files are not quarantined, so the verified binary runs without the
+  "cannot be opened" wall.
+- **Nothing is unverified**: both stages (bootstrap and Go installer)
+  check sha256 against the release's `SHA256SUMS` before executing, and
+  mismatch aborts with the two hashes printed. What the script path
+  skips is the *OS UI wall for unsigned code*, not the integrity check.
+- This is the same trust decision as any `curl | sh` tool: the channel
+  is HTTPS to the release you named (or `latest`), and the checksum is
+  fetched from that same release. A code-signing certificate is the
+  longer-term fix; until the project signs releases, these scripts are
+  the no-clicks path.
+
+`--uninstall` works the same way (`sh install.sh --uninstall`,
+`install.ps1 -Uninstall` passes through, `npx ... -- --uninstall`) and
+removes binaries, manifest and desktop integration.
 
 ---
 

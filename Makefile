@@ -158,10 +158,16 @@ release: winres
 	tar -C dist -czf dist/kvmshare_$(VERSION)_linux_amd64.tar.gz kvmshare_$(VERSION)_linux_amd64
 	cp gui/kvmshare-install dist/kvmshare-install_$(VERSION)_linux_amd64
 	cp gui/kvmshare-installer dist/kvmshare-installer_$(VERSION)_linux_amd64
+	@# The terminal one-liners (docs §9.7) resolve the standalone
+	@# installer asset for their platform and verify it against
+	@# SHA256SUMS before handing off — it is the trust anchor of the
+	@# curl/irm/npx path. Assets exist for the platforms actually built
+	@# here (linux_amd64, windows_amd64 when mingw is present); the
+	@# scripts error clearly on anything else.
 	@# Sanity gate: a fresh Windows role binary must carry this
 	@# release's build banner. A silent cargo failure used to leave
 	@# the previous build's exe in the dist dir and ship it.
-	@if [ -n "$(MINGW)" ]; then \
+	@	if [ -n "$(MINGW)" ]; then \
 		echo "mingw-w64 found — building Windows binaries"; \
 		$(CARGO) build --release --target $(WIN_TARGET) || exit 1; \
 		cp target/$(WIN_TARGET)/release/kvmshare-server.exe target/$(WIN_TARGET)/release/kvmshare-client.exe gui/kvmshare-gui.exe gui/kvmshare-install.exe gui/kvmshare-installer.exe dist/kvmshare_$(VERSION)_windows_amd64/ || exit 1; \
@@ -173,6 +179,9 @@ release: winres
 		echo "note: x86_64-w64-mingw32-gcc not found — Windows server/client binaries omitted (install mingw-w64, then make release includes them)"; \
 		rm -rf dist/kvmshare_$(VERSION)_windows_amd64; \
 	fi
+	@# Terminal bootstrap scripts (sh / PowerShell / npx) — see docs §9.7.
+	cp packaging/install.sh packaging/install.ps1 dist/
+	cp packaging/npm/kvmshare.js dist/kvmshare-npm-bootstrap.js
 	cd dist && for f in *; do [ -f "$$f" ] && [ "$$f" != SHA256SUMS ] && sha256sum "$$f"; done > SHA256SUMS
 	@echo "release $(VERSION) -> dist/"
 	@ls -lh dist/
@@ -190,9 +199,10 @@ publish: release
 		dist/kvmshare-install_$(VERSION)_linux_amd64 \
 		dist/kvmshare-installer_$(VERSION)_linux_amd64 \
 		$(if $(MINGW),dist/kvmshare_$(VERSION)_windows_amd64.zip dist/kvmshare-install_$(VERSION)_windows_amd64.exe dist/kvmshare-installer_$(VERSION)_windows_amd64.exe) \
+		dist/install.sh dist/install.ps1 dist/kvmshare-npm-bootstrap.js \
 		dist/SHA256SUMS \
 		--title "kvmshare $(VERSION)" \
-		--notes "Portable kvmshare release. Download the installer for your platform (or the full archive) and run it — it fetches and verifies everything itself."
+		--notes "Portable kvmshare release. Install from a terminal: curl -fsSL <release>/install.sh | sh (Linux/macOS), irm <release>/install.ps1 | iex (Windows), or npx github:YELrhilassi/kvmshare. The GUI installer and full archives are below."
 	@echo "published $(VERSION): https://github.com/YELrhilassi/kvmshare/releases/tag/$(VERSION)"
 
 ## Regenerate the Windows icon/version resources (gui/rsrc_windows_amd64.syso
