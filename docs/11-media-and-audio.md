@@ -251,8 +251,19 @@ working untouched and an upgrade never changes behaviour by surprise.
 |---|---|---|
 | Media injection | XF86 media keysym (XTest) | `VK_MEDIA_*` / `VK_VOLUME_*` via `SendInput` |
 | Capture | `parec` on the default sink's monitor (works on PulseAudio and PipeWire) | WASAPI loopback capture |
-| Playback | `pacat` to the default sink | WASAPI render |
+| Playback | `pacat` to the configured/default sink | WASAPI render (also via `AUTOCONVERTPCM`, so a device running at 44.1 kHz still takes the negotiated 48 kHz stream) |
 | Device listing | `pactl` | WASAPI enumerator |
+
+**One dependency worth knowing about.** Every Win32 call in
+`kvmshare-platform` uses the raw `windows-sys` bindings — except the
+audio backend, which needs the `windows` crate. That is not a
+preference: WASAPI is a COM API (`IMMDeviceEnumerator`, `IAudioClient`,
+`IAudioCaptureClient`, `IAudioRenderClient`) and `windows-sys` ships no
+COM interfaces at all, so the alternatives were hand-rolling four
+objects' worth of vtables — hundreds of lines of unsafe code that cannot
+be exercised off Windows — or the component bindings. The dependency is
+confined to the Windows target and to `platform::audio::windows`, so the
+rest of the crate keeps the raw bindings it already had.
 
 macOS is not implemented. The seams it needs are `Injector::media`, the
 `AudioCapture`/`AudioPlayback` traits, and one mapping table; nothing in

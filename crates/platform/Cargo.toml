@@ -16,6 +16,28 @@ arboard = "3.4"
 evdev = "0.13"
 libc = "0.2"
 [target.'cfg(windows)'.dependencies]
+# The full `windows` crate, alongside the raw `windows-sys` bindings
+# below — used **only** for audio. WASAPI is a COM API
+# (`IMMDeviceEnumerator`, `IAudioClient`, `IAudioCaptureClient`,
+# `IAudioRenderClient`), and `windows-sys` ships none of those
+# interfaces: hand-rolling the vtables for four COM objects would be a
+# few hundred lines of delicate unsafe code with no way to test it on
+# this host. The component bindings cost a dependency but make the
+# backend reviewable, and the dependency is confined to this target and
+# this one module — every other Win32 call in the crate stays raw.
+windows = { version = "0.61", features = [
+  "Win32_Devices_FunctionDiscovery", # PKEY_Device_FriendlyName
+  "Win32_Foundation",
+  "Win32_Media_Audio", # IMMDeviceEnumerator / IAudioClient / WAVEFORMATEX
+  "Win32_System_Com", # CoInitializeEx / CoCreateInstance / CoTaskMemFree
+  # PROPVARIANT (device property values) and, transitively, the gating
+  # feature for IMMDevice::Activate and IPropertyStore::GetValue — every
+  # one of those signatures mentions PROPVARIANT, so the component
+  # bindings only exist when the Variant type is requested too.
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_UI_Shell_PropertiesSystem", # IPropertyStore, for device names
+] }
 # Raw Input lives directly in `Win32_UI_Input` (no separate
 # Win32_UI_Input_RawInput feature); the RI_MOUSE_*/RI_KEY_* constants
 # live in Win32_UI_WindowsAndMessaging.

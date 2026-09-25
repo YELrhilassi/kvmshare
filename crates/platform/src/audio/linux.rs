@@ -239,6 +239,9 @@ impl Drop for PulseCapture {
 
 /// A running playback process, fed the peer's PCM.
 pub struct PulsePlayback {
+    /// Configured output device; empty or `default` = the system default
+    /// (always valid, and what follows the user when they switch outputs).
+    device: String,
     /// `None` until [`AudioPlayback::start`]. Playback is started by the
     /// audio runtime once a format is negotiated, so an instance exists
     /// before there is a process to own.
@@ -247,14 +250,13 @@ pub struct PulsePlayback {
 }
 
 impl PulsePlayback {
-    pub fn new() -> Self {
-        Self { child: None, format: None }
-    }
-}
-
-impl Default for PulsePlayback {
-    fn default() -> Self {
-        Self::new()
+    pub fn new(device: &str) -> Self {
+        let device = if device.trim().is_empty() {
+            "default".to_string()
+        } else {
+            device.to_string()
+        };
+        Self { device, child: None, format: None }
     }
 }
 
@@ -263,7 +265,7 @@ impl AudioPlayback for PulsePlayback {
         // Restarting replaces any running process (a format change is a
         // new stream, and the old process is playing the old one).
         self.stop();
-        let args = playback_args("default", format);
+        let args = playback_args(&self.device, format);
         log_debug!("audio playback: {PACAT} {}", args.join(" "));
         let child = Command::new(PACAT)
             .args(&args)

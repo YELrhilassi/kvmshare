@@ -52,19 +52,17 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{PulseCapture, PulseDevices, PulsePlayback};
 
-// Everything else currently has no audio backend. That includes Windows
-// for a concrete, deliberate reason rather than an oversight: WASAPI
-// capture and render need COM interfaces (`IMMDeviceEnumerator`,
-// `IAudioClient`, `IAudioCaptureClient`, `IAudioRenderClient`) that
-// `windows-sys` does not ship, so implementing them means either
-// hand-rolling raw vtables or pulling in the full `windows` crate — a
-// dependency this crate has deliberately avoided everywhere else. Until
-// that call is made, Windows reports audio as unavailable, which is
-// honest and immediate, instead of offering a switch that silently does
-// nothing. See `docs/11-media-and-audio.md` §11.5.
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{WasapiCapture, WasapiDevices, WasapiPlayback};
+
+// Platforms with no backend yet fail loudly rather than pretending (see
+// the module docs): macOS needs a CoreAudio pair implementing the same
+// two traits, and nothing above this layer is platform-specific.
+#[cfg(not(any(target_os = "linux", windows)))]
 mod unsupported;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub use unsupported::{UnsupportedCapture, UnsupportedDevices, UnsupportedPlayback};
 
 #[cfg(test)]

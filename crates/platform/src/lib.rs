@@ -113,7 +113,11 @@ pub fn audio_capture(
     {
         Ok(Box::new(audio::PulseCapture::new(device, format)?))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        Ok(Box::new(audio::WasapiCapture::new(device, format)?))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (device, format);
         Err("audio capture is not implemented on this platform".to_string())
@@ -126,13 +130,18 @@ pub fn audio_capture(
 /// combines it with local sound — which is why both machines can be
 /// audible at once without any custom mixing (see
 /// `docs/11-media-and-audio.md`).
-pub fn audio_playback() -> Box<dyn kvmshare_core::audio::AudioPlayback> {
+pub fn audio_playback(device: &str) -> Box<dyn kvmshare_core::audio::AudioPlayback> {
     #[cfg(target_os = "linux")]
     {
-        Box::new(audio::PulsePlayback::new())
+        Box::new(audio::PulsePlayback::new(device))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
+        Box::new(audio::WasapiPlayback::new(device))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = device;
         Box::new(audio::UnsupportedPlayback)
     }
 }
@@ -143,7 +152,11 @@ pub fn audio_devices() -> Box<dyn kvmshare_core::audio::AudioDevices> {
     {
         Box::new(audio::PulseDevices::new())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        Box::new(audio::WasapiDevices::new())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         Box::new(audio::UnsupportedDevices)
     }
