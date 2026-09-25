@@ -30,7 +30,7 @@ mod threads;
 
 use std::collections::VecDeque;
 use std::io;
-use std::net::{TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
@@ -55,6 +55,16 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 /// nothing on it has a deadline tighter than this: motion lives on its
 /// own thread and its own socket.
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How long a single connection *attempt* may take. The reconnect loop
+/// retries every 3 s; a bare `TcpStream::connect` into a dead-but-not-REFUSING
+/// address (laptop asleep into Modern Standby, AP lost the client, AP down)
+/// hangs ~21 s per attempt on Windows (SYN retransmit ladder), so a radio
+/// blackout of one minute meant only ~3 real attempts, each starting from
+/// scratch — the client looked dead for minutes after the network came back.
+/// A bounded attempt keeps the loop's cadence honest and turns recovery
+/// after the link returns into one or two seconds.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Why the client's session ended. The app layer's reconnect loop
 /// decides what to do next from this.
@@ -133,7 +143,37 @@ impl Client {
     /// stream and registers it with the server. Returns the client ready
     /// to run.
     pub fn connect(addr: &str, name: &str, id: &str, info: ScreenInfo) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+        // Resolve first, then dial each address with a hard cap. A bare
+        // `TcpStream::connect` has no timeout: into a dead-but-silent
+        // address (a laptop that dozed into Modern Standby, an AP that
+        // lost the client) every attempt hung for the OS's full SYN
+        // retransmit ladder (~21 s on Windows), stretching the retry loop
+        //'s 3 s cadence to ~2 attempts a minute and making recovery after
+        // the network returned feel like "never reconnects". The cap
+        // bounds the damage instead: the loop retries on schedule and
+        // lands within seconds of the link coming back. (Resolution is
+        // offline for plain IPs; a DNS hang there is bounded by the same
+        // argument in practice and left alone.)
+        let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+        let mut last_err: Option<io::Error> = None;
+        let mut stream = None;
+        for sa in &addrs {
+            match TcpStream::connect_timeout(sa, CONNECT_TIMEOUT) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let stream = match stream {
+            Some(s) => s,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    io::Error::other(format!("no addresses for {addr}"))
+                }))
+            }
+        };
         let mut transport = Transport::with_read_timeout(stream, Some(READ_TIMEOUT))?;
         transport.send(&Message::Hello {
             version: kvmshare_protocol::VERSION,

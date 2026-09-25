@@ -175,6 +175,50 @@ The notable bits:
   entirely (the GUI's "Disconnect" button); `RECONNECT`/`RESTART` end
   the current session and start a fresh handshake immediately.
 
+### 7.7 Reconnecting through a dead radio (the "Server unreachable" standoff)
+
+A laptop client can stay awake on its screen while its **Wi-Fi radio is
+effectively deaf**: Windows power management (Modern Standby, NIC power
+saving, driver power management) drops the link without tearing it
+down, so the OS still reports "connected" and the taskbar icon looks
+fine — but no packet reaches the AP anymore. The failure signature
+(observed live, PC acting as server):
+
+- a healthy session whose motion trace simply **stops** (no teardown,
+  no disconnect — the client's keepalives never arrive either);
+- afterwards, **zero** TCP SYNs, **zero** discovery beacons from the
+  client, an ARP entry stuck in `STALE`, and every LAN port timing out
+  (ICMP/SSH failing is normal through Windows firewall, but SYN-ACKs
+  from *allowed* ports are not);
+- meanwhile the client's GUI keeps retrying and shows "Server
+  unreachable", the server's Home page shows "waiting for it to come
+  online" — both sides are innocent; the air between them is broken.
+
+Two pieces of kvmshare make this survivable:
+
+- **Bounded connection attempts.** `Client::connect` dials each
+  resolved address with a hard `CONNECT_TIMEOUT` (3 s) instead of a
+  bare `TcpStream::connect`. Into a blackhole the OS spends ~21 s per
+  attempt on the SYN retransmit ladder, which stretched the 3 s retry
+  cadence to ~2 attempts a minute — recovery after the link returned
+  looked like "never reconnects". With the cap, the first attempt after
+  the radio wakes succeeds within seconds.
+- **Honest UI state.** The client writes `disconnected` to
+  `client.state` while retrying; the GUI ages a stuck "connecting" into
+  "can't reach the server" (Home panel) and the server side into
+  "waiting for it to come online" — never a stale "Connected".
+
+When it happens again, fix the machine, not the app: on the client
+laptop disable power management on the Wi-Fi adapter (Device Manager →
+adapter → Power Management → uncheck "Allow the computer to turn off
+this device", or `powercfg /SETACVALUEINDEX SCHEME_CURRENT SUB_NONE
+CONNECTIVITYINSTANDBY 1` plus a power-plan tune for Modern Standby),
+and check the driver's own power saving. Diagnosing from the server
+side needs no root: enable debug live via the role's `logctl` file
+(`level=debug`, `enabled=1` — hot-reloaded within 400 ms), then watch
+for session events; an ARP entry that never leaves `STALE` plus an
+empty `ss -tan state syn-recv` is the fingerprint of a deaf radio.
+
 ---
 
 **Next:** [8. GUI](08-gui.md) — the desktop app.
