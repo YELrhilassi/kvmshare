@@ -67,7 +67,14 @@ func (s *Service) browse(ctx context.Context) {
 			return
 		case e, ok := <-entries:
 			if !ok {
-				continue
+				// The resolver closed its channel (its sockets died with
+				// an interface flap, or the context ended). A closed
+				// channel is *always ready*, so `continue` here spun this
+				// loop at a full core forever — the "kvmshare-gui eats a
+				// CPU" on machines whose Wi-Fi had hiccuped. The session
+				// is over for this browse: return (the next Seek/
+				// Republish starts a fresh resolver).
+				return
 			}
 			s.upsertMDNS(e)
 		}

@@ -276,7 +276,13 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
-				continue
+				// The socket is dead (interface flap, sleep/resume, the
+				// link blackholing). `continue` here was a full-core spin:
+				// a closed PacketConn errors *instantly*, so this loop
+				// burned CPU forever with zero backpressure. Return — the
+				// receiver is done; the discovery layer's next Republish
+				// (role change, manual refresh) rebuilds the responder.
+				return
 			}
 			if cm != nil {
 				ifIndex = cm.IfIndex
@@ -305,7 +311,9 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
-				continue
+				// Same as recv4: a dead PacketConn errors instantly —
+				// return, never spin.
+				return
 			}
 			if cm != nil {
 				ifIndex = cm.IfIndex

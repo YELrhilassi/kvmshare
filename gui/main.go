@@ -162,6 +162,11 @@ func main() {
 	// loop that emits a snapshot only when something changed.
 	core.attachEvents(app.Event)
 	core.stateLoop()
+	// Self-diagnosis: if this process ever starts burning a whole core
+	// (a spin loop), dump every goroutine's stack to the state dir —
+	// the artifact that names the culprit when a user only reports
+	// "it uses a lot of CPU".
+	armDebugWatchdog(core)
 
 	windowOpts := application.WebviewWindowOptions{
 		Name:             "main",
