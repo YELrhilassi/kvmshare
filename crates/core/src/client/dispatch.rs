@@ -106,8 +106,21 @@ pub(crate) fn dispatch(layout: &mut Layout, shared: &Arc<Shared>, own_id: u8, ms
             log_debug!("layout updated: {} screens", new_layout.screens.len());
             *layout = new_layout;
         }
+        Message::MediaControl { command } => {
+            log_trace!("media control {command:?}");
+            shared.enqueue_event(InjectEvent::Media { command });
+        }
         Message::KeepAlive => {}
         Message::Error { code, text } => log_warn!("server error ({code}): {text}"),
+        // Audio is handled by the client's audio runtime, which owns a
+        // playback device and its own thread: audio must never run on
+        // the control loop (a blocking device write would wedge input),
+        // so the TCP loop routes these messages before dispatch — the
+        // same pattern as `Control`.
+        Message::AudioStart { .. }
+        | Message::AudioStop
+        | Message::AudioState { .. }
+        | Message::AudioFrame { .. } => {}
         // Not valid client-side traffic; ignore defensively. `Control`
         // is intercepted by the TCP loop before dispatch (the reconnect
         // loop needs the reason), so it can only reach here as a bug.

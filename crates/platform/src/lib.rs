@@ -45,6 +45,7 @@ use kvmshare_core::server::Engine;
 use kvmshare_core::server::Liveness;
 use kvmshare_protocol::message::Message;
 
+pub mod audio;
 pub mod keys;
 pub mod unsupported;
 
@@ -95,6 +96,56 @@ pub fn server(
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         unsupported::server(display)
+    }
+}
+
+/// Start capturing this machine's own audio output as a PCM stream.
+///
+/// `device` is a platform device name; empty or `default` means the
+/// system default output (whose loopback is captured — never a
+/// microphone). Returns an error why it cannot, rather than a stream
+/// that would be silent for reasons the user cannot see.
+pub fn audio_capture(
+    device: &str,
+    format: kvmshare_protocol::message::AudioFormat,
+) -> Result<Box<dyn kvmshare_core::audio::AudioCapture>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(audio::PulseCapture::new(device, format)?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (device, format);
+        Err("audio capture is not implemented on this platform".to_string())
+    }
+}
+
+/// Start playing the peer's audio stream into this machine's output.
+///
+/// Playback goes to the ordinary output device, so the OS's own mixer
+/// combines it with local sound — which is why both machines can be
+/// audible at once without any custom mixing (see
+/// `docs/11-media-and-audio.md`).
+pub fn audio_playback() -> Box<dyn kvmshare_core::audio::AudioPlayback> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(audio::PulsePlayback::new())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Box::new(audio::UnsupportedPlayback)
+    }
+}
+
+/// List this machine's audio devices, for the GUI's pickers.
+pub fn audio_devices() -> Box<dyn kvmshare_core::audio::AudioDevices> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(audio::PulseDevices::new())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Box::new(audio::UnsupportedDevices)
     }
 }
 

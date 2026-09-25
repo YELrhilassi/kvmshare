@@ -99,6 +99,11 @@ pub(crate) enum InjectEvent {
     Button { button: u8, pressed: bool },
     Wheel { dx: i32, dy: i32 },
     Key { kind: KeyKind, key: u32 },
+    /// A routed media command (play/pause/volume/...). Queued like the
+    /// other OS calls for the same reason: injection can block. See
+    /// [`crate::media`] for why these are routed by policy rather than
+    /// by cursor focus.
+    Media { command: kvmshare_protocol::message::MediaCommand },
 }
 
 /// How many events the queue may hold before the newest is dropped.
@@ -134,6 +139,7 @@ impl Shared {
                 InjectEvent::Button { button, pressed } => inj.button(button, pressed),
                 InjectEvent::Wheel { dx, dy } => inj.wheel(dx, dy),
                 InjectEvent::Key { kind, key } => inj.key(kind, key),
+                InjectEvent::Media { command } => inj.media(command),
             }
         }
     }

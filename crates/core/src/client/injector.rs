@@ -46,6 +46,24 @@ pub trait Injector: Send {
     /// Press/release/repeat a key, addressed by its canonical USB HID
     /// usage id (the platform backend maps it to the local key identity).
     fn key(&mut self, kind: KeyKind, key: u32);
+    /// Perform a media command — play/pause, next track, volume up — on
+    /// this machine, using whatever its OS calls that operation.
+    ///
+    /// Deliberately *semantic* rather than a key press (see
+    /// [`crate::media`]): the machine that captured the key and the
+    /// machine that acts on it may run different OSes with different
+    /// media keys, and one of them may lack the concept entirely.
+    ///
+    /// A backend whose OS has no discrete key for a command (Windows has
+    /// no separate fast-forward scan code, for instance) should degrade
+    /// to the nearest operation it does have and log it — silently doing
+    /// nothing would look like a dead key.
+    ///
+    /// Default: no media support (the backend logs nothing and the
+    /// command has no effect). Backends that implement it must not block
+    /// for long: injection runs on the motion thread, whose stall the
+    /// supervisor treats as a wedged session.
+    fn media(&mut self, _command: kvmshare_protocol::message::MediaCommand) {}
     /// Control has entered this machine. The local cursor stays
     /// **visible**: it *is* the shared cursor now — the server hides its
     /// own while the cursor is away, so hiding the client's too would

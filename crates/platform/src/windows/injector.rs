@@ -92,6 +92,29 @@ impl Win32Injector {
         }
     }
 
+    /// Press and release one key outright — the shape of a media key,
+    /// which is always a tap and never held. Distinct from [`Injector::key`],
+    /// which tracks down-state so a held key can be released on `leave`:
+    /// a tap needs no tracking because it cannot outlive the call.
+    fn tap_scancode(&mut self, scan: u16, extended: bool) {
+        for key_up in [false, true] {
+            // SAFETY: well-formed KEYBDINPUT in scan-code mode.
+            let mut input: km::INPUT = unsafe { std::mem::zeroed() };
+            input.r#type = km::INPUT_KEYBOARD;
+            input.Anonymous.ki.wVk = 0; // scan-code mode: virtual key unused
+            input.Anonymous.ki.wScan = scan;
+            let mut flags = km::KEYEVENTF_SCANCODE;
+            if extended {
+                flags |= km::KEYEVENTF_EXTENDEDKEY;
+            }
+            if key_up {
+                flags |= km::KEYEVENTF_KEYUP;
+            }
+            input.Anonymous.ki.dwFlags = flags;
+            self.send_input(&input);
+        }
+    }
+
     /// Physical screen dimensions for the current DPI (the process is
     /// per-monitor DPI aware, so `GetSystemMetrics` returns physical
     /// pixels).
@@ -320,6 +343,49 @@ impl Injector for Win32Injector {
         self.send_input(&input);
     }
 
+    /// Perform a media command by tapping the key Windows has for it.
+    ///
+    /// Windows exposes media transport as four extended scan codes —
+    /// next (E0 19), previous (E0 10), stop (E0 24) and a single
+    /// play/pause **toggle** (E0 22) — plus the three volume keys. It has
+    /// no discrete Play, Pause, fast-forward or rewind keys, so this
+    /// backend degrades deliberately rather than dropping the request:
+    ///
+    /// * `Play`/`Pause` become the toggle. Pressing "play" on a machine
+    ///   that only has a toggle does the thing the user meant often
+    ///   enough to be worth doing, and doing nothing would look like a
+    ///   dead key.
+    /// * `SeekForward`/`SeekBackward` have no equivalent at all. Faking
+    ///   them with the toggle would *pause the music* when the user
+    ///   asked to skip ahead — actively wrong — so they are logged and
+    ///   ignored.
+    ///
+    /// This is exactly the OS-specific degradation the semantic command
+    /// space exists for: the sending machine does not need to know any of
+    /// it.
+    fn media(&mut self, command: kvmshare_protocol::message::MediaCommand) {
+        use kvmshare_protocol::message::MediaCommand;
+        let hid = match command {
+            // No discrete keys: the toggle is the closest real operation.
+            MediaCommand::Play | MediaCommand::Pause | MediaCommand::PlayPause => 0xcd,
+            MediaCommand::Next => 0xb5,
+            MediaCommand::Previous => 0xb6,
+            MediaCommand::Stop => 0xb7,
+            MediaCommand::VolumeUp => 0xe9,
+            MediaCommand::VolumeDown => 0xea,
+            MediaCommand::Mute => 0xe8,
+            MediaCommand::SeekForward | MediaCommand::SeekBackward => {
+                log_win32_media_unsupported(command);
+                return;
+            }
+        };
+        let Some((scan, extended)) = crate::keys::scancode_from_hid(hid) else {
+            log_win32_media_unsupported(command);
+            return;
+        };
+        self.tap_scancode(scan, extended);
+    }
+
     fn enter(&mut self) {
         // This machine is now driven remotely: its own hardware must not
         // fight the injected stream (see [`isolation`] for the why).
@@ -394,4 +460,22 @@ impl kvmshare_core::client::Clipboard for Win32Clipboard {
 fn log_win32_reject() {
     use kvmshare_log::log_warn;
     log_warn!("SendInput rejected an event (input-isolated window?)");
+}
+
+/// A media command Windows has no key for. Logged (at most once per
+/// 30 s) rather than silently ignored: the user pressed a key and the
+/// machine did nothing, and "seek is not supported on this target" is
+/// the answer they need. Throttled because a held key repeats.
+fn log_win32_media_unsupported(command: kvmshare_protocol::message::MediaCommand) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_WARNED: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now >= LAST_WARNED.swap(now, Ordering::Relaxed) + 30 {
+        kvmshare_log::log_warn!(
+            "media: {command:?} has no Windows key equivalent — command ignored (no fast-forward/rewind media keys on Windows)"
+        );
+    }
 }

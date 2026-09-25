@@ -8,9 +8,13 @@
 //! The geometry and layout payloads (screen shape, rects, screens, the
 //! desktop layout) live in [`geometry`].
 
+mod audio;
 mod geometry;
+mod media;
 
+pub use audio::AudioFormat;
 pub use geometry::{KeyKind, Layout, Rect, Screen, ScreenInfo};
+pub use media::MediaCommand;
 
 use crate::frame::Frame;
 use crate::id::types;
@@ -56,6 +60,28 @@ pub enum Message {
     Key { kind: KeyKind, key: u32 },
     /// Clipboard content; `mime` describes the format ("text/plain", ...).
     Clipboard { mime: String, data: Vec<u8> },
+    /// A media-control request. Sent over TCP: these are rare, tiny, and
+    /// must never be lost or applied twice — the opposite of the cursor
+    /// stream's loss tolerance.
+    ///
+    /// The command is *semantic*, not a key code: the receiver presses
+    /// whatever its own OS calls play/pause. See [`MediaCommand`].
+    MediaControl { command: MediaCommand },
+    /// Sender is starting to stream its audio output. `formats` is the
+    /// sender's accepted set, in preference order; the peer answers with
+    /// a chosen [`AudioFormat`] that both support.
+    AudioStart { formats: Vec<AudioFormat> },
+    /// The audio stream is ending (capture stopped, config changed, role
+    /// shutting down).
+    AudioStop,
+    /// Whether the sender currently has audio playing. Drives the media
+    /// router's `last_active_source` policy, and the GUI's indication of
+    /// which machine is making sound.
+    AudioState { playing: bool },
+    /// One packet of audio payload, riding UDP. `timestamp_ms` is the
+    /// sender's capture clock, for jitter measurement and for dropping
+    /// packets that arrive too late to play.
+    AudioFrame { timestamp_ms: u32, samples: Vec<u8> },
     KeepAlive,
     Error { code: u8, text: String },
     /// Local only, never serialized to a peer: the user pressed the
@@ -83,6 +109,11 @@ impl Message {
             Message::MouseWheel { .. } => types::MOUSE_WHEEL,
             Message::Key { .. } => types::KEY,
             Message::Clipboard { .. } => types::CLIPBOARD,
+            Message::MediaControl { .. } => types::MEDIA_CONTROL,
+            Message::AudioStart { .. } => types::AUDIO_START,
+            Message::AudioStop => types::AUDIO_STOP,
+            Message::AudioState { .. } => types::AUDIO_STATE,
+            Message::AudioFrame { .. } => types::AUDIO_FRAME,
             Message::KeepAlive => types::KEEPALIVE,
             Message::Error { .. } => types::ERROR,
             Message::Escape => types::ESCAPE,
@@ -143,6 +174,15 @@ impl Message {
                 w.put_u32(data.len() as u32);
                 w.put_bytes(data);
             }
+            Message::MediaControl { command } => command.encode(&mut w),
+            Message::AudioStart { formats } => audio::encode_list(&mut w, formats),
+            Message::AudioStop => {}
+            Message::AudioState { playing } => w.put_u8(*playing as u8),
+            Message::AudioFrame { timestamp_ms, samples } => {
+                w.put_u32(*timestamp_ms);
+                w.put_u32(samples.len() as u32);
+                w.put_bytes(samples);
+            }
             Message::KeepAlive => {}
             Message::Error { code, text } => {
                 w.put_u8(*code);
@@ -195,6 +235,16 @@ impl Message {
                 let len = r.get_u32()? as usize;
                 let data = r.get_bytes(len, "clipboard data")?.to_vec();
                 Message::Clipboard { mime, data }
+            }
+            types::MEDIA_CONTROL => Message::MediaControl { command: MediaCommand::decode(&mut r)? },
+            types::AUDIO_START => Message::AudioStart { formats: audio::decode_list(&mut r)? },
+            types::AUDIO_STOP => Message::AudioStop,
+            types::AUDIO_STATE => Message::AudioState { playing: r.get_u8()? != 0 },
+            types::AUDIO_FRAME => {
+                let timestamp_ms = r.get_u32()?;
+                let len = r.get_u32()? as usize;
+                let samples = r.get_bytes(len, "audio samples")?.to_vec();
+                Message::AudioFrame { timestamp_ms, samples }
             }
             types::KEEPALIVE => Message::KeepAlive,
             types::ERROR => Message::Error { code: r.get_u8()?, text: r.get_str()?.to_owned() },
@@ -294,6 +344,55 @@ mod tests {
         roundtrip(Message::KeepAlive);
         roundtrip(Message::Error { code: errors::PROTOCOL, text: "nope".into() });
         roundtrip(Message::Escape);
+    }
+
+    #[test]
+    fn media_control_roundtrip() {
+        for command in MediaCommand::ALL {
+            roundtrip(Message::MediaControl { command });
+        }
+    }
+
+    #[test]
+    fn audio_messages_roundtrip() {
+        roundtrip(Message::AudioStart {
+            formats: vec![AudioFormat::default(), AudioFormat {
+                sample_rate: 44_100,
+                channels: 1,
+                frame_ms: 20,
+                codec: crate::id::codecs::PCM_S16LE,
+            }],
+        });
+        roundtrip(Message::AudioStop);
+        roundtrip(Message::AudioState { playing: true });
+        roundtrip(Message::AudioState { playing: false });
+        roundtrip(Message::AudioFrame {
+            timestamp_ms: 12_345,
+            samples: vec![0u8, 1, 2, 3, 255],
+        });
+    }
+
+    /// A media command this build does not know is refused rather than
+    /// mapped onto a nearby key — pressing the wrong key is worse than
+    /// doing nothing.
+    #[test]
+    fn unknown_media_command_is_rejected() {
+        let mut bytes = Message::MediaControl { command: MediaCommand::Stop }.encode();
+        let last = bytes.len() - 1;
+        bytes[last] = 0xfe;
+        assert!(Message::decode(&bytes).is_err());
+    }
+
+    /// An unsupported audio format is refused at the wire boundary, so a
+    /// malformed offer can never size a buffer.
+    #[test]
+    fn unsupported_audio_format_is_rejected() {
+        let mut bytes = Message::AudioStart { formats: vec![AudioFormat::default()] }.encode();
+        // Corrupt the sample rate (the first four payload bytes after the
+        // frame header and the 1-byte format count) to zero.
+        let rate_at = crate::frame::HEADER_LEN + 1;
+        bytes[rate_at..rate_at + 4].copy_from_slice(&0u32.to_be_bytes());
+        assert!(Message::decode(&bytes).is_err());
     }
 
     #[test]

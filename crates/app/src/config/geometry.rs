@@ -85,7 +85,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{NetworkConfig, ScreenConfig};
+    use crate::config::{AudioConfig, MediaConfig, NetworkConfig, ScreenConfig};
 
     // A stale local screen size (old default, display changed) is the
     // classic "cursor cannot cross" bug: the capture beacons the real
@@ -106,6 +106,8 @@ mod tests {
             network: NetworkConfig::default(),
             shortcuts: kvmshare_core::BindSection::default(),
             input: kvmshare_core::InputPrefs::default(),
+            media: MediaConfig::default(),
+            audio: AudioConfig::default(),
         };
 
         assert!(cfg.correct_local_screen_to(1024, 768), "a stale size must be corrected");
@@ -140,6 +142,8 @@ mod tests {
             network: NetworkConfig::default(),
             shortcuts: kvmshare_core::BindSection::default(),
             input: kvmshare_core::InputPrefs::default(),
+            media: MediaConfig::default(),
+            audio: AudioConfig::default(),
         };
         assert!(cfg.correct_local_screen_to(1024, 768));
         assert_eq!(cfg.screens[1].x, 1500, "an overlapping screen must not shift");

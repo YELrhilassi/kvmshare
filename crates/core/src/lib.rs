@@ -13,10 +13,12 @@
 //! traits defined here.
 
 pub mod actions;
+pub mod audio;
 pub mod client;
 pub mod clipboard;
 pub mod input;
 pub mod layout;
+pub mod media;
 pub mod motion;
 pub mod server;
 pub mod session;
@@ -25,8 +27,10 @@ pub mod transport;
 pub mod udp;
 
 pub use actions::{ActionEngine, BindSection, UserAction};
+pub use audio::{ActivityDetector, AudioCapture, AudioPlayback, JitterBuffer, PushOutcome};
 pub use input::InputPrefs;
 pub use layout::{Direction, Layout};
+pub use media::{MediaPrefs, MediaTarget, ResolvedTarget};
 pub use session::{Action, Session};
 
 /// Where the cursor currently is.

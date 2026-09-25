@@ -458,6 +458,24 @@ impl Injector for X11Injector {
         let _ = self.conn.flush();
     }
 
+    /// Perform a media command as a tap of its canonical media key.
+    ///
+    /// The canonical HID usage of every [`MediaCommand`] is exactly the
+    /// consumer-page usage a physical keyboard sends, and X11 maps those
+    /// to the `XF86Audio*` keysyms at the standard `evdev + 8` keycodes
+    /// (XF86AudioPlay at 172, XF86AudioNext at 171, ...). So injection is
+    /// the ordinary key path — same keycode derivation, same unknown-key
+    /// logging — which is what makes a routed media key look to the
+    /// desktop exactly like the user pressing it.
+    ///
+    /// Press and release are issued in one call: a media key is a tap,
+    /// never held, so there is nothing for [`Self::leave`] to release.
+    fn media(&mut self, command: kvmshare_protocol::message::MediaCommand) {
+        let hid = command.to_hid();
+        self.key(KeyKind::Down, hid);
+        self.key(KeyKind::Up, hid);
+    }
+
     fn enter(&mut self) {
         // The local cursor stays visible: it *is* the shared cursor now.
         // The server hides its own while the cursor is away, so hiding

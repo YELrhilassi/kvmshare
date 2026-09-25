@@ -29,9 +29,52 @@ pub mod types {
     pub const MOUSE_BUTTON: u8 = 0x22;
     pub const MOUSE_WHEEL: u8 = 0x23;
     pub const KEY: u8 = 0x30;
+    /// A semantic media-control request (play/pause/volume/...),
+    /// classified at the capture edge and routed by policy rather than
+    /// by cursor focus. See [`crate::message::MediaCommand`].
+    pub const MEDIA_CONTROL: u8 = 0x31;
     pub const CLIPBOARD: u8 = 0x40;
+    /// Sender is starting an audio stream; carries its accepted formats
+    /// for negotiation. See [`crate::message::AudioFormat`].
+    pub const AUDIO_START: u8 = 0x50;
+    /// The audio stream is ending.
+    pub const AUDIO_STOP: u8 = 0x51;
+    /// Whether the sender currently has something playing — the input to
+    /// the media router's `last_active_source` policy.
+    pub const AUDIO_STATE: u8 = 0x52;
+    /// One packet of audio payload. Rides UDP (loss-tolerant), never the
+    /// reliable control stream.
+    pub const AUDIO_FRAME: u8 = 0x53;
     pub const KEEPALIVE: u8 = 0x7e;
     pub const ERROR: u8 = 0x7f;
+}
+
+/// Media-control command ids carried by
+/// [`crate::message::Message::MediaControl`]. Plain `u8` constants, like
+/// every other wire id, so a hex dump stays readable.
+pub mod media {
+    pub const PLAY_PAUSE: u8 = 0;
+    pub const PLAY: u8 = 1;
+    pub const PAUSE: u8 = 2;
+    pub const STOP: u8 = 3;
+    pub const NEXT: u8 = 4;
+    pub const PREVIOUS: u8 = 5;
+    pub const SEEK_FORWARD: u8 = 6;
+    pub const SEEK_BACKWARD: u8 = 7;
+    pub const VOLUME_UP: u8 = 8;
+    pub const VOLUME_DOWN: u8 = 9;
+    pub const MUTE: u8 = 10;
+}
+
+/// Payload encodings for [`crate::message::AudioFormat`].
+///
+/// Unknown values are refused at decode time, so this list is the honest
+/// answer to "what can a peer send me" — adding a codec means adding a
+/// constant here *and* an implementation, in one change.
+pub mod codecs {
+    /// 16-bit signed little-endian PCM, interleaved. The baseline: no
+    /// dependency, no CPU, ~1.5 Mbit/s at 48 kHz stereo.
+    pub const PCM_S16LE: u8 = 0;
 }
 
 /// Frame flags.
