@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/protocol", "crates/log", "crates/core", "crates/platform", "crates/app"]
 
 [workspace.package]
-version = "0.8.7"
+version = "0.8.8"
 edition = "2021"
 license = "MIT"
 repository = "https://example.invalid/kvmshare"
