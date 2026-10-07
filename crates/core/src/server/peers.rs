@@ -240,10 +240,8 @@ impl Peers {
     /// idle stretch. A stream that goes silent after this is a real
     /// wedge and still gets caught.
     pub fn mark_heard(&mut self, id: u8) {
-        let now = crate::time::now_ms();
-        let _ = &now;
         match self.records.get_mut(&id) {
-            Some(record) => record.last_heard = Some(now),
+            Some(record) => record.last_heard = Some(crate::time::now_ms()),
             None => log_warn!("peer {id} activated without a transport record"),
         }
     }

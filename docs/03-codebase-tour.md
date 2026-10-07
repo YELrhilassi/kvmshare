@@ -73,8 +73,12 @@ section 3.4. That single file is the shortest path from process start to
    `server`, `client`, `motion`, `transport`, `udp`).
 3. **`crates/core/src/session/mod.rs`** — the switching brain. Pure
    logic; read `boundary.rs` for the crossing model.
-4. **`crates/core/src/server/mod.rs`** — how the server wires the
-   session to the network.
+4. **`crates/core/src/server/`** — how the server wires the session to
+   the network. `mod.rs` is the wiring; the pieces live beside it:
+   `peers.rs` (one store for the connected clients and their transport
+   records), `policy.rs` (who may connect), `controls.rs` (the app
+   layer's hot-control channel), `client.rs` (one connection's
+   lifecycle), `udp.rs` (the cursor-stream receiver).
 5. **`crates/core/src/client/mod.rs`** — how the client wires the
    injector to the network.
 6. **`crates/platform/src/lib.rs`** — where the OS backends plug in.

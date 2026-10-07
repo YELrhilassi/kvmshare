@@ -37,17 +37,25 @@
 //! * [`liveness`] — heartbeats and the supervisor watchdog.
 //! * [`client`] — one connected client: outbound queue, shared context,
 //!   and the accept → service → teardown lifecycle.
+//! * [`peers`] — the per-client state store (client + transport record).
+//! * [`policy`] — the connection policy ([`Policy`]) and id matching.
+//! * [`controls`] — the app layer's hot-control channel ([`Control`]).
 //! * [`actions`] — the executor that turns session actions into reality.
 //! * [`udp`] — the cursor-stream receiver and its beacon watchdog.
 
 mod actions;
 pub mod audio;
 mod client;
+mod controls;
 mod media;
 mod engine;
 mod liveness;
 mod peers;
+pub mod policy;
 mod udp;
+
+pub use controls::Control;
+pub use policy::{id_matches, Policy};
 
 use std::io;
 use std::net::{TcpListener, UdpSocket};
@@ -59,7 +67,6 @@ use std::thread;
 use kvmshare_log::{log_info, log_warn};
 use kvmshare_protocol::message::{Layout, Message, ScreenInfo};
 
-use crate::layout::Layout as Desktop;
 use crate::session::{Action, Session};
 use crate::time::now_ms;
 
@@ -71,96 +78,6 @@ use peers::Peers;
 
 pub use engine::{Engine, ServerClipboard};
 pub use liveness::{EXIT_RESTART, Liveness};
-
-/// Control messages from the app layer (never travel over the wire).
-#[derive(Debug)]
-pub enum Control {
-    /// The config changed on disk — adopt this new desktop layout,
-    /// shortcut bindings and input preferences now.
-    Reload(Desktop, crate::actions::BindSection, crate::input::InputPrefs),
-    /// The `[network]` policy changed on disk — adopt it now. Separate
-    /// from [`Control::Reload`] because it has a side effect a layout edit
-    /// must never have: any *connected* client whose machine id is in the
-    /// new `revoked_ids` is disconnected on the spot. Without this the
-    /// policy was only read at startup, so trusting or revoking a machine
-    /// silently did nothing until the server restarted.
-    SetPolicy(Policy),
-    /// Send an operational command to one connected client, looked up by
-    /// its screen name. `command` is a [`kvmshare_protocol::id::control`]
-    /// constant. The GUI writes these via the `server.cmd` control file.
-    ClientCommand { name: String, command: u8 },
-    /// The `[media]` routing policy changed on disk — adopt it now, and
-    /// re-arm (or release) the media-key grab to match. Separate from
-    /// [`Control::Reload`] because its one side effect is a *grab* change:
-    /// the capture layer intercepts media keys while routing is enabled,
-    /// and every other reload path must never touch that state. Without
-    /// this, a policy edit only took effect at the next restart — the
-    /// GUI's media page would claim a change the running router never
-    /// adopted.
-    SetMediaPrefs(crate::media::MediaPrefs),
-    /// The `[audio]` configuration changed on disk — adopt it now. The
-    /// audio link is re-settled by the connection paths from the shared
-    /// setup, so the only immediate duty is swapping the setup itself.
-    SetAudioOptions(Option<Arc<audio::ServerAudio>>),
-}
-
-/// The server's connection policy, loaded from the `[network]` config
-/// section. Decides which peers may connect at all.
-#[derive(Debug, Clone)]
-pub struct Policy {
-    /// Only accept clients whose **exact** screen name appears in the
-    /// layout, plus trusted machine ids. When false, any name is
-    /// admitted dynamically (the legacy plug-and-play behavior).
-    pub allowlist: bool,
-    /// Only accept connections from the local network (RFC1918 private
-    /// ranges, loopback and link-local). Blocks WAN/bridged peers.
-    pub local_only: bool,
-    /// Machine ids that may connect even when their name is not in the
-    /// layout (they are admitted dynamically, like a fresh client).
-    pub trusted_ids: Vec<String>,
-    /// Machine ids that may **never** connect. Checked before everything
-    /// else, including the layout and `trusted_ids`: revoking a machine is
-    /// a hard deny, so it is the one policy that cannot be bypassed by a
-    /// pinned layout screen. Both lists may hold the same id; revoke wins.
-    pub revoked_ids: Vec<String>,
-}
-
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            allowlist: true,
-            local_only: true,
-            trusted_ids: Vec::new(),
-            revoked_ids: Vec::new(),
-        }
-    }
-}
-
-impl Policy {
-    /// Is `machine_id` explicitly revoked? Same prefix matching as trust
-    /// (short or full ids work, in both directions), so revoking the short
-    /// id shown in the GUI also refuses the full one. Revocation is the
-    /// strongest rule: callers check this before anything else.
-    pub fn is_revoked(&self, machine_id: &str) -> bool {
-        self.revoked_ids.iter().any(|r| id_matches(machine_id, r))
-    }
-
-    /// Is `machine_id` trusted (admitted even without a layout screen)?
-    pub fn is_trusted(&self, machine_id: &str) -> bool {
-        self.trusted_ids.iter().any(|t| id_matches(machine_id, t))
-    }
-}
-
-/// Does a machine id match an id-list entry? An entry may be the full id
-/// or its 8-char short form (prefix match). Guards: empty entries never
-/// match; a short form must be at least 4 chars so a typo'd one-char
-/// "trust" cannot silently admit everything starting with it.
-pub fn id_matches(id: &str, entry: &str) -> bool {
-    if entry.is_empty() || entry.len() < 4 {
-        return false;
-    }
-    id == entry || id.starts_with(entry)
-}
 
 /// Lifecycle events the server emits for its app layer (and GUI). One
 /// [`ClientConnected`] per accepted client, one [`ClientDisconnected`]

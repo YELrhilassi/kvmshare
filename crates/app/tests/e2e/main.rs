@@ -269,4 +269,6 @@ fn calls(c: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     c.lock().unwrap().clone()
 }
 
-mod core_tests;
+mod admission_tests;
+mod policy_tests;
+mod session_tests;

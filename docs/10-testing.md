@@ -40,7 +40,7 @@ cd gui && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags production .
 | Logging | `crates/log/src/lib.rs` | level parsing/ordering, control-file hot reload, enabled toggle |
 | Key tables | `crates/platform/src/keys.rs` | both directions consistent (a bad entry can never silently break a cross-OS pair) |
 | Windows capture decode | `crates/platform/src/windows/capture/tests.rs` | raw-input → message translation |
-| **End-to-end** | `crates/app/tests/e2e/` | a real `Server` + real `Client` over real TCP/UDP with mock input + a recording injector: cursor enters/moves/crosses back, motion delivers the full command, buttons/keys forward, reconnect is not deafened by stale UDP sequences, crossing after idle survives the beacon watchdog, disconnect returns home, unknown clients admitted dynamically, config hot-reload returns the cursor home and drops stale clients |
+| **End-to-end** | `crates/app/tests/e2e/` | a real `Server` + real `Client` over real TCP/UDP with mock input + a recording injector. `session_tests.rs`: cursor enters/moves/crosses back, motion delivers the full command, buttons/keys forward, reconnect is not deafened by stale UDP sequences, crossing after idle survives the beacon watchdog, disconnect returns home, config hot-reload returns the cursor home and drops stale clients. `admission_tests.rs`: dynamic admission, the allowlist, trust by short id, revocation at the handshake and hot. `policy_tests.rs`: media routing to a pinned machine, the hot-reload re-arm, the media_pin override. `main.rs` holds the shared harness |
 
 The e2e suite is the closest thing to a manual two-machine test that
 runs without any OS plumbing — the platform traits are replaced by

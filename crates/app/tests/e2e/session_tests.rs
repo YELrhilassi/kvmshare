@@ -1,0 +1,509 @@
+//! The session flows over the wire: crossing, motion, buttons and keys,
+//! beacons and the watchdog, disconnects, hot reload and duplicate
+//! replacement.
+
+use super::*;
+
+#[test]
+fn cursor_enters_moves_and_crosses_back_over_tcp() {
+    let h = start_server();
+
+    let (client, injector, client_calls, out_rx) = connect_client(h.port);
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
+    h.wait_for_clients(1);
+
+    // -- Cross from pc onto hp (left screen). --
+    // The real cursor parks at the shared edge (beacon), then an outward
+    // push crosses. (Deltas alone never cross — see core::session.)
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+
+    let cc = calls(&client_calls);
+    assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
+    // Entry point is hp's right edge inset past the seam
+    // (1919 - ENTRY_INSET, 540); the server also sends an absolute move
+    // for the entry position. (The inset stops the seam-jitter bounce: an
+    // entry exactly on the wall makes the first beacon a park, which
+    // re-crosses.)
+    assert!(
+        cc.iter().any(|c| c == &format!("move {},{}", SCREEN_W - 25, SCREEN_H / 2)),
+        "client should move to entry point, got {cc:?}"
+    );
+
+    let ec = calls(&h.engine_calls);
+    assert!(ec.iter().any(|c| c == "cursor false"), "server should hide its cursor, got {ec:?}");
+    // The hidden cursor must stay exactly where it crossed — the server
+    // must NOT warp it (a warp would sweep hover/enter effects across
+    // the local desktop, and a visible one would dash the cursor to the
+    // screen center on every crossing).
+    assert!(
+        !ec.iter().any(|c| c.starts_with("warp ")),
+        "server must not warp its cursor when switching away, got {ec:?}"
+    );
+
+    // -- Roam around on hp: forwarded as *relative* motion. --
+    // The client's OS applies its own pointer transform to relative
+    // input, so the shared cursor feels native there. The server must
+    // never send absolute positions in the motion stream (the hidden
+    // local cursor never moves while we are away).
+    feed(&h, Message::MouseMoveRel { dx: -100, dy: 0 });
+    let cc = calls(&client_calls);
+    // Under the closed-loop model the -100 frame is fed forward
+    // immediately (half a frame) and the damped corrections deliver the
+    // rest against the read-back cursor — what must hold is that the
+    // command trajectory is honored exactly: the recorded relative
+    // stream totals -100 px on x, nothing on y.
+    let (rel_x, rel_y): (i64, i64) = cc
+        .iter()
+        .filter_map(|c| c.strip_prefix("rel "))
+        .map(|r| {
+            let (x, y) = r.split_once(',').unwrap();
+            (x.parse::<i64>().unwrap(), y.parse::<i64>().unwrap())
+        })
+        .fold((0, 0), |(ax, ay), (x, y)| (ax + x, ay + y));
+    assert_eq!(rel_x, -100, "motion must deliver the full -100 px command, got {cc:?}");
+    assert_eq!(rel_y, 0, "no motion outside the command axis, got {cc:?}");
+    assert!(
+        cc.iter().all(|c| !c.starts_with("move ") || c == &format!("move {},{}", SCREEN_W - 25, SCREEN_H / 2)),
+        "only the entry move may be absolute, got {cc:?}"
+    );
+
+    // -- Buttons and keys forward while on the client. --
+    feed(&h, Message::MouseButton { button: 0, pressed: true });
+    let cc = calls(&client_calls);
+    assert!(cc.contains(&"button 0 true".to_string()), "button should forward, got {cc:?}");
+
+    feed(&h, Message::Key { kind: KeyKind::Down, key: 0x04 }); // canonical HID usage: 'a'
+    let cc = calls(&client_calls);
+    assert!(cc.contains(&"key Down 4".to_string()), "key should forward, got {cc:?}");
+
+    // -- Cross back to pc. --
+    // The client's real cursor must be pinned on the shared edge (its
+    // right edge) for a crossing; first push moves it there, then the
+    // next outward push (a frame later, as in real use) crosses. The
+    // entry point sits inset inside hp, so the roam must cover that
+    // ground before the cursor can park on the wall.
+    feed(&h, Message::MouseMoveRel { dx: 250, dy: 0 }); // roam back to the right wall
+    feed(&h, Message::MouseMoveRel { dx: 10, dy: 0 }); // keep pushing: cross home
+
+    let cc = calls(&client_calls);
+    assert!(cc.contains(&"leave".to_string()), "client should leave, got {cc:?}");
+    let ec = calls(&h.engine_calls);
+    assert!(ec.iter().any(|c| c == "cursor true"), "server should restore its cursor, got {ec:?}");
+}
+/// A raw peer that speaks just enough of the protocol to register as a
+/// client, flood the server's UDP beacon stream with `n` cursor
+/// beacons, then vanish. Used to simulate a previous client session whose
+/// UDP sequence counter reached `n` before it disconnected — the
+/// reconnect must not inherit that state (stale beacons must never
+/// deafen a fresh peer).
+fn raw_beacon_client(port: u16, n: u32) {
+    let mut tcp = Transport::new(TcpStream::connect(("127.0.0.1", port)).unwrap()).unwrap();
+    let info = screen_info();
+    tcp.send(&Message::Hello { version: VERSION, id: "machine-hp".into(), name: "hp".into(), info }).unwrap();
+    let id = match tcp.recv().unwrap() {
+        RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => own_screen_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    // A UDP stream to the same server port, like the real client's.
+    let udp_sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    udp_sock.connect(("127.0.0.1", port)).unwrap();
+    for seq in 1..=n {
+        udp_sock
+            .send(&udp::pack(id, seq, &Message::CursorPos { x: SCREEN_W / 2, y: SCREEN_H / 2 }))
+            .unwrap();
+    }
+    // Give the server a moment to drain the datagrams, then vanish.
+    thread::sleep(Duration::from_millis(50));
+}
+#[test]
+fn client_reconnect_is_not_deafened_by_stale_udp_sequences() {
+    let h = start_server();
+
+    // A previous "hp" session ran long enough that the server's UDP
+    // sequence tracker for its screen id climbed high, then it
+    // disconnected. (The tracker must be cleared on disconnect — a fresh
+    // session starts its own sequence at 1.)
+    raw_beacon_client(h.port, 500);
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 0, "old session should have disconnected");
+
+    // The real client reconnects (same screen id) and must work normally:
+    // beacons from sequence 1 on are fresh and drive the crossing back.
+    let (client, injector, client_calls, out_rx) = connect_client(h.port);
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
+    h.wait_for_clients(1);
+
+    // Cross onto hp.
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+    let cc = calls(&client_calls);
+    assert!(cc.contains(&"enter".to_string()), "client should enter, got {cc:?}");
+    assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
+
+    // Cross back: push the real cursor across the entry inset to the
+    // shared edge; its (fresh) beacons arm it and the outward push
+    // fires the crossing.
+    feed(&h, Message::MouseMoveRel { dx: 100, dy: 0 });
+
+    let mut cc = calls(&client_calls);
+    for _ in 0..50 {
+        if cc.contains(&"leave".to_string()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+        cc = calls(&client_calls);
+    }
+    assert!(cc.contains(&"leave".to_string()), "reconnected client should cross back, got {cc:?}");
+    assert!(
+        calls(&h.engine_calls).iter().any(|c| c == "cursor true"),
+        "server cursor should be restored after the return crossing"
+    );
+}
+#[test]
+fn crossing_after_idle_is_not_dropped_by_the_beacon_watchdog() {
+    let h = start_server();
+
+    // A raw peer that registers (TCP + UDP) like a real client but only
+    // starts beaconing well after the server activates it — the shape of
+    // a real LAN client, whose first beacon lands tens of milliseconds
+    // after the crossing, never within the watchdog's ~1 ms first check.
+    // (On localhost a full client's immediate beacon can beat the check,
+    // hiding the race this guards against.)
+    let mut tcp = Transport::new(TcpStream::connect(("127.0.0.1", h.port)).unwrap()).unwrap();
+    let info = screen_info();
+    tcp.send(&Message::Hello { version: VERSION, id: "machine-hp".into(), name: "hp".into(), info }).unwrap();
+    let id = match tcp.recv().unwrap() {
+        RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => own_screen_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    assert_eq!(id, 1);
+    let udp_sock = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    udp_sock.connect(("127.0.0.1", h.port)).unwrap();
+    udp_sock.send(&udp::pack(id, 0, &Message::KeepAlive)).unwrap(); // UDP registration
+    h.wait_for_clients(1);
+
+    // Idle on the server side past the active-beacon timeout (1.5 s).
+    // The client's beacons only flow while it is active, so its UDP
+    // "last heard" goes stale during this stretch — exactly the state
+    // that used to make the beacon watchdog drop the client the instant
+    // it was activated again.
+    thread::sleep(Duration::from_millis(2000));
+
+    // Cross onto hp.
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+    assert!(
+        calls(&h.engine_calls).iter().any(|c| c == "cursor false"),
+        "server should hide its cursor (crossed onto hp)"
+    );
+
+    // The client stays silent for a beat (real network: its first beacon
+    // takes a few ms to come back). Without the activation reset, the
+    // watchdog drops it within ~1 ms — its registration timestamp is
+    // already >1.5 s stale — and the local cursor is restored. With the
+    // reset it is granted the full watchdog window.
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !calls(&h.engine_calls).iter().any(|c| c == "cursor true"),
+        "client must survive the activation gap without beaconing"
+    );
+
+    // Now it beacons normally and must stay alive: a wedge drop would
+    // restore the local cursor.
+    for _ in 0..10 {
+        udp_sock.send(&udp::pack(id, 1, &Message::CursorPos { x: SCREEN_W - 25, y: SCREEN_H / 2 })).unwrap();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !calls(&h.engine_calls).iter().any(|c| c == "cursor true"),
+        "client must stay alive while beaconing"
+    );
+}
+#[test]
+fn client_disconnect_returns_cursor_home() {
+    let h = start_server();
+
+    // Connect but never run the loop: the socket stays open.
+    let (client, _injector, _client_calls, _out_rx) = connect_client(h.port);
+    h.wait_for_clients(1);
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 }); // beacon at the shared edge
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 }); // outward push: on hp now
+
+    // Dropping the client closes the TCP connection; the server notices
+    // and returns the cursor to the local screen.
+    drop(client);
+    thread::sleep(Duration::from_millis(150));
+
+    let ec = calls(&h.engine_calls);
+    assert!(ec.iter().any(|c| c == "cursor true"), "cursor should be restored after disconnect, got {ec:?}");
+}
+#[test]
+fn config_hot_reload_returns_cursor_home_and_broadcasts() {
+    let h = start_server();
+
+    let (client, injector, client_calls, out_rx) = connect_client(h.port);
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
+    h.wait_for_clients(1);
+
+    // Move onto hp, then reload a layout that no longer has hp: the
+    // cursor must come home and the client must be told to leave.
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 }); // beacon at the shared edge
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 }); // outward push
+    assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
+
+    let new_layout = Layout::new(vec![Screen {
+        id: 0,
+        name: "pc".into(),
+        rect: Rect { x: 0, y: 0, w: 1920, h: 1080 },
+    }]);
+    h.control_tx
+        .send(Control::Reload(new_layout, Default::default(), Default::default()))
+        .unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    let ec = calls(&h.engine_calls);
+    assert!(ec.iter().any(|c| c == "cursor true"), "cursor should return home, got {ec:?}");
+    assert!(ec.iter().any(|c| c == "warp 960,540"), "cursor should warp to local center, got {ec:?}");
+
+    let cc = calls(&client_calls);
+    assert!(cc.contains(&"leave".to_string()), "client should be told to leave, got {cc:?}");
+
+    // hp was dropped from the layout, so it must be unregistered.
+    assert_eq!(h.server.client_count(), 0, "stale client should be dropped after reload");
+}
+#[test]
+fn duplicate_connection_replaces_stale_one_without_losing_the_live_client() {
+    // The shape of a reconnect race: a machine reconnects before the
+    // server noticed the old socket's death (or a second instance
+    // bypassed the role lock). Both connections carry the same name, so
+    // both get the same screen id. The fresh connection must become the
+    // registered one, and the stale connection's eventual teardown must
+    // NOT unregister the live client — otherwise the server forgets a
+    // connected machine: the GUI flips it to "nearby", crossing stops
+    // routing, while the client keeps its (working) session.
+    let h = start_server();
+
+    // First connection (the one that will turn stale). It must survive
+    // long enough to be replaced, so the client object stays alive on a
+    // thread; a channel lets the test close it (drop) at the right
+    // moment. Its session is never run — the server-side reader only
+    // needs the TCP connection to exist, then to see it close.
+    let (client1, _inj1, _calls1, _out1) = connect_client(h.port);
+    let (close1_tx, close1_rx) = mpsc::channel::<()>();
+    let handle1 = thread::spawn(move || {
+        let _ = close1_rx.recv(); // wait for the signal, then drop (close TCP)
+        drop(client1);
+    });
+    h.wait_for_clients(1);
+
+    // Second connection, same machine name → same screen id. The fresh
+    // one replaces the stale registration (the map holds exactly one).
+    let (client2, injector2, client_calls2, out_rx2) = connect_client(h.port);
+    let handle2 = thread::spawn(move || client2.run(Box::new(injector2), Box::new(NoClipboard), &out_rx2, None).unwrap());
+    h.wait_for_clients(1);
+    assert_eq!(h.server.client_count(), 1, "duplicate connection must replace, not stack");
+
+    // Kill the STALE connection: its TCP closes, and its server-side
+    // reader runs teardown — which must be a no-op for the live
+    // registration (the identity check). Without the fix, this teardown
+    // unregisters the live client and the server forgets it: the GUI
+    // would flip it to "nearby" and crossings would stop routing.
+    close1_tx.send(()).unwrap();
+    let _ = handle1.join();
+    thread::sleep(Duration::from_millis(100)); // let the reader's EOF land
+    assert_eq!(
+        h.server.client_count(),
+        1,
+        "stale connection's teardown must not evict the live replacement"
+    );
+
+    // The live (replacement) client must still be serviced: a crossing
+    // reaches it and it reports home again.
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+    let cc = calls(&client_calls2);
+    assert!(cc.contains(&"enter".to_string()), "live client should still receive crossings, got {cc:?}");
+    assert!(calls(&h.engine_calls).iter().any(|c| c == "cursor false"));
+
+    // Cross back, then end the live session via the server's disconnect
+    // control (the client ends its session; the reader then finishes).
+    feed(&h, Message::MouseMoveRel { dx: 100, dy: 0 });
+    let mut cc = calls(&client_calls2);
+    for _ in 0..50 {
+        if cc.contains(&"leave".to_string()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+        cc = calls(&client_calls2);
+    }
+    assert!(cc.contains(&"leave".to_string()), "live client should cross back, got {cc:?}");
+
+    h.control_tx.send(Control::ClientCommand { name: "hp".into(), command: kvmshare_protocol::id::control::DISCONNECT }).unwrap();
+    let _ = handle2.join();
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 0);
+}
+/// The GUI's connected list is driven by `clients.json`, which the app
+/// layer rewrites per lifecycle event. A server-initiated drop (revoke,
+/// operator disconnect) must emit `ClientDisconnected` — the regression
+/// here was the GUI showing "connected to you" for a machine that had
+/// been dropped, until the client happened to reconnect.
+#[test]
+fn server_initiated_disconnect_updates_the_client_list() {
+    let h = start_server();
+    let (client, injector, _client_calls, out_rx) = connect_client(h.port);
+    thread::spawn(move || client.run(Box::new(injector), Box::new(NoClipboard), &out_rx, None).unwrap());
+    h.wait_for_clients(1);
+
+    // The operator disconnects the machine from the GUI. The control
+    // channel is drained by the main loop's idle poll (CONTROL_POLL =
+    // 100 ms), so allow a few polls for the command to land.
+    h.control_tx
+        .send(Control::ClientCommand { name: "hp".into(), command: kvmshare_protocol::id::control::DISCONNECT })
+        .unwrap();
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(h.server.client_count(), 0);
+    // The GUI's list is driven by the disconnect event; without it,
+    // `clients.json` (and therefore the Home page) kept claiming the
+    // machine was connected. `Harness::events` drains the channel, so
+    // the vec must be captured once and asserted on — re-draining in
+    // the assert silently re-reads an empty channel.
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        events = h.events();
+        if events.iter().any(|e| e == "disconnected:hp") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        events.iter().any(|e| e == "disconnected:hp"),
+        "the operator disconnect must emit ClientDisconnected, got: {events:?}"
+    );
+}
+/// A client whose cursor stream goes silent while it is active (a dozing
+/// Wi-Fi NIC, a wedged motion loop) must be dropped by the beacon
+/// watchdog — and the drop must carry the server's last words on the
+/// wire: `Leave` (restores the client's own input while it still runs)
+/// followed by `Control{RECONNECT}` (its app loop re-handshakes
+/// immediately instead of after the retry delay). A fresh client with
+/// the same name must then be admitted into the same layout slot, and
+/// the GUI's connected list must learn of the drop.
+///
+/// This is the regression behind the mid-use drop on the Wi-Fi laptop:
+/// the session died silently, the GUI kept claiming a connection, and
+/// the reconnect crawled back only on the client's retry timer.
+#[test]
+fn silent_active_client_is_dropped_with_leave_and_reconnect_then_readmitted() {
+    let h = start_server();
+    let info = screen_info();
+
+    // Drive one connection by hand so the exact teardown messages can
+    // be read off the wire (a full Client consumes them internally and
+    // folds them into its SessionEnd).
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", h.port)).unwrap();
+    let mut transport = Transport::with_read_timeout(stream, Some(Duration::from_millis(100))).unwrap();
+    transport
+        .send(&Message::Hello { version: VERSION, id: "machine-hp".into(), name: "hp".into(), info: info.clone() })
+        .unwrap();
+    match transport.recv().unwrap() {
+        RecvResult::Msg(Message::Welcome { own_screen_id, .. }) => assert_eq!(own_screen_id, 1),
+        other => panic!("expected welcome, got {other:?}"),
+    }
+    h.wait_for_clients(1);
+
+    // Register the cursor stream (the client's first datagram), then
+    // cross onto hp: park the real cursor on the left wall (absolute
+    // beacon), push outward (relative motion). The client is now
+    // active — its beacons are what keeps it alive.
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.connect(format!("127.0.0.1:{}", h.port)).unwrap();
+    udp.send(&udp::pack(1, 1, &Message::KeepAlive)).unwrap();
+    thread::sleep(Duration::from_millis(80));
+    feed(&h, Message::MouseMoveAbs { x: 0, y: SCREEN_H / 2 });
+    feed(&h, Message::MouseMoveRel { dx: -5, dy: 0 });
+    // A couple of in-screen beacons: proof the stream was alive before
+    // it went silent (the watchdog measures silence from the last one).
+    udp.send(&udp::pack(1, 2, &Message::CursorPos { x: 100, y: 100 })).unwrap();
+    thread::sleep(Duration::from_millis(80));
+    udp.send(&udp::pack(1, 3, &Message::CursorPos { x: 120, y: 100 })).unwrap();
+
+    // Now go fully silent on the stream (no more beacons) while the TCP
+    // channel stays connected — the exact mid-use Wi-Fi shape. The
+    // watchdog fires after ACTIVE_BEACON_TIMEOUT; allow generous slack.
+    let mut last_words: Vec<Message> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while std::time::Instant::now() < deadline {
+        match transport.recv().unwrap() {
+            RecvResult::Msg(msg) => match &msg {
+                Message::Leave { .. } | Message::Control { .. } => last_words.push(msg),
+                _ => {} // Enter and friends from the crossing — expected
+            },
+            RecvResult::NoData => {}
+            RecvResult::Eof => break,
+        }
+        if last_words.iter().any(|m| matches!(m, Message::Control { .. })) {
+            break;
+        }
+        // No client-count shortcut here: teardown empties the map as
+        // soon as the messages are enqueued, and breaking on that raced
+        // the Control frame's arrival at the socket.
+    }
+    assert_eq!(
+        last_words.first(),
+        Some(&Message::Leave { screen_id: 1 }),
+        "teardown must restore the dropped client's input first, got {last_words:?}"
+    );
+    assert_eq!(
+        last_words.get(1),
+        Some(&Message::Control { command: kvmshare_protocol::id::control::RECONNECT }),
+        "teardown must command the reconnect, got {last_words:?}"
+    );
+    for _ in 0..100 {
+        if h.server.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 0, "the silent client must be dropped");
+
+    // The GUI's list must have learned of the drop (the event drives
+    // clients.json).
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        events = h.events();
+        if events.iter().any(|e| e == "disconnected:hp") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(events.iter().any(|e| e == "disconnected:hp"), "GUI must see the drop, got: {events:?}");
+
+    // The machine comes back (reconnect, wake from sleep, fresh start):
+    // admitted into the same slot by the same rule as before.
+    let client = Client::connect(&format!("127.0.0.1:{}", h.port), "hp", "machine-hp", info).unwrap();
+    assert_eq!(client.own_id(), 1, "the fresh session must reuse the layout slot");
+    for _ in 0..100 {
+        if h.server.client_count() >= 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.server.client_count(), 1, "the fresh client must be admitted");
+}
