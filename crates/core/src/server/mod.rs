@@ -88,6 +88,19 @@ pub enum Control {
     /// its screen name. `command` is a [`kvmshare_protocol::id::control`]
     /// constant. The GUI writes these via the `server.cmd` control file.
     ClientCommand { name: String, command: u8 },
+    /// The `[media]` routing policy changed on disk — adopt it now, and
+    /// re-arm (or release) the media-key grab to match. Separate from
+    /// [`Control::Reload`] because its one side effect is a *grab* change:
+    /// the capture layer intercepts media keys while routing is enabled,
+    /// and every other reload path must never touch that state. Without
+    /// this, a policy edit only took effect at the next restart — the
+    /// GUI's media page would claim a change the running router never
+    /// adopted.
+    SetMediaPrefs(crate::media::MediaPrefs),
+    /// The `[audio]` configuration changed on disk — adopt it now. The
+    /// audio link is re-settled by the connection paths from the shared
+    /// setup, so the only immediate duty is swapping the setup itself.
+    SetAudioOptions(Option<Arc<audio::ServerAudio>>),
 }
 
 /// The server's connection policy, loaded from the `[network]` config
@@ -240,9 +253,10 @@ pub struct Server {
     /// trust the server (discovery, auto-connect).
     server_id: String,
     /// Audio sharing setup, when `[audio]` asked for it. `None` = off.
-    /// Handed to every [`ClientCtx`] so the per-client decide-and-attach
-    /// step sees the same configuration.
-    audio: Option<Arc<audio::ServerAudio>>,
+    /// Behind a lock so a hot `[audio]` config edit can swap it while the
+    /// server runs; each [`ClientCtx`] snapshots it when the server loop
+    /// starts.
+    audio: Arc<Mutex<Option<Arc<audio::ServerAudio>>>>,
     /// The media routing policy. Shared (and hot-reloadable) so a policy
     /// edit applies to the next key press rather than the next restart.
     media: Arc<Mutex<crate::media::MediaPrefs>>,
@@ -311,7 +325,7 @@ impl Server {
             policy: Arc::new(Mutex::new(opts.policy)),
             events: Mutex::new(opts.events),
             server_id: opts.server_id,
-            audio: opts.audio,
+            audio: Arc::new(Mutex::new(opts.audio)),
             media: Arc::new(Mutex::new(crate::media::MediaPrefs::default())),
             gain: Arc::new(std::sync::Mutex::new(crate::motion::GainTracker::new())),
         })
@@ -398,7 +412,7 @@ impl Server {
             policy: self.policy.clone(), // shared: hot policy changes apply
             events: self.events.lock().unwrap().clone(),
             server_id: self.server_id.clone(),
-            audio: self.audio.clone(),
+            audio: self.audio.lock().unwrap().clone(),
         });
         let udp_accept = self.udp.clone();
         let ctx_accept = ctx.clone();
@@ -566,6 +580,14 @@ impl Server {
                 self.apply_policy(policy);
                 return Ok(());
             }
+            Control::SetMediaPrefs(prefs) => {
+                self.apply_media_prefs(prefs, engine);
+                return Ok(());
+            }
+            Control::SetAudioOptions(audio) => {
+                self.apply_audio_options(audio);
+                return Ok(());
+            }
             Control::Reload(layout, bindings, prefs) => {
                 let mut session = self.session.lock().unwrap();
                 session.set_bindings(bindings);
@@ -607,6 +629,48 @@ impl Server {
             Layout { screens: s.layout().screens.clone() }
         };
         self.broadcast(&Message::Layout { layout })
+    }
+
+    /// Adopt a hot `[media]` policy change.
+    ///
+    /// Stores the new prefs and re-arms the media-key grab in the same
+    /// step, mirroring what startup does (see the `run` loop's arming).
+    /// The two must travel together: routing on with the grab un-armed
+    /// would let a routed key act on both machines, and an armed grab with
+    /// routing off would swallow keys for nothing. The active-cursor rule
+    /// (never re-grab while the cursor is away) is the same one the run
+    /// loop applies.
+    fn apply_media_prefs(&self, prefs: crate::media::MediaPrefs, engine: &Arc<Mutex<Box<dyn Engine>>>) {
+        *self.media.lock().unwrap() = prefs;
+        if self.active.lock().unwrap().is_none() {
+            media::arm_capture(engine, media::wants_capture(&self.media.lock().unwrap()));
+        }
+        log_info!(
+            "media policy updated (routing {})",
+            if self.media.lock().unwrap().route_media_keys { "on" } else { "off" }
+        );
+    }
+
+    /// Adopt a hot `[audio]` configuration.
+    ///
+    /// The new setup is only stored: every live audio link is attached to
+    /// a *client connection*, whose lifetime is the session's, and those
+    /// links already hold a runtime built from the old options. Tearing a
+    /// running stream down mid-session because the user resized a device
+    /// name would be an interruption the config edit did not ask for; the
+    /// new options are picked up by the next connection — which, for audio
+    /// changes, is the same "reconnect applies it" contract the client
+    /// side has.
+    fn apply_audio_options(&self, audio: Option<Arc<audio::ServerAudio>>) {
+        if audio.is_some() {
+            log_info!("audio configuration updated (applies to the next connection)");
+        } else {
+            log_info!("audio sharing disabled by config");
+        }
+        *self
+            .audio
+            .lock()
+            .unwrap() = audio;
     }
 
     /// Adopt a hot `[network]` policy change and enforce its one immediate

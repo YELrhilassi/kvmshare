@@ -48,6 +48,13 @@ pub enum UserAction {
     ToggleLock,
     /// Return control to the server immediately (same as the escape key).
     GoHome,
+    /// Pin media routing to the screen named `to` until the same chord is
+    /// pressed again (a toggle, not a momentary hold: a held modifier set
+    /// cannot also be a *media* press, and a latch survives the chord).
+    /// The explicit override for the inferred policies — the user saw the
+    /// router pick the wrong machine and says which one they meant. See
+    /// [`crate::media::MediaPrefs`].
+    ToggleMediaPin { to: String },
 }
 
 /// Modifier bits for a chord. Platform-independent: every platform's
@@ -420,6 +427,7 @@ impl ActionEngine {
             "cycle" => Some(UserAction::SwitchNext),
             "lock" => Some(UserAction::ToggleLock),
             "home" if !at_home => Some(UserAction::GoHome),
+            "media_pin" if !spec.screen.is_empty() => Some(UserAction::ToggleMediaPin { to: spec.screen.clone() }),
             _ => None,
         }
     }

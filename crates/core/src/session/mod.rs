@@ -144,6 +144,11 @@ pub struct Session {
     /// Fed by `AudioState`, consumed by the media router's
     /// `last_active_source` policy — see [`crate::media`].
     last_active: Option<u8>,
+    /// The user's explicit media-target override: a screen id the router
+    /// must use regardless of the configured policy, until the same
+    /// shortcut is pressed again. `None` = no override. See
+    /// [`Session::media_override`] and [`crate::media`].
+    media_override: Option<u8>,
 }
 
 impl Session {
@@ -169,6 +174,7 @@ impl Session {
             walls_locked: false,
             prefs: InputPrefs::default(),
             last_active: None,
+            media_override: None,
         }
     }
 
@@ -184,6 +190,31 @@ impl Session {
     /// The screen that most recently reported audio playing.
     pub fn last_active(&self) -> Option<u8> {
         self.last_active
+    }
+
+    /// The user's explicit media-target override, when one is latched.
+    ///
+    /// This outranks every configured policy: the user pressed the
+    /// "media lives there now" shortcut after watching the router pick
+    /// wrong, and an inference must never outvote a human. It clears on
+    /// the same shortcut (a toggle), when the pinned client departs (a pin
+    /// to nobody is not a policy), and never silently on its own — the
+    /// point of an override is that it stays put.
+    pub fn media_override(&self) -> Option<u8> {
+        self.media_override
+    }
+
+    /// Toggle the media-target override to the screen currently named
+    /// `name`, as the user's shortcut named it. Unknown names are a no-op:
+    /// a shortcut naming a machine that is not in the layout must not
+    /// wipe an override that is doing its job.
+    pub fn toggle_media_override(&mut self, name: &str) {
+        let id = self.layout.screens.iter().find(|s| s.name == name).map(|s| s.id);
+        match (id, self.media_override) {
+            (Some(id), Some(current)) if id == current => self.media_override = None,
+            (Some(id), _) => self.media_override = Some(id),
+            (None, _) => {}
+        }
     }
 
     /// Record a peer's answer to "do you have audio playing?".
@@ -204,6 +235,12 @@ impl Session {
     pub fn on_client_departed(&mut self, screen_id: u8) {
         if self.last_active == Some(screen_id) {
             self.last_active = None;
+        }
+        // The override too: a pin to a machine that cannot receive is not
+        // a policy, it is a dead key. It clears so the configured policy
+        // takes over again.
+        if self.media_override == Some(screen_id) {
+            self.media_override = None;
         }
     }
 
@@ -398,8 +435,12 @@ impl Session {
     /// A client with the given id disconnected: drop back to the local
     /// screen if the cursor was on it, and make its screen a dead edge
     /// again (no crossing may enter a screen whose client is gone).
+    /// Also retires the machine's media-routing state: it can no longer be
+    /// the last active source, and an override pin pointing at it would be
+    /// a dead key (see [`Self::on_client_departed`]).
     pub fn on_client_disconnected(&mut self, id: u8) -> Action {
         self.connected.remove(&id);
+        self.on_client_departed(id);
         if self.cursor.mode == Mode::Remote(id) {
             self.force_local()
         } else {

@@ -153,6 +153,11 @@ pub struct MediaContext<'a> {
     /// Screen id that most recently reported audio playing; `None` when
     /// nothing is playing anywhere.
     pub last_active: Option<u8>,
+    /// The user's explicit override, latched by the media-target
+    /// shortcut until pressed again. When set it outranks every target
+    /// policy — an inference must never outvote a human. `None` = the
+    /// configured policy decides.
+    pub override_target: Option<u8>,
     /// Resolve a machine id to its screen id, when that machine is
     /// currently connected.
     pub screen_of: &'a dyn Fn(&str) -> Option<u8>,
@@ -162,7 +167,7 @@ impl<'a> MediaContext<'a> {
     /// A context with nothing connected — the case that must never
     /// swallow a key.
     pub fn alone() -> Self {
-        Self { focus: None, last_active: None, screen_of: &|_| None }
+        Self { focus: None, last_active: None, override_target: None, screen_of: &|_| None }
     }
 }
 
@@ -179,8 +184,20 @@ pub fn resolve(
 ) -> ResolvedTarget {
     // The master switch short-circuits everything: with routing off, no
     // key is ever intercepted, whatever the per-category policy says.
+    // (An override while routing is off therefore does nothing — routing
+    // off means "kvmshare is not here", which is the switch's whole point.)
     if !prefs.route_media_keys {
         return ResolvedTarget::Local;
+    }
+
+    // The user's explicit override outranks every category, including the
+    // volume/output split: they said where media lives *now*, and both
+    // categories follow until the shortcut is pressed again. An override
+    // naming a departed machine is cleared by the session, so it can only
+    // name a connected screen here — which makes the fallback unreachable
+    // in this branch by construction.
+    if let Some(id) = ctx.override_target {
+        return ResolvedTarget::Remote(id);
     }
 
     let target = if command.is_volume() {
@@ -230,7 +247,7 @@ mod tests {
 
     /// A context with `hp` (screen 1) connected and focused.
     fn focused_on_hp(last_active: Option<u8>) -> MediaContext<'static> {
-        MediaContext { focus: Some(1), last_active, screen_of: &screen_of }
+        MediaContext { focus: Some(1), last_active, override_target: None, screen_of: &screen_of }
     }
 
     #[test]
@@ -263,7 +280,7 @@ mod tests {
         );
 
         // Cursor home → local, and never swallowed.
-        let home = MediaContext { focus: None, last_active: None, screen_of: &|_| None };
+        let home = MediaContext { focus: None, last_active: None, override_target: None, screen_of: &|_| None };
         assert_eq!(
             resolve(&prefs, MediaCommand::PlayPause, &home),
             ResolvedTarget::Local
@@ -280,7 +297,7 @@ mod tests {
             fallback_local: true,
         };
         // Cursor is home, but transport still reaches hp...
-        let ctx = MediaContext { focus: None, last_active: None, screen_of: &screen_of };
+        let ctx = MediaContext { focus: None, last_active: None, override_target: None, screen_of: &screen_of };
         assert_eq!(
             resolve(&prefs, MediaCommand::Next, &ctx),
             ResolvedTarget::Remote(1)
@@ -300,7 +317,7 @@ mod tests {
             fallback_local: true,
         };
         // Focused on screen 2, but sound came from screen 3.
-        let ctx = MediaContext { focus: Some(2), last_active: Some(3), screen_of: &|_| None };
+        let ctx = MediaContext { focus: Some(2), last_active: Some(3), override_target: None, screen_of: &|_| None };
         assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Remote(3));
         assert_eq!(resolve(&prefs, MediaCommand::VolumeDown, &ctx), ResolvedTarget::Remote(2));
     }
@@ -315,12 +332,12 @@ mod tests {
             volume: MediaTarget::FocusOrLastActive,
             fallback_local: true,
         };
-        let ctx = MediaContext { focus: Some(2), last_active: Some(3), screen_of: &|_| None };
+        let ctx = MediaContext { focus: Some(2), last_active: Some(3), override_target: None, screen_of: &|_| None };
         assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Remote(2));
 
         // Cursor home: the last active source keeps control, so the user
         // never has to reach for the mouse to pause a track.
-        let ctx = MediaContext { focus: None, last_active: Some(3), screen_of: &|_| None };
+        let ctx = MediaContext { focus: None, last_active: Some(3), override_target: None, screen_of: &|_| None };
         assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Remote(3));
     }
 
@@ -334,7 +351,7 @@ mod tests {
             volume: MediaTarget::LastActiveSource,
             fallback_local: true,
         };
-        let ctx = MediaContext { focus: Some(1), last_active: None, screen_of: &|_| None };
+        let ctx = MediaContext { focus: Some(1), last_active: None, override_target: None, screen_of: &|_| None };
         assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Local);
     }
 
@@ -348,7 +365,7 @@ mod tests {
             volume: MediaTarget::default(),
             fallback_local: true,
         };
-        let ctx = MediaContext { focus: Some(1), last_active: Some(1), screen_of: &|_| None };
+        let ctx = MediaContext { focus: Some(1), last_active: Some(1), override_target: None, screen_of: &|_| None };
         assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Local);
     }
 
@@ -361,7 +378,7 @@ mod tests {
             volume: MediaTarget::default(),
             fallback_local: false,
         };
-        let ctx = MediaContext { focus: Some(1), last_active: None, screen_of: &|_| None };
+        let ctx = MediaContext { focus: Some(1), last_active: None, override_target: None, screen_of: &|_| None };
         assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Drop);
         // An explicit `local` target is still local — the fallback only
         // governs *unresolved* targets.
@@ -394,6 +411,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The user's explicit override outranks every configured policy —
+    /// transport, volume, whatever they said — because it is the answer to
+    /// "the router picked wrong".
+    #[test]
+    fn the_override_outranks_every_policy() {
+        let policies = [
+            MediaTarget::Local,
+            MediaTarget::FollowFocus,
+            MediaTarget::Machine("hp-machine-id".into()),
+            MediaTarget::LastActiveSource,
+            MediaTarget::FocusOrLastActive,
+        ];
+        for p in policies {
+            let prefs = MediaPrefs {
+                route_media_keys: true,
+                transport: p.clone(),
+                volume: p,
+                fallback_local: true,
+            };
+            // Cursor on 2, sound from 3, policy saying whatever it says:
+            // the override wins.
+            let ctx = MediaContext {
+                focus: Some(2),
+                last_active: Some(3),
+                override_target: Some(1),
+                screen_of: &screen_of,
+            };
+            for cmd in MediaCommand::ALL {
+                assert_eq!(resolve(&prefs, cmd, &ctx), ResolvedTarget::Remote(1), "{cmd:?}");
+            }
+        }
+    }
+
+    /// An override never survives routing being switched off: the master
+    /// switch means "kvmshare is not here", and an override cannot make a
+    /// disabled feature act.
+    #[test]
+    fn an_override_is_inert_while_routing_is_off() {
+        let prefs = MediaPrefs {
+            route_media_keys: false,
+            ..MediaPrefs::default()
+        };
+        let ctx = MediaContext {
+            focus: None,
+            last_active: None,
+            override_target: Some(1),
+            screen_of: &screen_of,
+        };
+        assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Local);
     }
 
     #[test]

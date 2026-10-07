@@ -118,6 +118,14 @@ impl Session {
                 self.walls_locked = !self.walls_locked;
                 vec![]
             }
+            UserAction::ToggleMediaPin { to } => {
+                // The user's explicit "media lives there now" toggle: an
+                // override that stays latched (see `toggle_media_override`)
+                // until the same chord names it again — or the machine
+                // leaves, which clears it in `on_client_departed`.
+                self.toggle_media_override(&to);
+                vec![]
+            }
             UserAction::GoHome if !matches!(self.cursor.mode, Mode::Local) => {
                 vec![self.force_local()]
             }

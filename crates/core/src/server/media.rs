@@ -69,9 +69,9 @@ pub struct MediaRoute<'a> {
 /// Pure in its decision (it delegates to [`resolve`]) and explicit in its
 /// effects, so a test can drive it with a fake engine and a client map.
 pub fn route_command(rt: &MediaRoute<'_>, command: MediaCommand) -> Routed {
-    let (focus, last_active) = {
+    let (focus, last_active, override_target) = {
         let session = rt.session.lock().unwrap();
-        (session.focus(), session.last_active())
+        (session.focus(), session.last_active(), session.media_override())
     };
     let prefs = rt.prefs.clone();
 
@@ -93,6 +93,7 @@ pub fn route_command(rt: &MediaRoute<'_>, command: MediaCommand) -> Routed {
         let context = MediaContext {
             focus,
             last_active,
+            override_target,
             screen_of: &screen_of,
         };
         resolve(&prefs, command, &context)
@@ -203,7 +204,8 @@ mod tests {
                 None
             }
         };
-        let context = MediaContext { focus: None, last_active: None, screen_of: &screen_of };
+        let context =
+            MediaContext { focus: None, last_active: None, override_target: None, screen_of: &screen_of };
         assert_eq!(resolve(&prefs, MediaCommand::Next, &context), ResolvedTarget::Local);
     }
 }
