@@ -180,31 +180,82 @@ func validateAudio(a AudioSection) error {
 	return nil
 }
 
+// rawSectionReader is the decode half every media/audio read needs: the
+// two sections, and whether each was present. A missing file is an empty
+// document (not an error — everything the file could have said is in the
+// section pointers); every other read error and every parse error is.
+type rawSections struct {
+	Media *mediaFile
+	Audio *audioFile
+}
+
+// readMediaAudioSections decodes a config file's `[media]`/`[audio]`
+// sections. Both pointers are nil when the file (or the section) does not
+// exist, so "absent" and "default" stay distinguishable — the settings
+// page must show the server's defaults without pretending the user
+// wrote them.
+func readMediaAudioSections(path string) (*mediaFile, *audioFile, error) {
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("read config: %w", err)
+	}
+	var cf rawSections
+	if err := toml.Unmarshal(raw, &cf); err != nil {
+		return nil, nil, fmt.Errorf("parse config: %w", err)
+	}
+	return cf.Media, cf.Audio, nil
+}
+
+// editConfigFile re-reads `path`, lets `edit` put values into the decoded
+// section map, and atomically rewrites the whole file under the
+// cross-process config lock. Unrelated sections decode as generic TOML
+// and pass through untouched; the lock is the same one the Rust side and
+// SaveConfig take, so read-modify-writes of the same file from either
+// process can never interleave and erase each other's change (layout
+// saves, trust edits, media policy — all live in one file).
+//
+// A missing file is an empty document: the first save creates it.
+func editConfigFile(what string, path string, edit func(sections map[string]any)) error {
+	raw, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", what, err)
+	}
+	var cf map[string]any
+	if len(raw) > 0 {
+		if err := toml.Unmarshal(raw, &cf); err != nil {
+			return fmt.Errorf("parse %s: %w", what, err)
+		}
+	}
+	if cf == nil {
+		cf = map[string]any{}
+	}
+	edit(cf)
+	out, err := toml.Marshal(cf)
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", what, err)
+	}
+	if err := fileutil.WriteLocked(path, out, 0o644, true); err != nil {
+		return fmt.Errorf("write %s: %w", what, err)
+	}
+	return nil
+}
+
 // LoadMediaAudio returns the server-role media routing and audio sharing
 // settings from the server's config file.
 func (a *App) LoadMediaAudio() (MediaSection, AudioSection, error) {
-	raw, err := os.ReadFile(a.configPath)
-	if os.IsNotExist(err) {
-		// No config yet: the defaults the server will write on its first
-		// start. Nothing to read is not an error to show.
-		return defaultMedia(), defaultAudio(), nil
-	}
+	mf, af, err := readMediaAudioSections(a.configPath)
 	if err != nil {
-		return MediaSection{}, AudioSection{}, fmt.Errorf("read config: %w", err)
-	}
-	var cf struct {
-		Media  *mediaFile  `toml:"media"`
-		Audio  *audioFile  `toml:"audio"`
-	}
-	if err := toml.Unmarshal(raw, &cf); err != nil {
-		return MediaSection{}, AudioSection{}, fmt.Errorf("parse config: %w", err)
+		return MediaSection{}, AudioSection{}, err
 	}
 	m, au := defaultMedia(), defaultAudio()
-	if cf.Media != nil {
-		m = cf.Media.json()
+	if mf != nil {
+		m = mf.json()
 	}
-	if cf.Audio != nil {
-		au = cf.Audio.json()
+	if af != nil {
+		au = af.json()
 	}
 	return m, au, nil
 }
@@ -225,29 +276,10 @@ func (a *App) SaveMediaAudio(m MediaSection, au AudioSection) error {
 	// SaveConfig: the server also writes this file (auto-trust, screen
 	// corrections), and the lock is what keeps the two writers from
 	// erasing each other.
-	raw, err := os.ReadFile(a.configPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read config: %w", err)
-	}
-	var cf map[string]any
-	if len(raw) > 0 {
-		if err := toml.Unmarshal(raw, &cf); err != nil {
-			return fmt.Errorf("parse config: %w", err)
-		}
-	}
-	if cf == nil {
-		cf = map[string]any{}
-	}
-	cf["media"] = m.file()
-	cf["audio"] = au.file()
-	out, err := toml.Marshal(cf)
-	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
-	}
-	if err := fileutil.WriteLocked(a.configPath, out, 0o644, true); err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-	return nil
+	return editConfigFile("config", a.configPath, func(cf map[string]any) {
+		cf["media"] = m.file()
+		cf["audio"] = au.file()
+	})
 }
 
 // clientConfigPath resolves the client role's own config file — the
@@ -301,27 +333,11 @@ func (a *App) SaveClientAudio(au AudioSection) error {
 	// be dead weight here (the client has exactly one peer — the server
 	// that admitted it), so it is never written.
 	au.Peer = ""
-	path := a.clientConfigPath()
-	raw, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read client config: %w", err)
-	}
-	var cf map[string]any
-	if len(raw) > 0 {
-		if err := toml.Unmarshal(raw, &cf); err != nil {
-			return fmt.Errorf("parse client config: %w", err)
-		}
-	}
-	if cf == nil {
-		cf = map[string]any{}
-	}
-	cf["audio"] = au.file()
-	out, err := toml.Marshal(cf)
-	if err != nil {
-		return fmt.Errorf("encode client config: %w", err)
-	}
-	if err := fileutil.Write(path, out, 0o644); err != nil {
-		return fmt.Errorf("write client config: %w", err)
-	}
-	return nil
+	// Under the config lock, like every other config write: the client
+	// reads this file on every reconnect, and an unlocked write is one
+	// racy read away from serving it a torn config. Same discipline,
+	// one helper.
+	return editConfigFile("client config", a.clientConfigPath(), func(cf map[string]any) {
+		cf["audio"] = au.file()
+	})
 }

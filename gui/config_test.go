@@ -240,6 +240,74 @@ func TestSaveConfigDoesNotStartServer(t *testing.T) {
 	}
 }
 
+// A layout save must never erase the [media]/[audio] sections: they are
+// edited (and saved) by their own page, so a save from any other page
+// carries them through untouched. This used to be a real data-loss bug —
+// the layout save rewrote the whole file without them and the running
+// server hot-reloaded the loss as "routing off, audio off".
+func TestSaveConfigPreservesMediaAndAudioSections(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	// The media page saved its sections first.
+	if err := a.SaveMediaAudio(defaultMedia(), defaultAudio()); err != nil {
+		t.Fatal(err)
+	}
+	// The media page set a non-default policy so the loss would be visible.
+	if err := a.SaveMediaAudio(MediaSection{
+		RouteMediaKeys: true,
+		Transport:      "machine:98980a4d",
+		Volume:         "local",
+		FallbackLocal:  true,
+	}, defaultAudio()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then the user saves a layout from the Server page — a Config that
+	// does not mention media or audio at all (nil pointers), exactly what
+	// the frontend sends.
+	layoutOnly := Config{
+		Port:    defaultPort,
+		Screens: []Screen{{Name: "pc", Width: 1920, Height: 1080, X: 0, Y: 0}},
+		Network: Network{Allowlist: true, LocalOnly: true, TrustedIDs: []string{}, RevokedIDs: []string{}},
+	}
+	if err := a.SaveConfig(layoutOnly); err != nil {
+		t.Fatal(err)
+	}
+
+	m, au, err := a.LoadMediaAudio()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Transport != "machine:98980a4d" || m.Volume != "local" {
+		t.Fatalf("a layout save wiped the media policy: %+v", m)
+	}
+	if !m.RouteMediaKeys || !m.FallbackLocal {
+		t.Fatalf("a layout save reset the media switches: %+v", m)
+	}
+	if au.ActivityFloorDb != defaultAudio().ActivityFloorDb {
+		t.Fatalf("a layout save clobbered the audio section: %+v", au)
+	}
+
+	// And the sections still round-trip through a full load/save cycle.
+	cfg, err := a.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Media == nil || cfg.Audio == nil {
+		t.Fatalf("media/audio not surfaced on a full load: %+v", cfg)
+	}
+	if err := a.SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err = a.LoadMediaAudio()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Transport != "machine:98980a4d" {
+		t.Fatalf("full load/save cycle lost the media policy: %+v", m)
+	}
+}
+
 // The trust/revoke lists survive a save that does not mention them (a
 // layout edit), while an explicit empty list still clears them. Without
 // the nil-means-keep rule, editing a screen would silently wipe the

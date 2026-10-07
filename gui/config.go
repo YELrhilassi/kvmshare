@@ -52,6 +52,14 @@ type Config struct {
 	// never registered.
 	Shortcuts *ShortcutSection `json:"shortcuts,omitempty"`
 	Input     *InputSection    `json:"input,omitempty"`
+	// [media]/[audio], same contract as Shortcuts/Input: they are edited
+	// on their own page and saved by their own methods, so a layout save
+	// carries them through as pointers and nil keeps the on-disk values.
+	// Without this, a SaveConfig (which writes the whole file) silently
+	// erased the media routing policy and the audio consent the moment a
+	// user touched any other page.
+	Media *MediaSection `json:"media,omitempty"`
+	Audio *AudioSection `json:"audio,omitempty"`
 }
 
 // ShortcutSection is the `[shortcuts]` TOML section (schema owned by
@@ -93,6 +101,8 @@ type configFile struct {
 	Network   networkFile      `toml:"network"`
 	Shortcuts *ShortcutSection `toml:"shortcuts,omitempty"`
 	Input     *inputFile       `toml:"input,omitempty"`
+	Media     *mediaFile       `toml:"media,omitempty"`
+	Audio     *audioFile       `toml:"audio,omitempty"`
 }
 
 // inputFile is the on-disk `[input]` shape: snake_case, as the Rust
@@ -217,6 +227,14 @@ func (a *App) LoadConfig() (Config, error) {
 	if cf.Input != nil {
 		cfg.Input = cf.Input.jsonInput()
 	}
+	if cf.Media != nil {
+		m := cf.Media.json()
+		cfg.Media = &m
+	}
+	if cf.Audio != nil {
+		af := cf.Audio.json()
+		cfg.Audio = &af
+	}
 	// Old configs have no [network] section; default to secure.
 	if !cf.Network.Allowlist && !cf.Network.LocalOnly && len(cf.Network.TrustedIDs) == 0 {
 		cfg.Network.Allowlist = true
@@ -276,14 +294,23 @@ func (a *App) SaveConfig(cfg Config) error {
 			}
 		}
 	}
-	// Sections the frontend did not touch keep their on-disk values.
-	if cfg.Shortcuts == nil || cfg.Input == nil {
+	// Sections the frontend did not touch keep their on-disk values: the
+	// same nil-means-keep rule the policy lists above follow. (A save that
+	// cannot re-read the current file fails anyway — an unreadable config
+	// is not one worth overwriting.)
+	if cfg.Shortcuts == nil || cfg.Input == nil || cfg.Media == nil || cfg.Audio == nil {
 		if current, err := a.LoadConfig(); err == nil {
 			if cfg.Shortcuts == nil {
 				cfg.Shortcuts = current.Shortcuts
 			}
 			if cfg.Input == nil {
 				cfg.Input = current.Input
+			}
+			if cfg.Media == nil {
+				cfg.Media = current.Media
+			}
+			if cfg.Audio == nil {
+				cfg.Audio = current.Audio
 			}
 		}
 	}
@@ -300,6 +327,14 @@ func (a *App) SaveConfig(cfg Config) error {
 	}
 	if cfg.Input != nil {
 		cf.Input = cfg.Input.fileInput()
+	}
+	if cfg.Media != nil {
+		m := cfg.Media.file()
+		cf.Media = &m
+	}
+	if cfg.Audio != nil {
+		af := cfg.Audio.file()
+		cf.Audio = &af
 	}
 	for _, s := range cfg.Screens {
 		cf.Screens = append(cf.Screens, screenFile{
