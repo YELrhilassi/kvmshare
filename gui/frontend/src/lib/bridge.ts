@@ -247,7 +247,9 @@ export function onState(cb: (s: LiveSnapshot) => void): () => void {
   };
 }
 
-interface GoApp {
+// The bound service surface. Exported so feature stores can take the
+// api() thunk as a dependency (a store test can hand it a fake).
+export interface GoApp {
   GetSettings(): Promise<Settings>;
   SetSettings(s: Settings): Promise<void>;
   GetPaths(): Promise<Paths>;
