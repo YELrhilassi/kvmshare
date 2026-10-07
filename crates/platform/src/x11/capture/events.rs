@@ -8,6 +8,8 @@ use x11rb::protocol::xinput::{self, EventMask, Fp3232, XIEventMask};
 use x11rb::protocol::xproto;
 use x11rb::rust_connection::RustConnection;
 
+use kvmshare_protocol::message::MediaCommand;
+
 use crate::keys::ESCAPE_KEY_HID;
 
 /// Device 0 = all devices for `xi_select_events`.
@@ -54,6 +56,19 @@ pub enum CaptureCommand {
     /// `(mods, key)` pairs; `key` is a canonical HID usage, `mods` the
     /// 4-bit ctrl|alt|shift|meta mask. An empty list releases everything.
     BindChords(Vec<(u8, u32)>),
+    /// Arm (or disarm) the **media-key grab** so the local desktop never
+    /// acts on a media key that the router is going to place elsewhere.
+    /// The reply carries the outcome, because whether suppression is armed
+    /// is what tells a log line "media keys are routed" apart from "media
+    /// keys also act on this machine" — a claim the caller must not have
+    /// to guess at.
+    MediaCapture(bool, std::sync::mpsc::SyncSender<Result<(), String>>),
+    /// Perform a media command on this machine: tap the media key a
+    /// physical keyboard would send (see [`crate::x11::media`]), which is
+    /// what the router's `local` outcome means. Sent only while the grab is
+    /// armed — an ungrabbed key already reached the desktop, and tapping it
+    /// again would act twice.
+    Media(MediaCommand),
 }
 
 /// Select XI2 raw events on `root`.

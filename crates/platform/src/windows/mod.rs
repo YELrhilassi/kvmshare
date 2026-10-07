@@ -36,6 +36,7 @@ pub(crate) mod cursor_hide;
 mod engine;
 mod injector;
 mod isolation;
+pub(crate) mod media;
 mod timer;
 
 use std::sync::mpsc::Receiver;

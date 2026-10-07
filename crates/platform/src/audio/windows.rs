@@ -549,18 +549,20 @@ mod tests {
     /// The WAVEFORMATEX must describe exactly what the wire carries:
     /// 16-bit PCM at the negotiated rate and channel count. Getting these
     /// wrong is silent corruption — the stream plays, at the wrong speed
-    /// or with the channels misaligned.
+    /// or with the channels misaligned. (The struct is `#[repr(packed)]`
+    /// in the bindings, so every field is read by copy — a reference to a
+    /// packed field is unaligned and rejected by the compiler.)
     #[test]
     fn the_wave_format_describes_the_negotiated_pcm() {
         let fmt = AudioFormat::default();
         let wf = wave_format(fmt);
-        assert_eq!(wf.wFormatTag, 1, "WAVE_FORMAT_PCM");
-        assert_eq!(wf.nChannels, 2);
-        assert_eq!(wf.nSamplesPerSec, 48_000);
-        assert_eq!(wf.wBitsPerSample, 16);
-        assert_eq!(wf.nBlockAlign, 4, "2 channels x 2 bytes");
-        assert_eq!(wf.nAvgBytesPerSec, 48_000 * 4, "rate x block align");
-        assert_eq!(wf.cbSize, 0, "plain WAVEFORMATEX, no extension");
+        assert_eq!({ wf.wFormatTag }, 1, "WAVE_FORMAT_PCM");
+        assert_eq!({ wf.nChannels }, 2);
+        assert_eq!({ wf.nSamplesPerSec }, 48_000);
+        assert_eq!({ wf.wBitsPerSample }, 16);
+        assert_eq!({ wf.nBlockAlign }, 4, "2 channels x 2 bytes");
+        assert_eq!({ wf.nAvgBytesPerSec }, 48_000 * 4, "rate x block align");
+        assert_eq!({ wf.cbSize }, 0, "plain WAVEFORMATEX, no extension");
     }
 
     /// Mono and a different rate are carried through unchanged — the
@@ -569,10 +571,10 @@ mod tests {
     fn a_negotiated_format_is_described_faithfully() {
         let fmt = AudioFormat { sample_rate: 44_100, channels: 1, frame_ms: 20, codec: 0 };
         let wf = wave_format(fmt);
-        assert_eq!(wf.nChannels, 1);
-        assert_eq!(wf.nSamplesPerSec, 44_100);
-        assert_eq!(wf.nBlockAlign, 2);
-        assert_eq!(wf.nAvgBytesPerSec, 44_100 * 2);
+        assert_eq!({ wf.nChannels }, 1);
+        assert_eq!({ wf.nSamplesPerSec }, 44_100);
+        assert_eq!({ wf.nBlockAlign }, 2);
+        assert_eq!({ wf.nAvgBytesPerSec }, 44_100 * 2);
     }
 
     /// The block align used to size reads and writes must agree with the

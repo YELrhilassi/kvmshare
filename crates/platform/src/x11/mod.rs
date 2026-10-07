@@ -30,6 +30,7 @@ pub mod capture;
 pub mod engine;
 pub(crate) mod geometry;
 pub mod injector;
+pub(crate) mod media;
 pub mod wheel_daemon;
 pub mod wheel_server;
 
@@ -62,11 +63,17 @@ impl Server {
     /// build the engine and the clipboard service.
     pub fn start(display: Option<&str>) -> Result<Self, String> {
         let (cmd_tx, cmd_rx) = mpsc::channel();
+        // Whether the media keys are actually suppressed on this machine.
+        // Created here and shared: the capture thread writes it (it owns
+        // the connection that holds the grabs) and the engine reads it, so
+        // the answer the router logs is the one the X server is enforcing
+        // rather than what the config asked for.
+        let media_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The third return value is the command wake pipe's write end:
         // the capture loop blocks in poll(2) when idle, and the engine
         // must nudge it out of that wait on every command.
-        let (input, capture_tick, wake) = capture::start(display, cmd_rx)?;
-        let engine = Box::new(engine::X11Engine::new(display, cmd_tx, wake)?);
+        let (input, capture_tick, wake) = capture::start(display, cmd_rx, media_active.clone())?;
+        let engine = Box::new(engine::X11Engine::new(display, cmd_tx, wake, media_active)?);
         let clipboard: Box<dyn Clipboard> = Box::new(injector::X11Clipboard::new(display));
         let liveness = Arc::new(Liveness {
             capture_tick_ms: capture_tick,

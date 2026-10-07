@@ -121,7 +121,46 @@ pub(crate) struct InputCapture {
     /// deduplicated, packed mods) — the diff baseline so a repeated
     /// publish (an unrelated config reload) changes nothing.
     pub(crate) grabbed_chords: Vec<(u8, u32)>,
+    /// Whether the media keys are **currently** grabbed here. Held beside
+    /// the shared flag because the flag is what the engine reports and
+    /// this is what the connection actually did; a no-op publish must not
+    /// release a grab that is in place.
+    pub(crate) media_grabbed: bool,
+    /// The shared "media keys are suppressed on this machine" answer, read
+    /// by the engine (see [`CaptureCommand::MediaCapture`]). Written here
+    /// only, so it can never report a state the connection does not hold.
+    pub(crate) media_active: Arc<AtomicBool>,
+    /// Whether the X server has the XTest extension. Injection is XTest,
+    /// and without it a routed media key could not be performed locally —
+    /// so the grab is refused rather than armed, which keeps the promise
+    /// that a grabbed key is always performed exactly once.
+    pub(crate) xtest_available: bool,
+    /// Whether a *keyboard* grab is currently held (the cursor is on a
+    /// client). Tracked separately from [`Self::grabbed`], which reports
+    /// the pointer grab the beacon thread cares about: a keyboard grab can
+    /// be held while the pointer grab is not, and that is precisely the
+    /// state in which an injected media key would be swallowed by our own
+    /// grab.
+    pub(crate) kbd_grabbed: bool,
+    /// The media key this thread last injected as a local tap, and when:
+    /// `(keycode, injected_at)`. The tap reaches this thread's own raw XI2
+    /// stream (XTest events generate raw events; grabs do not stop that),
+    /// and without this record the capture would classify its own tap as
+    /// user input, route it, and tap it again — an endless loop of
+    /// play/pause toggles. Matching events inside the settle window are
+    /// swallowed; see [`Self::is_own_media_tap`].
+    pub(crate) injected_media: Option<(u8, Instant)>,
 }
+
+/// How long after an injected media tap its raw echo is swallowed. The
+/// tap's round-trips guarantee the server has *processed* the fake key
+/// before the tap call returns, so the echo is already queued on this
+/// connection at that moment — one loop iteration later at the latest.
+/// The window only has to cover that scheduling slack, not a human
+/// keypress; a user physically striking the very same media key within
+/// it loses exactly that one press (the next works), which is the right
+/// trade against a loop that never ends.
+const MEDIA_ECHO_WINDOW: Duration = Duration::from_millis(100);
 
 /// Open the X display (`None` = `$DISPLAY`), select XI2 raw events on the
 /// root window, and start the capture thread.
@@ -134,6 +173,7 @@ pub(crate) struct InputCapture {
 pub fn start(
     display: Option<&str>,
     cmd_rx: Receiver<CaptureCommand>,
+    media_active: Arc<AtomicBool>,
 ) -> Result<(Receiver<Message>, Arc<AtomicU64>, UnixStream), String> {
     let (conn, screen_num) =
         RustConnection::connect(display).map_err(|e| format!("X11 connect: {e}"))?;
@@ -162,6 +202,18 @@ pub fn start(
     }
     conn.xfixes_query_version(5, 0)
         .map_err(|e| format!("XFixes version: {e}"))?;
+    // XTest is how a media command is performed on this machine (see
+    // [`crate::x11::media`]). Its absence is not fatal — the capture and
+    // the cursor stream are unaffected — but it is recorded, because
+    // arming the media grab without it would swallow the key and perform
+    // it nowhere.
+    let xtest_available = conn
+        .extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)
+        .map_err(|e| format!("XTest query: {e}"))?
+        .is_some();
+    if !xtest_available {
+        log_warn!("XTest extension not available — media keys will not be intercepted");
+    }
     log_info!("input capture started (XI2 raw events)");
     // The visible desktop, with the whole root as the fallback. Computed
     // once here on the capture connection and shared with the beacon
@@ -211,6 +263,11 @@ pub fn start(
         evdev,
         capture_tick: capture_tick.clone(),
         grabbed_chords: Vec::new(),
+        media_grabbed: false,
+        media_active,
+        xtest_available,
+        kbd_grabbed: false,
+        injected_media: None,
     };
     thread::spawn(move || {
         if let Err(e) = capture.run_forever() {
@@ -377,6 +434,13 @@ impl InputCapture {
             XEvent::XinputRawButtonPress(e) => self.on_button(e.detail, true),
             XEvent::XinputRawButtonRelease(e) => self.on_button(e.detail, false),
             XEvent::XinputRawKeyPress(e) => {
+                // Our own injected media tap, coming back through the raw
+                // stream: swallow it here, before it becomes a `Message::Key`
+                // the router would act on (and tap again). See
+                // [`Self::is_own_media_tap`].
+                if self.is_own_media_tap(e.detail) {
+                    return;
+                }
                 if let Some(key) = self.canonical_key(e.detail) {
                     // While the cursor is on a client, Scroll Lock is the
                     // escape hatch: it is consumed here and turned into a
@@ -403,6 +467,12 @@ impl InputCapture {
                 }
             }
             XEvent::XinputRawKeyRelease(e) => {
+                // The tap's release: swallowed with its press, or the
+                // desktop would see a press with no release (and the
+                // router would see a key it never routed).
+                if self.is_own_media_tap(e.detail) {
+                    return;
+                }
                 if let Some(key) = self.canonical_key(e.detail) {
                     // Swallow the release of a consumed escape press too
                     // (see the press arm above). If the grab already
@@ -488,5 +558,35 @@ impl InputCapture {
     pub(crate) fn canonical_key(&self, keycode: u32) -> Option<u32> {
         let evdev = keycode.checked_sub(8)? as u16;
         crate::keys::hid_from_evdev(evdev)
+    }
+
+    /// Is this raw key event the echo of a media key this thread injected?
+    ///
+    /// The match is on the keycode we injected (not the HID usage), so an
+    /// unrelated key in the window is never swallowed, and only inside
+    /// [`MEDIA_ECHO_WINDOW`] of the injection. Called for press *and*
+    /// release: the pair must be swallowed together or the desktop sees a
+    /// stuck key. A matched **release** clears the record early, so a
+    /// genuine second press of the same key right after (hold-repeat
+    /// paced) is never eaten.
+    pub(crate) fn is_own_media_tap(&mut self, keycode: u32) -> bool {
+        let Some((kc, at)) = self.injected_media else {
+            return false;
+        };
+        if keycode != kc as u32 {
+            return false;
+        }
+        if at.elapsed() > MEDIA_ECHO_WINDOW {
+            // Stale: whatever this is, it is not our echo.
+            self.injected_media = None;
+            return false;
+        }
+        true
+    }
+
+    /// Record a media key this thread is about to inject (see
+    /// [`Self::is_own_media_tap`]).
+    pub(crate) fn note_injected_media(&mut self, keycode: u8) {
+        self.injected_media = Some((keycode, Instant::now()));
     }
 }

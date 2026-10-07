@@ -128,6 +128,30 @@ impl Engine for Win32Engine {
         // `super::capture::set_bound_chords`.
         super::capture::set_bound_chords(chords);
     }
+
+    fn set_media_capture(&mut self, active: bool) -> Result<(), String> {
+        // Real OS-level suppression: the capture's low-level keyboard hook
+        // swallows every media key while this is armed (see
+        // `super::capture::set_media_capture`). It reports `Err` when the
+        // capture is not running — the one state where suppression cannot
+        // be honoured — so the router's log line is backed by a hook
+        // rather than a hopeful default, and media keys keep working
+        // locally instead of vanishing.
+        super::capture::set_media_capture(active)
+    }
+
+    fn media_capture_active(&self) -> bool {
+        super::capture::media_capture_active()
+    }
+
+    fn media(&mut self, command: kvmshare_protocol::message::MediaCommand) {
+        // One shared tap with the client-side injector (`super::media::tap`):
+        // the command is performed the same way whichever role resolved it
+        // as local, and the tap is marked so this machine's own hook lets
+        // it through (suppressing it would make `local` a no-op and feed
+        // it back to the session — a loop).
+        super::media::tap(command);
+    }
 }
 
 /// The engine thread: the single owner of the cursor-state transitions.

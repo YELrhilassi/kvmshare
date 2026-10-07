@@ -83,6 +83,7 @@ use kvmshare_log::{log_error, log_info};
 use kvmshare_protocol::message::{KeyKind, Message};
 
 use super::buttons;
+use super::media;
 
 /// Window class name for the hidden capture window.
 const CAPTURE_CLASS: &[u16] = &[
@@ -161,6 +162,14 @@ static ESCAPE_CONSUMED: AtomicBool = AtomicBool::new(false);
 static CHORD_SWALLOWED: LazyLock<Mutex<HashSet<(u16, bool)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Media-key presses swallowed for media routing — same bookkeeping as
+/// [`CHORD_SWALLOWED`], separate set: a chord that happens to bind a media
+/// key must keep its own release-suppression independent of the router's
+/// arming (the chord stays suppressed when routing turns off mid-hold,
+/// and vice versa).
+static MEDIA_SWALLOWED: LazyLock<Mutex<HashSet<(u16, bool)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// The (mods, hid-key) pairs bound to kvmshare actions, published by
 /// the app layer after startup and on every config reload. While
 /// isolated (cursor on a client), a bound chord is swallowed here —
@@ -173,6 +182,44 @@ static BOUND_CHORDS: OnceLock<Arc<Mutex<Vec<(u8, u32)>>>> = OnceLock::new();
 /// Live modifier state inside the hook (updated by every modifier
 /// transition the hook sees).
 static HOOK_MODS: Mutex<Mods> = Mutex::new(Mods::NONE);
+
+/// Whether media keys are suppressed at this machine's OS boundary — the
+/// Windows half of media routing. While set, every media-key press (and
+/// its repeats and release) is swallowed here *unless* it carries the
+/// injected-media marker (see [`super::media`]): a routed key must not
+/// also act here, but a command the router resolved as **local** must act
+/// here and nowhere else, so our own taps pass.
+///
+/// Set by the engine (see [`set_media_capture`]); read by the hook
+/// procedure on every keyboard event, where an atomic load is cheaper
+/// than the alternatives and a torn read is impossible.
+static MEDIA_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// Arm (or disarm) media-key suppression at the OS boundary.
+///
+/// The suppression is real here because the low-level keyboard hook is the
+/// first thing a key crosses after the keyboard driver: a swallowed key
+/// never reaches any application, the shell, or the volume system. `Ok` is
+/// returned only while the hook mechanism that enforces it is actually
+/// running — this module's capture thread — so the router's claim "media
+/// keys are routed" is backed by a hook, not a hopeful default.
+///
+/// A process whose capture never started (a non-interactive window station,
+/// a hook-install failure) reports `Err`, and the caller logs that media
+/// keys will also act locally — the honest degradation instead of a lie.
+pub fn set_media_capture(active: bool) -> Result<(), String> {
+    if TX.get().is_none() {
+        return Err("input capture is not running, so media keys cannot be suppressed".into());
+    }
+    MEDIA_CAPTURE.store(active, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Whether media-key suppression is armed. The engine reports this rather
+/// than assuming, which is what makes the log line truth.
+pub fn media_capture_active() -> bool {
+    MEDIA_CAPTURE.load(Ordering::SeqCst)
+}
 
 /// Copy of `crate::actions::Mods` — the platform crate cannot depend on
 /// kvmshare_core's actions module for a tiny bitset (circular crate
@@ -309,6 +356,14 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
             let extended = info.flags & wm::LLKHF_EXTENDED != 0;
             let is_down = matches!(msg, wm::WM_KEYDOWN | wm::WM_SYSKEYDOWN);
             let is_up = matches!(msg, wm::WM_KEYUP | wm::WM_SYSKEYUP);
+            // Our own media tap, before anything else touches it: it must
+            // be injected, not captured (it is not user input) and not
+            // suppressed (it is the command being performed here). See
+            // [`super::media`] for why the marker exists.
+            if media::is_our_injection(info.dwExtraInfo) {
+                // SAFETY: standard hook chaining.
+                return unsafe { wm::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+            }
             if is_down || is_up {
                 let id = (info.scanCode as u16, extended);
                 let mut down = KEYS_DOWN.lock().unwrap();
@@ -329,14 +384,29 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         let is_modifier = key >= 0xE0 && key <= 0xE7;
                         if is_modifier {
                             update_hook_mods(key, true);
-                        } else if is_bound_chord(HOOK_MODS.lock().unwrap().bits(), key) {
-                            // Bound chord at the OS boundary: the OS
-                            // never sees it (its own binding — Win+Tab,
-                            // media keys — must not fire); the session
-                            // still gets it and the action engine owns
-                            // it from there.
-                            suppress = true;
-                            CHORD_SWALLOWED.lock().unwrap().insert(id);
+                        } else {
+                            if is_bound_chord(HOOK_MODS.lock().unwrap().bits(), key) {
+                                // Bound chord at the OS boundary: the OS
+                                // never sees it (its own binding — Win+Tab,
+                                // media keys — must not fire); the session
+                                // still gets it and the action engine owns
+                                // it from there.
+                                suppress = true;
+                                CHORD_SWALLOWED.lock().unwrap().insert(id);
+                            }
+                            // Media keys: same boundary, same rule, keyed
+                            // by the HID usage the shared classifier
+                            // recognises rather than by a chord binding —
+                            // so the router's suppression can never
+                            // disagree with the classifier about what a
+                            // media key is.
+                            if media_capture_active()
+                                && kvmshare_protocol::message::MediaCommand::from_hid(key)
+                                    .is_some()
+                            {
+                                suppress = true;
+                                MEDIA_SWALLOWED.lock().unwrap().insert(id);
+                            }
                         }
                         if isolate() && key == crate::keys::ESCAPE_KEY_HID {
                             // Scroll Lock while away: come home, consume
@@ -369,10 +439,28 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                             // Release of a suppressed chord press.
                             suppress = true;
                         }
+                        if MEDIA_SWALLOWED.lock().unwrap().remove(&id) {
+                            // Release of a suppressed media press.
+                            suppress = true;
+                        }
                         hook_send(Message::Key {
                             kind: KeyKind::Up,
                             key,
                         });
+                    }
+                } else if is_down && was_down {
+                    // An auto-repeat of a key whose press was swallowed
+                    // (a bound chord or a media key): the OS must not see
+                    // it either, or a held Win+Tab fires the native binding
+                    // and held VolumeUp ramps the local volume while the
+                    // router sends every command to the other machine.
+                    // Repeats are swallowed outright and not re-forwarded:
+                    // the destination performs one command per press, which
+                    // is the router's documented contract.
+                    if CHORD_SWALLOWED.lock().unwrap().contains(&id)
+                        || MEDIA_SWALLOWED.lock().unwrap().contains(&id)
+                    {
+                        suppress = true;
                     }
                 }
                 drop(down);

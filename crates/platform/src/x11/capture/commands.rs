@@ -11,14 +11,16 @@ use std::time::Instant;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xfixes::{self};
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
+use x11rb::protocol::xtest::ConnectionExt as _;
 
 use kvmshare_log::{log_debug, log_warn};
-use kvmshare_protocol::message::{KeyKind, Message};
+use kvmshare_protocol::message::{KeyKind, MediaCommand, Message};
 
 use super::events::CaptureCommand;
 use super::events::{REPEAT_DELAY, REPEAT_INTERVAL};
 use super::thread::InputCapture;
 use super::thread::BEACON_PERIOD;
+use crate::x11::media;
 
 /// How hard the crossing grab fights an existing grabber before giving
 /// up (see [`InputCapture::set_grabbed`]).
@@ -128,6 +130,13 @@ impl InputCapture {
                 }
             }
             CaptureCommand::BindChords(chords) => self.set_bound_chords(chords),
+            CaptureCommand::MediaCapture(active, reply) => {
+                let result = self.set_media_capture(active);
+                // The engine is waiting on this; a receiver that has given
+                // up (its timeout expired) is not an error to report.
+                let _ = reply.send(result);
+            }
+            CaptureCommand::Media(command) => self.media(command),
             CaptureCommand::Grab(grab) => self.set_grabbed(grab),
             CaptureCommand::IsolateRemote(remote) => {
                 // The evdev reader grabs the physical devices at the
@@ -155,6 +164,197 @@ impl InputCapture {
                 }
             }
         }
+    }
+
+    /// Arm (or disarm) the **media-key grab**.
+    ///
+    /// The mechanism is exactly the one [`Self::set_bound_chords`] uses for
+    /// a bound chord, and for the same reason: a passive grab on the root
+    /// window is how a client beats the desktop to a key. What differs is
+    /// the lifetime — the chord grabs are as many as the user configured
+    /// while these cover the whole media key set — and the fact that these
+    /// are deliberately kept **asynchronous**: the grabbing client receives
+    /// nothing (no key events are selected on the root window), so the key
+    /// is consumed outright and the session still learns of it through the
+    /// raw XI2 stream, which no grab can suppress.
+    ///
+    /// `Err` only when suppression cannot be honoured at all — no XTest,
+    /// so a grabbed key could be performed nowhere. Arming the grab in that
+    /// state would swallow the key and act on neither machine; refusing
+    /// instead leaves media keys working locally, which is the documented
+    /// degradation and strictly better than a dead key.
+    ///
+    /// Note what is *not* claimed: X grab requests have no reply, so a
+    /// variant another client already owns fails silently (exactly as the
+    /// chord grabs do). "Armed" therefore means the grabs were issued, and
+    /// the honest way to state it in a log line is what
+    /// [`CaptureCommand::MediaCapture`]'s reply feeds.
+    pub(crate) fn set_media_capture(&mut self, active: bool) -> Result<(), String> {
+        if active == self.media_grabbed {
+            // Idempotent: a policy reload that changes nothing about media
+            // routing must not blink the grab off and on — that would be a
+            // window in which a media key reaches the desktop.
+            self.media_active.store(active, Ordering::Release);
+            return Ok(());
+        }
+        if !active {
+            self.grab_media_keys(false);
+            self.media_active.store(false, Ordering::Release);
+            log_debug!("media keys released to the local desktop");
+            return Ok(());
+        }
+        if !self.xtest_available {
+            return Err(
+                "XTest is unavailable, so a grabbed media key could not be performed locally"
+                    .into(),
+            );
+        }
+        self.grab_media_keys(true);
+        self.media_active.store(true, Ordering::Release);
+        log_debug!("media keys grabbed (routing owns them now)");
+        Ok(())
+    }
+
+    /// Issue the media-key grabs (`grab`) or their release, and record the
+    /// result. One place, so the two directions can never disagree about
+    /// which keycodes are involved.
+    fn grab_media_keys(&mut self, grab: bool) {
+        for kc in media::keycodes() {
+            for m in lock_variants(0) {
+                let mods = xproto::ModMask::from(m);
+                let key = xproto::Keycode::from(kc);
+                if grab {
+                    // owner_events=false: we want nothing delivered. ASYNC
+                    // on both: the key is consumed rather than frozen for
+                    // other clients, because there is nothing to hand them
+                    // — a routed media key is either performed elsewhere or
+                    // replayed by `Self::media`.
+                    let _ = self.conn.grab_key(
+                        false,
+                        self.root,
+                        mods,
+                        key,
+                        xproto::GrabMode::ASYNC,
+                        xproto::GrabMode::ASYNC,
+                    );
+                } else {
+                    let _ = self.conn.ungrab_key(key, self.root, mods);
+                }
+            }
+        }
+        let _ = self.conn.flush();
+        self.media_grabbed = grab;
+    }
+
+    /// Perform a media command on this machine: tap the media key a
+    /// physical keyboard would send.
+    ///
+    /// # Why the grabs come off for the tap
+    ///
+    /// An injected XTest key is an ordinary key event: the grabs that make
+    /// routing possible would swallow it too, and the desktop would never
+    /// see the command. So the suppression is lifted for the tap's duration
+    /// — the passive media grabs, and the *keyboard* grab if the cursor is
+    /// away — and put back after. Two round-trips bracket the tap: the
+    /// first proves the releases have been processed before the key is
+    /// injected, the second proves the tap has been delivered before the
+    /// grabs return.
+    ///
+    /// The window this opens is real and worth stating plainly: for the two
+    /// round-trips it takes (sub-millisecond on a healthy server) some
+    /// *other* key pressed by hand in that instant could reach the local
+    /// desktop instead of the client. It is bounded by the fact that the key being handled is
+    /// already consumed, that a media key is human-paced, and that nothing
+    /// else is in flight — and it is the only way to keep the promise that
+    /// `local` means the machine actually acts.
+    pub(crate) fn media(&mut self, command: MediaCommand) {
+        // The router reaches this only while the grab is armed — but the
+        // arm can fail, and then the desktop already acted on the physical
+        // key. Tapping it again would act twice, so nothing is done.
+        if !self.media_grabbed && !self.kbd_grabbed {
+            return;
+        }
+        let Some(keycode) = media::keycode_for(command) else {
+            log_warn!("media: {command:?} has no X keycode in this build — not performed");
+            return;
+        };
+        // Record the tap so this thread's own raw stream can recognise the
+        // echo: XTest events generate raw XI2 events, grabs do not stop
+        // that, and an unrecognised tap would be classified, routed, and
+        // tapped again — forever. See [`InputCapture::is_own_media_tap`].
+        self.note_injected_media(keycode);
+        let media_was = self.media_grabbed;
+        let keyboard_was = self.kbd_grabbed;
+        if media_was {
+            self.grab_media_keys(false);
+        }
+        if keyboard_was {
+            let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+        }
+        let _ = self.conn.flush();
+        // Round-trip 1: the server has processed the releases.
+        let _ = self.conn.get_input_focus().ok().and_then(|c| c.reply().ok());
+        let _ = self.conn.xtest_fake_input(
+            media::PRESS,
+            keycode,
+            x11rb::CURRENT_TIME,
+            self.root,
+            0,
+            0,
+            0,
+        );
+        let _ = self.conn.xtest_fake_input(
+            media::RELEASE,
+            keycode,
+            x11rb::CURRENT_TIME,
+            self.root,
+            0,
+            0,
+            0,
+        );
+        let _ = self.conn.flush();
+        // Round-trip 2: the tap has been delivered.
+        let _ = self.conn.get_input_focus().ok().and_then(|c| c.reply().ok());
+        if media_was {
+            self.grab_media_keys(true);
+        }
+        if keyboard_was && !self.retake_keyboard_grab() {
+            log_warn!("media: could not re-take the keyboard grab after performing {command:?}");
+            self.kbd_grabbed = false;
+        }
+        log_debug!("media: {command:?} performed locally");
+    }
+
+    /// Re-take the keyboard grab after a media-key injection window, with
+    /// the same retry policy [`Self::set_grabbed`] uses.
+    fn retake_keyboard_grab(&mut self) -> bool {
+        for attempt in 0..GRAB_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(GRAB_RETRY_GAP);
+            }
+            if self.keyboard_grab_attempt() == Some(true) {
+                self.kbd_grabbed = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// One `GrabKeyboard` request and its reply, or `None` when the
+    /// request itself failed (a broken connection — the caller's retry is
+    /// pointless, but harmless).
+    fn keyboard_grab_attempt(&mut self) -> Option<bool> {
+        self.conn
+            .grab_keyboard(
+                false,
+                self.root,
+                x11rb::CURRENT_TIME,
+                xproto::GrabMode::ASYNC,
+                xproto::GrabMode::ASYNC,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.status == xproto::GrabStatus::SUCCESS)
     }
 
     /// Grab (or release) the pointer and keyboard on this connection.
@@ -207,23 +407,20 @@ impl InputCapture {
                         .map(|r| r.status == xproto::GrabStatus::SUCCESS);
                 }
                 if keyboard != Some(true) {
-                    keyboard = self
-                        .conn
-                        .grab_keyboard(
-                            false,
-                            self.root,
-                            x11rb::CURRENT_TIME,
-                            xproto::GrabMode::ASYNC,
-                            xproto::GrabMode::ASYNC,
-                        )
-                        .ok()
-                        .and_then(|c| c.reply().ok())
-                        .map(|r| r.status == xproto::GrabStatus::SUCCESS);
+                    keyboard = self.keyboard_grab_attempt();
                 }
                 if pointer == Some(true) && keyboard == Some(true) {
                     break;
                 }
             }
+            // The keyboard half is tracked on its own as well as through
+            // `grabbed`: a media command performed locally has to know
+            // whether *this* grab stands between it and the desktop (see
+            // `Self::media`), while the combined flag reports the pointer
+            // grab the beacon thread cares about. A partial success counts:
+            // a held keyboard grab suppresses keys whether or not the
+            // pointer grab came with it.
+            self.kbd_grabbed = keyboard == Some(true);
             match (pointer, keyboard) {
                 (Some(true), Some(true)) => true,
                 (p, k) => {
@@ -235,6 +432,7 @@ impl InputCapture {
             let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
             let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
             let _ = self.conn.flush();
+            self.kbd_grabbed = false;
             false
         };
         self.grabbed
