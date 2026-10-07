@@ -22,6 +22,7 @@
 //! * [`dispatch`] — applies one server message to the local machine.
 //! * [`threads`] — the motion, UDP and sync worker loops.
 
+mod audio;
 mod dispatch;
 mod injector;
 mod shared;
@@ -135,6 +136,29 @@ pub struct Client {
     /// The cursor stream socket; handed to [`Shared`] when `run` starts
     /// (motion and UDP threads share it).
     udp: UdpSocket,
+    /// Audio sharing, when `[audio]` asked for it. `None` = off, and the
+    /// feature then costs nothing: no socket is bound and no announcement
+    /// is sent.
+    audio: Option<AudioSetup>,
+}
+
+/// What the client needs to take part in audio, supplied by the app layer
+/// so the core never names a platform type (see
+/// [`crate::audio::device`]).
+#[derive(Clone)]
+pub struct AudioSetup {
+    pub options: crate::audio::runtime::AudioOptions,
+    pub backend: Arc<dyn crate::audio::runtime::AudioBackend>,
+}
+
+// Hand-written: the backend is a trait object, and the interesting part of
+// a setup for a log line or an assertion failure is the options anyway.
+impl std::fmt::Debug for AudioSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioSetup")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
@@ -210,7 +234,15 @@ impl Client {
         // server learns both who we are and where to send motion.
         udp.send(&udp::pack(own_id, 0, &Message::KeepAlive))?;
 
-        Ok(Self { transport, own_id, layout, server_id, udp })
+        Ok(Self { transport, own_id, layout, server_id, udp, audio: None })
+    }
+
+    /// Take part in audio sharing for this session. Non-breaking builder:
+    /// a caller that does not configure audio gets exactly the previous
+    /// behaviour.
+    pub fn with_audio(mut self, setup: AudioSetup) -> Self {
+        self.audio = Some(setup);
+        self
     }
 
     /// The server's machine id (from `Welcome`). Empty if unknown.
@@ -236,7 +268,7 @@ impl Client {
     ) -> io::Result<SessionEnd> {
         // Destructure so each field is owned independently — `udp` moves
         // into [`Shared`] while `transport` stays on this thread.
-        let Client { mut transport, own_id, layout, server_id: _, udp } = self;
+        let Client { mut transport, own_id, layout, server_id: _, udp, audio } = self;
         let mut layout = layout;
         // The follower is born with the injector's current geometry so
         // its command can never run past a screen edge — even before
@@ -272,6 +304,41 @@ impl Client {
         // The sync thread hands messages (resolution changes, clipboard
         // uploads) to the TCP thread over this channel.
         let (sync_tx, sync_rx) = mpsc::channel::<Message>();
+
+        // Audio, when this machine is configured for it. The runtime owns
+        // its own socket and threads; here it only needs (a) the address of
+        // the server it just authenticated against, so its datagrams are
+        // bound to the same peer identity the cursor stream uses, and (b) a
+        // way to get its control messages onto the TCP link.
+        let (audio_tx, audio_rx) = mpsc::channel::<Message>();
+        let mut audio = match (audio, transport.peer_addr()) {
+            (Some(setup), Ok(peer)) if setup.options.is_active() => {
+                match audio::ClientAudio::start(
+                    setup.options,
+                    setup.backend,
+                    peer.ip(),
+                    audio_tx,
+                ) {
+                    Ok(mut engine) => {
+                        // Announce now; the first idle tick puts the offer
+                        // on the wire. The server cannot be told earlier
+                        // than the handshake, which is exactly why audio
+                        // starts here rather than in `connect`.
+                        engine.announce();
+                        Some(engine)
+                    }
+                    Err(e) => {
+                        audio::warn_unavailable(&e);
+                        None
+                    }
+                }
+            }
+            (Some(_), Err(e)) => {
+                audio::warn_unavailable(&format!("cannot identify the server address: {e}"));
+                None
+            }
+            _ => None,
+        };
 
         let sync = thread::Builder::new()
             .name("kvmshare-client-sync".into())
@@ -355,6 +422,14 @@ impl Client {
                 }
                 RecvResult::Msg(msg) => {
                     shared.tcp_tick_ms.store(now_ms(), Ordering::Relaxed);
+                    // Audio messages go to the audio runtime and nowhere
+                    // else, so the two paths can never both act on one
+                    // message (see [`audio`]).
+                    if let Some(engine) = audio.as_mut() {
+                        if engine.handle(&msg) {
+                            continue;
+                        }
+                    }
                     dispatch::dispatch(&mut layout, &shared, own_id, msg);
                 }
                 RecvResult::Eof => break,
@@ -369,6 +444,9 @@ impl Client {
                     while let Ok(msg) = sync_rx.try_recv() {
                         transport.send(&msg)?;
                     }
+                    while let Ok(msg) = audio_rx.try_recv() {
+                        transport.send(&msg)?;
+                    }
                     if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
                         transport.send(&Message::KeepAlive)?;
                         last_keepalive = Instant::now();
@@ -377,8 +455,17 @@ impl Client {
             }
         }
 
-        // Session over: stop the workers, then place the cursor once more
-        // at the final command so the last position is exact. Joins are
+        // Session over: stop audio first. Its socket must stop accepting
+        // before anything else reconnects, or a datagram from the dead
+        // session could be played into the new one.
+        if let Some(engine) = audio.as_mut() {
+            engine.stop();
+            if let Some(reason) = engine.last_error() {
+                log_warn!("audio stopped: {reason}");
+            }
+        }
+        // Then the workers, and one final cursor placement so the last
+        // position is exact. Joins are
         // bounded: a worker wedged on an OS call must not hang the
         // reconnect loop (the supervisor already released local input for
         // that case).

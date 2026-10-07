@@ -76,8 +76,9 @@ pub(crate) struct Shared {
     /// idle NoData cycle). A stalled value while the link is healthy
     /// means the control loop is wedged inside a dispatch.
     pub(crate) tcp_tick_ms: AtomicU64,
-    /// Injection events (buttons, keys, wheel) queued by the TCP thread
-    /// and executed by the motion thread on its own cadence.
+    /// Injection events (buttons, keys, wheel, media commands) queued by
+    /// the TCP thread and executed by the motion thread on its own
+    /// cadence.
     ///
     /// Why: a button/key/wheel is an OS call (`SendInput` and friends)
     /// that can *block* — Windows UI-protection (UIPI) and elevated
@@ -113,13 +114,35 @@ pub(crate) enum InjectEvent {
 const EVENT_QUEUE_CAP: usize = 512;
 
 impl Shared {
+    /// Whether any injection event is waiting. The motion loop's idle
+    /// wait uses this as part of its wake predicate, so a media command
+    /// that arrives while this machine is **not** being controlled wakes
+    /// the loop instead of sitting in the queue until control crosses
+    /// here — media routing exists precisely for the machine the cursor
+    /// is not on (see [`crate::media`]).
+    pub(crate) fn has_pending_events(&self) -> bool {
+        !self.events.lock().unwrap().is_empty()
+    }
+
     /// Queue one injection event for the motion thread. Bounded: when
     /// the queue is full the event is dropped (the motion loop is
     /// wedged, and the recovery paths will restart the session anyway).
+    ///
+    /// Wakes the motion loop out of its idle wait: a queued event is a
+    /// duty even when this machine is not being controlled (a routed
+    /// media command to the machine the cursor is **not** on — the case
+    /// media routing exists for). The notify happens under [`Self::wake_lock`]
+    /// so it cannot slip between the loop's predicate check and its
+    /// wait — the standard missed-wakeup race, and with input routed by
+    /// policy rather than by cursor, a lost wake here would sit the
+    /// command in the queue for minutes.
     pub(crate) fn enqueue_event(&self, event: InjectEvent) {
         let mut q = self.events.lock().unwrap();
         if q.len() < EVENT_QUEUE_CAP {
             q.push_back(event);
+            drop(q);
+            let _guard = self.wake_lock.lock().unwrap();
+            self.wake_cv.notify_all();
         }
     }
 

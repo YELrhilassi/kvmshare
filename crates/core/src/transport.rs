@@ -22,7 +22,7 @@
 //! inside [`DEAD_PEER_TIMEOUT`].
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use kvmshare_protocol::{id::MAGIC, Frame, Message, HEADER_LEN, LEN_OFFSET, MAX_PAYLOAD};
@@ -79,6 +79,16 @@ impl Transport {
     /// motion and periodic duties are never delayed by a long block).
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(timeout)
+    }
+
+    /// The peer's address for this connection.
+    ///
+    /// Used by the client to bind its audio socket to the server it has
+    /// actually authenticated against — the same rule the server applies to
+    /// each client's datagrams, and the reason audio needs no identity of
+    /// its own on the wire.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
     }
 
     /// A **read-only** handle sharing this connection's socket, with its

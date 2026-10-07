@@ -38,6 +38,18 @@ pub struct ServerAudio {
     pub peer_machine_id: Option<String>,
 }
 
+/// Hand-written: the backend is a trait object (see the same reasoning on
+/// the client's `AudioSetup`), and what a log line or a debug dump wants
+/// from a setup is the options and the chosen peer.
+impl std::fmt::Debug for ServerAudio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerAudio")
+            .field("options", &self.options)
+            .field("peer", &self.peer_machine_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The peer an `[audio] peer` value names, or `None` when it names none.
 ///
 /// A blank value means "unset", not "a machine id that matches nothing" —

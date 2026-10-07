@@ -51,18 +51,39 @@ pub(crate) fn motion_loop(shared: Arc<Shared>, own_id: u8) {
     let mut recover = false;
     while !shared.stop.load(Ordering::Relaxed) && !recover {
         // Event-driven idle: while this machine is not being controlled
-        // the motion thread has no duties at all (the supervisor only
+        // the motion thread has no *steering* duties (the supervisor only
         // guards active sessions and the heartbeat is only read while
         // active), so it blocks on the wake condvar instead of ticking
-        // at MOTION_PERIOD forever. Enter/Leave/stop notify it; a
-        // spurious wake simply re-checks the flags.
+        // at MOTION_PERIOD forever. Enter/Leave/stop notify it — and so
+        // does a queued injection event: a routed media command arrives
+        // precisely when this machine is NOT being controlled (see
+        // [`crate::media`]), and it must be performed rather than wait
+        // for control to cross here. A spurious wake simply re-checks
+        // the flags.
         if !shared.active.load(Ordering::Acquire) {
-            let mut guard = shared.wake_lock.lock().unwrap();
-            while !shared.active.load(Ordering::Acquire) && !shared.stop.load(Ordering::Relaxed) {
-                guard = shared.wake_cv.wait(guard).unwrap();
+            {
+                let mut guard = shared.wake_lock.lock().unwrap();
+                while !shared.active.load(Ordering::Acquire)
+                    && !shared.stop.load(Ordering::Relaxed)
+                    && !shared.has_pending_events()
+                {
+                    guard = shared.wake_cv.wait(guard).unwrap();
+                }
             }
-            drop(guard);
-            continue; // re-check stop at the loop head
+            // Woken while still idle: either a queued injection event (a
+            // routed media command — this machine is exactly the machine
+            // the cursor is not on) or stop. Perform the event, but no
+            // steering: the cursor here is this machine's own, and no
+            // beacons flow while control is elsewhere. The loop head
+            // re-checks stop and waits again once the queue is empty.
+            if !shared.active.load(Ordering::Acquire) {
+                if !shared.stop.load(Ordering::Relaxed) {
+                    let mut inj = shared.injector.lock().unwrap();
+                    shared.drain_events(&mut inj);
+                }
+                continue;
+            }
+            continue; // control arrived: fall through to a steering tick
         }
         // The idle guard above guarantees control is on this machine
         // from here on. Fixed-cadence steering: place the cursor on the
