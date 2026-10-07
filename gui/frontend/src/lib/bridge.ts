@@ -60,6 +60,32 @@ export interface InputSection {
   swapScroll: boolean;
 }
 
+/** [media] config section — schema owned by kvmshare_core::media. */
+export interface MediaSection {
+  routeMediaKeys: boolean;
+  /** local | follow_focus | last_active_source | focus_or_last_active | machine:<id> */
+  transport: string;
+  volume: string;
+  fallbackLocal: boolean;
+}
+
+/** [audio] config section — schema owned by the Rust server (both roles). */
+export interface AudioSection {
+  send: boolean;
+  receive: boolean;
+  captureDevice: string;
+  playbackDevice: string;
+  activityFloorDb: number;
+  /** Server role only: which machine to pair with (empty = automatic). */
+  peer?: string;
+}
+
+/** The server-role media routing + audio sharing answer. */
+export interface MediaAudio {
+  media: MediaSection;
+  audio: AudioSection;
+}
+
 export interface Settings {
   mode: Mode;
   clientAddr: string;
@@ -227,6 +253,10 @@ interface GoApp {
   GetPaths(): Promise<Paths>;
   LoadConfig(): Promise<LayoutConfig>;
   SaveConfig(c: LayoutConfig): Promise<void>;
+  LoadMediaAudio(): Promise<MediaAudio>;
+  SaveMediaAudio(m: MediaSection, a: AudioSection): Promise<void>;
+  LoadClientAudio(): Promise<AudioSection>;
+  SaveClientAudio(a: AudioSection): Promise<void>;
   ServerStart(): Promise<boolean>;
   ServerStop(): Promise<void>;
   ServerRunning(): Promise<boolean>;
@@ -343,6 +373,10 @@ export const api = (): GoApp => ({
   GetPaths: () => call<Paths>("GetPaths"),
   LoadConfig: () => call<LayoutConfig>("LoadConfig"),
   SaveConfig: (c) => call<void>("SaveConfig", c),
+  LoadMediaAudio: () => call<MediaAudio>("LoadMediaAudio"),
+  SaveMediaAudio: (m, a) => call<void>("SaveMediaAudio", m, a),
+  LoadClientAudio: () => call<AudioSection>("LoadClientAudio"),
+  SaveClientAudio: (a) => call<void>("SaveClientAudio", a),
   ServerStart: () => call<boolean>("ServerStart"),
   ServerStop: () => call<void>("ServerStop"),
   ServerRunning: () => call<boolean>("ServerRunning"),

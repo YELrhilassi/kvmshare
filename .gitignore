@@ -21,4 +21,4 @@ gui/kvmshare-server.log
 .vscode/
 .idea/
 *.swp
-.DS_Store
+.DS_Storegui/gui

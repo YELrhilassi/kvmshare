@@ -9,6 +9,7 @@ import ClientPage from "@/features/client/ClientPage";
 import LayoutPage from "@/features/layout/LayoutPage";
 import KeyboardPage from "@/features/input/KeyboardPage";
 import MousePage from "@/features/input/MousePage";
+import MediaPage from "@/features/media/MediaPage";
 import LogsPage from "@/features/logs/LogsPage";
 import SettingsPage from "@/features/settings/SettingsPage";
 
@@ -88,6 +89,7 @@ function Shell() {
           {effectivePage === "layout" && <LayoutPage />}
           {effectivePage === "keyboard" && <KeyboardPage />}
           {effectivePage === "mouse" && <MousePage />}
+          {effectivePage === "media" && <MediaPage />}
           {effectivePage === "logs" && <LogsPage />}
           {effectivePage === "settings" && <SettingsPage />}
         </main>
