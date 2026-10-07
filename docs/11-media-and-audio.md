@@ -87,6 +87,16 @@ capture backend → HID usage → MediaCommand::from_hid
    └─ Some  → the router decides the destination
 ```
 
+**The classifier never eats ordinary keys.** Every backend canonicalises
+keystrokes to the *keyboard* usage page, where `0xe2` is Left Alt — but
+on the consumer page `0xe2`-adjacent codes are media keys, and an early
+draft accepted `0xe2` as Mute. With routing on (the default) that
+classified the Alt of Alt+Tab and Alt+F4 as Mute and swallowed it. The
+rule now: only the consumer-page media codes are media, Mute is `0xe8`
+alone, and the neighbouring keyboard-page modifiers (`0xe0`–`0xe2`,
+`0xe6`) are pinned as non-media by a regression test. A routing feature
+that can eat your chords is worse than no routing feature.
+
 ### Policy
 
 Two categories, because they mean different things:
@@ -118,14 +128,45 @@ does not classify at all and media keys behave exactly as they would
 without kvmshare installed. This makes the whole feature opt-in and
 safe to ship on by default.
 
+### Arming is the same decision as routing
+
+The server intercepts classified keys *before* the session, and the
+media-key **grab** on the local machine is armed exactly when routing is
+enabled — never separately. The two are one indivisible decision:
+keys are consumed either way, and a consumed key that was not grabbed
+would simply be lost, while a grab without consumption would double-act.
+The grab is (re-)armed at startup, on every hot policy change, and never
+while the cursor is on a client (re-grabbing away would fight the
+forwarded input); the next idle moment applies it.
+
+Routed keys also work when the cursor is **home** — that is the feature's
+headline case. A client performs a routed command even while its motion
+loop is idle: the injection queue is drained on idle wakes, without
+steering the cursor (zero-CPU idle is preserved).
+
 ### The override
 
 `last_active_source` is inferred, so it can be wrong (two machines
 playing at once). Rather than guessing harder, the router exposes an
-explicit override: a user-bound shortcut that pins the media target for
-as long as it is held, or cycles it. Deliberate overrides are opt-in —
-the inferred policy is the default, and the GUI shows the resolved
-target so the user can see where a key will go before pressing it.
+explicit override: the user binds a chord to the `media_pin` shortcut
+naming a screen, and pressing it **latches** that machine as the media
+target — every category, until the same chord is pressed again. It is a
+toggle, not a momentary hold (a held modifier set cannot also be a
+media press, and a latch survives the chord). The rules around it are
+deliberately conservative:
+
+- an override outranks every configured policy — an inference must
+  never outvote a human;
+- a shortcut naming a machine that is not in the layout is a no-op, so
+  a typo cannot wipe an override that is doing its job;
+- the override dies with the machine it pinned (a pin to nobody is not
+  a policy), and never expires on its own;
+- with routing off the override is inert — the master switch means
+  "kvmshare is not here".
+
+The pin is the GUI's per-machine answer to "the router picked wrong":
+press the chord once while looking at the machine you want, press it
+again to hand control back to the policy.
 
 ## 11.3 Audio streaming
 
@@ -208,6 +249,22 @@ about.
 
 ## 11.4 Configuration
 
+Two files, because the settings describe two different machines:
+
+- **the server's `kvmshare-server.toml`** owns `[media]` (where media
+  keys go when this machine is typed on) and `[audio]` (which machine it
+  streams its output to). The server hot-reloads both sections live —
+  the grab re-arms for a routing change, and an audio change applies at
+  the next connection, because a live audio link is attached to a
+  client connection.
+- **the client's `kvmshare-client.toml`** owns this machine's own
+  `[audio]` — its capture/playback consent. A client obeys the
+  *server's* layout over the wire; the wire cannot carry hardware
+  consent, so it is a separate file with a separate schema
+  (`KVMSHARE_CLIENT_CONFIG`, else `~/.config/kvmshare/kvmshare-client.toml`).
+  It is re-read on every (re)connect, so a save applies at the next
+  connection without restarting the client.
+
 ```toml
 [media]
 # Master switch. false = media keys are never intercepted; the local OS
@@ -223,9 +280,6 @@ volume = "local"
 # Leave this on unless you really want a media key to be dropped.
 fallback_local = true
 
-# Optional pin, when a category is set to a fixed machine.
-# transport_machine = "98980a4d9afac273a9aac53ec1c57c35"
-
 [audio]
 # Send this machine's output to the peer.
 send = false
@@ -239,11 +293,21 @@ playback_device = ""
 
 # Silence floor for "playing" detection, in dBFS. -50 is a good start.
 activity_floor_db = -50.0
+
+# Server role only: pin the audio peer by machine id (short form
+# works). Empty = automatic — the link runs only while exactly one
+# client is connected, and is dropped the moment a second joins, rather
+# than streaming this machine's output to a machine nobody chose.
+peer = ""
 ```
 
-Every value above has a default that is either harmless (routing on with
-a local fallback) or inert (audio off), so an existing config file keeps
-working untouched and an upgrade never changes behaviour by surprise.
+Pinned media targets are written inline as `machine:<id>` (e.g.
+`transport = "machine:98980a4d"`); the GUI's media page writes exactly
+this form. Every value above has a default that is either harmless
+(routing on with a local fallback) or inert (audio off), so an existing
+config file keeps working untouched and an upgrade never changes
+behaviour by surprise. Unknown target values are a config error, not a
+silent default — a typo in a routing policy must be visible.
 
 ## 11.5 Platform backends
 
@@ -269,8 +333,31 @@ macOS is not implemented. The seams it needs are `Injector::media`, the
 `AudioCapture`/`AudioPlayback` traits, and one mapping table; nothing in
 the protocol, router, or config is platform-specific.
 
-## 11.6 What is honest about this feature
+## 11.6 The GUI surface
 
+The GUI's **Media & audio** page exists in both roles and edits exactly
+what this document describes: server-role media routing and audio
+sharing, client-role audio consent, and the server's audio peer. All
+writes go through typed Go mappings of the Rust serde schemas (never
+generic maps — numbers must stay numbers), preserve every unrelated
+toml section, and take the same cross-process config lock the Rust
+side takes: the server hot-reloads the file, and an unlocked
+read-modify-write could erase the server's own concurrent writes
+(auto-trust, screen-size correction). A save the GUI accepts is a
+config the Rust parser never rejects — the validators agree by test.
+
+The server's media policy also accepts the pin shortcut through the
+ordinary `[shortcuts]` machinery: an action named `media_pin` with a
+`screen` value (see §11.2, *The override*).
+
+## 11.7 What is honest about this feature
+
+- **A routed key is consumed exactly once.** It is never also forwarded
+  as an ordinary keystroke — and the local grab is armed exactly when
+  routing is on, so no state exists where a key acts twice or vanishes.
+- **Windows seek is throttled and logged, not delivered.** There is no
+  seek target to name on the wire today; pretending otherwise would
+  drop the events silently.
 - **Audio is opt-in and off by default.** Nothing is captured, and
   nothing is sent, until a machine's config says so.
 - **Capture requires permission.** On Linux, capturing the monitor

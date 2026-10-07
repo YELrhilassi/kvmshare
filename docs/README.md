@@ -20,6 +20,7 @@ the whole thing from scratch without getting lost.
 | 8 | [GUI](08-gui.md) | The Wails desktop app: Go backend + React frontend, process management, tray, installer |
 | 9 | [Building & releasing](09-build-release.md) | Make targets, the dev loop, release archives, self-update |
 | 10 | [Testing](10-testing.md) | What is tested, where, and how to run the suites |
+| 11 | [Media & audio](11-media-and-audio.md) | The media-key router, audio streaming, the two config files, and the GUI page |
 
 ## The one-paragraph mental model
 
