@@ -426,7 +426,10 @@ fn spawn_config_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
                     // Layout and policy travel separately: the layout edit
                     // broadcasts the new screen map, while the policy edit
                     // can disconnect a client that was just revoked (see
-                    // [`Control::SetPolicy`]).
+                    // [`Control::SetPolicy`]). Media and audio travel
+                    // separately too, because each has exactly one side
+                    // effect a layout edit must never trigger — the
+                    // media-key grab, and the audio setup swap.
                     if tx
                         .send(Control::Reload(
                             cfg.to_layout(),
@@ -435,6 +438,20 @@ fn spawn_config_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
                         ))
                         .is_err()
                         || tx.send(Control::SetPolicy(cfg.network_policy())).is_err()
+                        || tx
+                            .send(Control::SetMediaPrefs(
+                                cfg.media
+                                    .to_prefs()
+                                    // Validation ran in `Config::load`, so
+                                    // this cannot fail; the fallback keeps
+                                    // a parsing edge from killing the
+                                    // watcher thread.
+                                    .unwrap_or_default(),
+                            ))
+                            .is_err()
+                        || tx
+                            .send(Control::SetAudioOptions(server_audio(&cfg)))
+                            .is_err()
                     {
                         return; // server gone
                     }

@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use kvmshare_app::guard::{self, RoleGuard};
 use kvmshare_app::{
-    hostname, machine_id, parse_client_args, revoked_policy, state_dir, with_default_port,
-    write_client_state, write_client_state_connected, write_client_state_refused,
-    write_client_state_stopped, DEFAULT_PORT,
+    client_config_path, hostname, machine_id, parse_client_args, revoked_policy, state_dir,
+    with_default_port, write_client_state, write_client_state_connected,
+    write_client_state_refused, write_client_state_stopped, ClientConfig, DEFAULT_PORT,
 };
 use kvmshare_core::client::{Client, SessionEnd};
 use kvmshare_log::{log_error, log_info, log_warn};
@@ -27,6 +27,35 @@ use kvmshare_protocol::message::Message;
 /// yet, or may restart — a client that dies on a refused connection would
 /// be useless.
 const RETRY_DELAY: Duration = Duration::from_secs(3);
+
+/// This machine's audio setup, or `None` when it asks for nothing.
+///
+/// The client is otherwise config-free — it obeys the *remote* server's
+/// layout — but `[audio]` describes this machine's own hardware and
+/// consent, so it must come from this machine's own file (see
+/// [`ClientConfig`]). Only the audio section is read, so a file that is
+/// missing, empty, or has never been written means "no audio", which is
+/// exactly what a machine with no `[audio]` section asks for.
+fn client_audio_setup() -> Option<kvmshare_core::client::AudioSetup> {
+    let path = client_config_path();
+    let cfg = match ClientConfig::load(&path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            // A file that exists but does not parse is worth a word: the
+            // user asked for something and is not getting it. A missing
+            // file is the default state and stays quiet.
+            log_warn!("audio: ignoring {}: {e}", path.display());
+            return None;
+        }
+    };
+    if !cfg.audio.is_active() {
+        return None;
+    }
+    Some(kvmshare_core::client::AudioSetup {
+        options: cfg.audio.to_options(),
+        backend: kvmshare_platform::audio::backend(),
+    })
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -158,6 +187,16 @@ fn run() -> Result<(), String> {
                             let _ = std::fs::remove_file(&path);
                         }
                     });
+                // Audio: this machine's own `[audio]` section decides
+                // whether it takes part. Read per connection rather than
+                // once, so a config edit takes effect on the next
+                // reconnect without restarting the client — the client is
+                // already a loop, and the only stateful part of audio is
+                // the run's own socket.
+                let client = match client_audio_setup() {
+                    Some(setup) => client.with_audio(setup),
+                    None => client,
+                };
                 match client.run(injector, clipboard, &out_rx, Some(on_control)) {
                     // The server told us to disconnect: do not reconnect.
                     // The operator starts the client again when wanted.

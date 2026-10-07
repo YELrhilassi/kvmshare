@@ -59,6 +59,26 @@ impl Engine for MockEngine {
     fn show_local_cursor(&mut self, visible: bool) {
         self.calls.lock().unwrap().push(format!("cursor {visible}"));
     }
+    fn set_bound_chords(&mut self, chords: Vec<(u8, u32)>) {
+        // Recorded so tests can wait on the reload that published them:
+        // it is the last engine call a `Control::Reload` makes, so seeing
+        // it means the whole reload has been processed.
+        self.calls.lock().unwrap().push(format!("chords {}", chords.len()));
+    }
+    fn set_media_capture(&mut self, active: bool) -> Result<(), String> {
+        self.calls.lock().unwrap().push(format!("media_capture {active}"));
+        Ok(())
+    }
+    fn media_capture_active(&self) -> bool {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "media_capture true")
+    }
+    fn media(&mut self, command: kvmshare_protocol::message::MediaCommand) {
+        self.calls.lock().unwrap().push(format!("media {command:?}"));
+    }
 }
 
 /// A client-side injector that records what the client was told to do.
@@ -104,6 +124,9 @@ impl Injector for RecordingInjector {
     }
     fn key(&mut self, kind: KeyKind, key: u32) {
         self.calls.lock().unwrap().push(format!("key {kind:?} {key}"));
+    }
+    fn media(&mut self, command: kvmshare_protocol::message::MediaCommand) {
+        self.calls.lock().unwrap().push(format!("media {command:?}"));
     }
     fn enter(&mut self) {
         self.calls.lock().unwrap().push("enter".into());
@@ -155,6 +178,15 @@ impl Harness {
 }
 
 fn start_server() -> Harness {
+    start_server_with_media(kvmshare_core::media::MediaPrefs::default())
+}
+
+/// A server whose `[media]` policy is already in place before `run`
+/// arms the grab. Tests that care about the exact sequence of engine
+/// calls must configure it here: the run loop applies the configured
+/// policy at startup, and a `SetMediaPrefs` sent afterwards races that
+/// startup arm on the control channel.
+fn start_server_with_media(media: kvmshare_core::media::MediaPrefs) -> Harness {
     let session = Session::new(two_screen_layout(), 0);
     let (control_tx, control_rx) = mpsc::channel::<Control>();
     let (events_tx, events_rx) = mpsc::channel::<ServerEvent>();
@@ -176,6 +208,9 @@ fn start_server() -> Harness {
         .unwrap(),
     );
     let port = server.local_addr().unwrap().port();
+    // The configured `[media]` policy must be in place before `run` — the
+    // run loop applies it when it arms the grab at startup.
+    server.set_media_prefs(media);
 
     let (input_tx, input_rx) = mpsc::channel::<Message>();
     let engine_calls = Arc::new(Mutex::new(Vec::new()));

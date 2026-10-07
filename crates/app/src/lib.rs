@@ -25,8 +25,8 @@ pub use client_state::{
 pub use trust::{policy_from_revoked_list, revoked_policy, revoked_policy_from_env, REVOKED_ENV, REVOKED_FILE};
 pub use clipboard::spawn_server_clipboard;
 pub use config::{
-    default_config_path, set_id, Config, NetworkConfig, ScreenConfig, DEFAULT_PORT, DEFAULT_SCREEN_H,
-    DEFAULT_SCREEN_W,
+    client_config_path, default_config_path, set_id, ClientConfig, Config, NetworkConfig,
+    ScreenConfig, DEFAULT_PORT, DEFAULT_SCREEN_H, DEFAULT_SCREEN_W,
 };
 pub use guard::state_dir;
 pub use hostname::hostname;

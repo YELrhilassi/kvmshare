@@ -1,5 +1,5 @@
-//! Persistence of the server config: loading, atomic saving, and where
-//! the server looks for its file.
+//! Persistence of the role configs: loading, atomic saving, and where the
+//! server and the client each look for their file.
 
 use std::path::{Path, PathBuf};
 
@@ -12,8 +12,7 @@ impl Config {
     /// a concurrent reader (the hot-reload watcher, the GUI) never sees
     /// a torn write.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let text = toml::to_string_pretty(self).map_err(|e| format!("encode config: {e}"))?;
-        atomic_write(path, &text)
+        write_toml(path, self)
     }
 
     /// Load the config at `path`, creating a machine-accurate default
@@ -42,6 +41,15 @@ impl Config {
             Err(e) => Err(format!("read {}: {e}", path.display())),
         }
     }
+}
+
+/// Serialize `value` as TOML and write it atomically. Shared by every
+/// config type in this module, so the on-disk discipline (parent
+/// directories, the cross-process lock, temp file + rename) is written
+/// once instead of once per section.
+pub(crate) fn write_toml<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let text = toml::to_string_pretty(value).map_err(|e| format!("encode config: {e}"))?;
+    atomic_write(path, &text)
 }
 
 /// Write `text` to `path` atomically (temp file + rename) while holding
@@ -95,16 +103,42 @@ impl Drop for ConfigLock {
 /// the `KVMSHARE_CONFIG` env var, then `~/.config/kvmshare/`, then the
 /// current directory.
 pub fn default_config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("KVMSHARE_CONFIG") {
+    role_config_path("KVMSHARE_CONFIG", "kvmshare-server.toml")
+}
+
+/// Where the **client** looks for its own config.
+///
+/// The client deliberately obeys the remote server's layout — screens,
+/// positions and shortcuts are the server's business — but `[audio]`
+/// describes *this* machine's hardware and consent, so it cannot come from
+/// the other end of the wire. That is the entire content of the client's
+/// config file, and the reason it is a separate file rather than a section
+/// of the server's: the two roles are configured by different people on
+/// different machines, and neither should be able to edit the other's.
+///
+/// Resolution mirrors [`default_config_path`] (env var, then the per-user
+/// directory, then the current directory) with the client's own names, so
+/// a machine that runs both roles keeps two files side by side instead of
+/// one file that means different things depending on who read it.
+pub fn client_config_path() -> PathBuf {
+    role_config_path("KVMSHARE_CLIENT_CONFIG", "kvmshare-client.toml")
+}
+
+/// The shared resolution rule behind both paths above: an explicit env
+/// var wins (the operator owns it), then the per-user `.config/kvmshare`
+/// directory when the file is actually there, then a file beside the
+/// working directory as the portable-install fallback.
+fn role_config_path(env_var: &str, file_name: &str) -> PathBuf {
+    if let Ok(p) = std::env::var(env_var) {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
     if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home).join(".config/kvmshare/kvmshare-server.toml");
+        let p = PathBuf::from(home).join(".config/kvmshare").join(file_name);
         if p.exists() {
             return p;
         }
     }
-    PathBuf::from("kvmshare-server.toml")
+    PathBuf::from(file_name)
 }

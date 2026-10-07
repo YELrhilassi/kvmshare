@@ -6,12 +6,14 @@
 //! layout geometry (wire layout + local-screen correction) in
 //! `geometry`.
 
+mod client;
 mod geometry;
 mod ids;
 mod io;
 
+pub use client::ClientConfig;
 pub use ids::set_id;
-pub use io::default_config_path;
+pub use io::{client_config_path, default_config_path};
 
 use std::path::Path;
 
@@ -171,6 +173,10 @@ pub struct AudioConfig {
     /// one pair of machines, so with more than one client the choice stops
     /// being obvious, and the link is dropped rather than streaming this
     /// machine's output to a machine the user never picked.
+    ///
+    /// Read only where the choice has to be made — the **server** role.
+    /// A client has exactly one peer (the server that admitted it), so its
+    /// copy of `[audio]` leaves this unset and it is ignored there.
     #[serde(default)]
     pub peer: String,
 }
@@ -204,6 +210,25 @@ impl AudioConfig {
     /// Whether this section asks for anything at all.
     pub fn is_active(&self) -> bool {
         self.send || self.receive
+    }
+
+    /// Reject values that cannot be honoured.
+    ///
+    /// The activity floor is compared against a measured level, so a NaN or
+    /// a value above digital full scale would make the "is anything
+    /// playing" answer permanently wrong in one direction or the other.
+    /// Both roles run this, because both roles run the same pipeline.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.activity_floor_db.is_finite()
+            || self.activity_floor_db > 0.0
+            || self.activity_floor_db < -120.0
+        {
+            return Err(format!(
+                "[audio] activity_floor_db must be finite, at most 0.0 dBFS, and at least -120.0 (got {})",
+                self.activity_floor_db
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -331,19 +356,10 @@ impl Config {
         // Media routing targets are validated here, not at first use: a
         // config that cannot route is a config that should not load.
         self.media.to_prefs()?;
-        // The activity floor is compared against a measured level, so a
-        // NaN or a level above digital full scale would make the
-        // "is anything playing" answer permanently wrong in one
-        // direction or the other.
-        if !self.audio.activity_floor_db.is_finite()
-            || self.audio.activity_floor_db > 0.0
-            || self.audio.activity_floor_db < -120.0
-        {
-            return Err(format!(
-                "[audio] activity_floor_db must be finite, at most 0.0 dBFS, and at least -120.0 (got {})",
-                self.audio.activity_floor_db
-            ));
-        }
+        // The audio section validates itself (see `AudioConfig::validate`),
+        // so the server and the client role can never disagree about what a
+        // legal `[audio]` section is.
+        self.audio.validate()?;
         Ok(())
     }
 
