@@ -30,14 +30,14 @@
 //! off would swallow them, and any state where the grab is on but keys are
 //! forwarded would double-act.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kvmshare_log::{log_debug, log_info, log_warn};
 use kvmshare_protocol::message::{MediaCommand, Message};
 
 use crate::media::{resolve, MediaContext, MediaPrefs, ResolvedTarget};
-use crate::server::client::{route, Client};
+use crate::server::client::route;
+use crate::server::peers::Peers;
 use crate::server::Engine;
 use crate::session::Session;
 
@@ -60,7 +60,7 @@ pub enum Routed {
 pub struct MediaRoute<'a> {
     pub prefs: &'a MediaPrefs,
     pub session: &'a Arc<Mutex<Session>>,
-    pub clients: &'a Arc<Mutex<HashMap<u8, Arc<Client>>>>,
+    pub peers: &'a Arc<Mutex<Peers>>,
     pub engine: &'a Mutex<Box<dyn Engine>>,
 }
 
@@ -75,21 +75,14 @@ pub fn route_command(rt: &MediaRoute<'_>, command: MediaCommand) -> Routed {
     };
     let prefs = rt.prefs.clone();
 
-    // The decision is made under the clients lock (the pinned target needs
-    // the machine-id lookup), and the lock is released before anything is
-    // sent or any engine call is made. Both of those can take other locks,
-    // and a routing decision must never be able to deadlock the input path.
+    // The decision is made under the peers lock (the pinned target needs
+    // the machine-id lookup, which is one store method), and the lock is
+    // released before anything is sent or any engine call is made. Both
+    // of those can take other locks, and a routing decision must never be
+    // able to deadlock the input path.
     let resolved = {
-        let clients = rt.clients.lock().unwrap();
-        let screen_of = |machine_id: &str| -> Option<u8> {
-            clients
-                .values()
-                .find(|c| {
-                    let id = c.machine_id.as_str();
-                    id == machine_id || id.starts_with(machine_id) || machine_id.starts_with(id)
-                })
-                .map(|c| c.id)
-        };
+        let peers = rt.peers.lock().unwrap();
+        let screen_of = |machine_id: &str| -> Option<u8> { peers.solve_machine_id(machine_id) };
         let context = MediaContext {
             focus,
             last_active,
@@ -104,12 +97,7 @@ pub fn route_command(rt: &MediaRoute<'_>, command: MediaCommand) -> Routed {
             // A client that vanished between the decision and here is a
             // miss, not an error — the key is still consumed, because it was
             // consumed the moment routing was on.
-            let sender = rt
-                .clients
-                .lock()
-                .unwrap()
-                .get(&id)
-                .map(|client| client.out.clone());
+            let sender = rt.peers.lock().unwrap().get(id).map(|client| client.out.clone());
             match sender {
                 Some(sender)
                     if sender.try_send(route(Message::MediaControl { command })).is_ok() =>

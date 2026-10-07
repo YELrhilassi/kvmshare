@@ -1,20 +1,24 @@
 //! The UDP cursor stream: one receiver thread that learns each client's
 //! address, routes real-cursor beacons to the session (dropping stale
 //! frames by sequence number), and executes any crossing a beacon fires.
+//!
+//! Every per-client fact this thread reads or writes — the handshake IP
+//! it authenticates against, the stream address, the sequence, the
+//! last-heard clock — lives in the [`Peers`] store, so the receiver's
+//! update is one operation on one lock instead of a careful dance
+//! across four maps.
 
 use std::io;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use kvmshare_log::{log_debug, log_warn};
+use kvmshare_log::log_warn;
 use kvmshare_protocol::message::Message;
 
 use crate::server::actions::apply_action;
 use crate::server::client::ClientCtx;
 use crate::session::Action;
-use crate::time::now_ms;
-use crate::udp;
 
 /// How long the active client's cursor stream may go silent before the
 /// server drops it. The client beacons every ~8 ms while active, so
@@ -31,7 +35,7 @@ use crate::udp;
 /// cost of the extra window is a wedged client holding an isolated
 /// local machine a few seconds longer before the escape-key/teardown
 /// paths (which already existed) recover it.
-const ACTIVE_BEACON_TIMEOUT: Duration = Duration::from_millis(5000);
+const ACTIVE_BEACON_TIMEOUT: u64 = 5000;
 
 /// The UDP socket's read timeout: the receiver blocks in `recv_from` and
 /// the OS wakes it at this cadence when the stream is idle, purely so
@@ -40,21 +44,21 @@ const ACTIVE_BEACON_TIMEOUT: Duration = Duration::from_millis(5000);
 pub const IDLE_TIMEOUT: Duration = Duration::from_millis(8);
 
 /// Drop the active client when its cursor stream has been silent for
-/// [`ACTIVE_BEACON_TIMEOUT`]. Called from the UDP receiver whenever the
-/// stream is quiet. Mirrors the TCP silence drop in the reader thread —
-/// but catches what that cannot: a client whose motion loop is wedged
-/// while its control thread (and keepalives) are still alive.
+/// [`ACTIVE_BEACON_TIMEOUT`] ms. Called from the UDP receiver whenever
+/// the stream is quiet. Mirrors the TCP silence drop in the reader
+/// thread — but catches what that cannot: a client whose motion loop is
+/// wedged while its control thread (and keepalives) are still alive.
 fn check_active_beacon_staleness(ctx: &ClientCtx) {
     let active = *ctx.active.lock().unwrap();
     let Some(id) = active else { return };
-    let now = now_ms();
-    let last = ctx.last_heard.lock().unwrap().get(&id).copied();
+    let last = ctx.peers.lock().unwrap().last_heard_of(id);
     let Some(last) = last else { return };
-    if now.saturating_sub(last) <= ACTIVE_BEACON_TIMEOUT.as_millis() as u64 {
+    let now = crate::time::now_ms();
+    if now.saturating_sub(last) <= ACTIVE_BEACON_TIMEOUT {
         return;
     }
     log_warn!(
-        "client {id}: cursor stream silent for {ACTIVE_BEACON_TIMEOUT:?} while active — dropping so control returns home"
+        "client {id}: cursor stream silent for {ACTIVE_BEACON_TIMEOUT} ms while active — dropping so control returns home"
     );
     // The reader thread's normal teardown path does the unregister +
     // return-home; triggering it from here (a forced disconnect) is the
@@ -62,7 +66,7 @@ fn check_active_beacon_staleness(ctx: &ClientCtx) {
     // teardown's identity check can confirm it is still the registered
     // one (a stale beacon watchdog must never evict a newer connection
     // that took over the id).
-    let client = { ctx.clients.lock().unwrap().get(&id).cloned() };
+    let client = ctx.peers.lock().unwrap().get(id);
     match client {
         Some(client) => ctx.teardown(&client),
         None => {
@@ -83,14 +87,7 @@ fn check_active_beacon_staleness(ctx: &ClientCtx) {
             let action = ctx.session.lock().unwrap().on_client_disconnected(id);
             if let Action::SwitchToLocal { .. } = action {
                 if let Ok(mut engine) = ctx.engine.lock() {
-                    let _ = apply_action(
-                        action,
-                        &ctx.active,
-                        &ctx.clients,
-                        &ctx.last_heard,
-                        &mut engine,
-                        ctx.events.as_ref(),
-                    );
+                    let _ = apply_action(action, &ctx.active, &ctx.peers, &mut engine, ctx.events.as_ref());
                 }
             }
         }
@@ -108,7 +105,7 @@ pub fn udp_receiver(udp: Arc<std::net::UdpSocket>, ctx: Arc<ClientCtx>) {
     loop {
         match udp.recv_from(&mut buf) {
             Ok((n, from)) => {
-                let Some(d) = udp::unpack(&buf[..n]) else { continue };
+                let Some(d) = crate::udp::unpack(&buf[..n]) else { continue };
                 // Only datagrams from a known client count — and the
                 // client id in a datagram is just a claim; the **source
                 // IP** is what the transport authenticates. A datagram is
@@ -120,10 +117,9 @@ pub fn udp_receiver(udp: Arc<std::net::UdpSocket>, ctx: Arc<ClientCtx>) {
                 // or feed a beacon to the session — a forged CursorPos
                 // could otherwise drive edge crossings.
                 {
-                    let known_ip = ctx.tcp_ips.lock().unwrap().get(&d.id).copied();
-                    let known_ip = match known_ip {
-                        Some(ip) => ip,
-                        None => continue, // no such connected client
+                    let mut peers = ctx.peers.lock().unwrap();
+                    let Some(known_ip) = peers.tcp_ip_of(d.id) else {
+                        continue; // no such connected client
                     };
                     if from.ip() != known_ip {
                         // Not from the handshaked machine: a spoofed id
@@ -131,48 +127,24 @@ pub fn udp_receiver(udp: Arc<std::net::UdpSocket>, ctx: Arc<ClientCtx>) {
                         // every probe would hand attackers a cheap oracle.
                         continue;
                     }
-                }
-                // Any surviving datagram proves its cursor stream is
-                // alive (beacons flow continuously while it is active).
-                // Tracked for the staleness watchdog above.
-                ctx.last_heard.lock().unwrap().insert(d.id, now_ms());
-                // Learn or verify the datagram's source **port**. The IP
-                // was already matched against the handshake above; the
-                // port is learned from the client's first datagram (its
-                // registration, sent right after the handshake) and can
-                // legitimately change when the client reconnects from a
-                // new port. Either way the old sequence space belongs to
-                // the old address — reset it and adopt the new source.
-                // Without this, a late frame from a dead session
-                // re-creates the seq tracker at its high value and every
-                // fresh beacon (starting at 1) is judged stale: the live
-                // session is deafened.
-                {
-                    let mut addrs = ctx.addrs.lock().unwrap();
-                    match addrs.get(&d.id) {
-                        None => {
-                            addrs.insert(d.id, from);
-                            log_debug!("client {} registered UDP stream from {from}", d.id);
-                        }
-                        Some(addr) if *addr != from => {
-                            ctx.seqs.lock().unwrap().remove(&d.id);
-                            addrs.insert(d.id, from);
-                            log_debug!("client {} re-registered UDP stream from {from}", d.id);
-                        }
-                        Some(_) => {}
-                    }
+                    // Any surviving datagram proves this client's cursor
+                    // stream is alive: learn/verify the source port (a
+                    // new port resets the sequence space — see
+                    // [`Peers::hear_from`]) and refresh liveness in the
+                    // same operation.
+                    peers.hear_from(d.id, from);
                 }
                 match d.msg {
                     Message::CursorPos { x, y } => {
                         // Stale or duplicate beacons are dropped: a late
                         // "at the wall" report must never arm a crossing.
                         {
-                            let mut seqs = ctx.seqs.lock().unwrap();
-                            let last = seqs.entry(d.id).or_default();
-                            if !udp::is_newer(d.seq, *last) {
+                            let mut peers = ctx.peers.lock().unwrap();
+                            let last = peers.seq_of(d.id).unwrap_or(0);
+                            if !crate::udp::is_newer(d.seq, last) {
                                 continue;
                             }
-                            *last = d.seq;
+                            peers.advance_seq(d.id, d.seq);
                         }
                         // The client's *real* cursor position drives
                         // remote edge crossings. Session state is updated
@@ -184,14 +156,7 @@ pub fn udp_receiver(udp: Arc<std::net::UdpSocket>, ctx: Arc<ClientCtx>) {
                         if !actions.is_empty() {
                             if let Ok(mut engine) = ctx.engine.lock() {
                                 for a in actions {
-                                    if let Err(e) = apply_action(
-                                        a,
-                                        &ctx.active,
-                                        &ctx.clients,
-                                        &ctx.last_heard,
-                                        &mut engine,
-                                        ctx.events.as_ref(),
-                                    ) {
+                                    if let Err(e) = apply_action(a, &ctx.active, &ctx.peers, &mut engine, ctx.events.as_ref()) {
                                         log_warn!("beacon crossing for client {}: {e}", d.id);
                                     }
                                 }

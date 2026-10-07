@@ -46,11 +46,11 @@ mod client;
 mod media;
 mod engine;
 mod liveness;
+mod peers;
 mod udp;
 
-use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{TcpListener, UdpSocket};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -67,6 +67,7 @@ use actions::apply_action;
 use client::{Client, ClientCtx};
 pub use client::{Outbound, route};
 use liveness::{supervisor_loop, CONTROL_POLL};
+use peers::Peers;
 
 pub use engine::{Engine, ServerClipboard};
 pub use liveness::{EXIT_RESTART, Liveness};
@@ -210,7 +211,11 @@ pub struct Server {
     listener: TcpListener,
     udp: Arc<UdpSocket>,
     session: Arc<Mutex<Session>>,
-    clients: Arc<Mutex<HashMap<u8, Arc<Client>>>>,
+    /// The connected clients and their transport records, one store.
+    /// (Handshake IPs, UDP stream addresses, sequences and last-heard
+    /// clocks live in the same place as the client itself — see
+    /// [`peers`].)
+    peers: Arc<Mutex<Peers>>,
     /// Id of the client the cursor is currently on (`None` = local).
     active: Arc<Mutex<Option<u8>>>,
     /// The local engine, shared with the accept path's `ClientCtx`. Held
@@ -219,25 +224,6 @@ pub struct Server {
     /// a revoked machine's socket may outlive the cleanup by seconds.
     /// Set by `run`; `disconnect_client` treats it as best-effort.
     engine: Arc<Mutex<Option<Arc<Mutex<Box<dyn Engine>>>>>>,
-    /// Client id → UDP address, learned from each client's first
-    /// datagram. The writers need it to route cursor-stream frames.
-    udp_addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
-    /// Client id → last applied beacon sequence (stale/duplicate UDP
-    /// datagrams are dropped, so an out-of-order "at the wall" report can
-    /// never arm a crossing the user did not push for).
-    udp_seqs: Arc<Mutex<HashMap<u8, u32>>>,
-    /// Client id → when its cursor stream was last heard (monotonic ms).
-    /// The active client beacons every few ms; a stream gone silent is
-    /// the signature of a wedged client — see the beacon watchdog in
-    /// [`udp::udp_receiver`]. Reset to "now" at the moment the session
-    /// activates a client, so the client's first beacons (which only
-    /// flow while it is active) can never be judged late.
-    last_heard: Arc<Mutex<HashMap<u8, u64>>>,
-    /// Client id → the IP its TCP handshake came from. The UDP cursor
-    /// stream is accepted only from this IP — the id inside a datagram
-    /// is a client-supplied claim, the handshake's source IP is not
-    /// (see [`ClientCtx::tcp_ips`]).
-    tcp_ips: Arc<Mutex<HashMap<u8, IpAddr>>>,
     /// App-layer control messages (hot reload). `None` disables them.
     /// In a `Mutex` so `Server` stays `Sync` (the channel itself is not).
     control: Mutex<Option<Receiver<Control>>>,
@@ -314,13 +300,9 @@ impl Server {
             listener,
             udp,
             session: Arc::new(Mutex::new(session)),
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            peers: Arc::new(Mutex::new(Peers::default())),
             active: Arc::new(Mutex::new(None)),
             engine: Arc::new(Mutex::new(None)),
-            udp_addrs: Arc::new(Mutex::new(HashMap::new())),
-            udp_seqs: Arc::new(Mutex::new(HashMap::new())),
-            last_heard: Arc::new(Mutex::new(HashMap::new())),
-            tcp_ips: Arc::new(Mutex::new(HashMap::new())),
             control: Mutex::new(opts.control),
             policy: Arc::new(Mutex::new(opts.policy)),
             events: Mutex::new(opts.events),
@@ -345,7 +327,7 @@ impl Server {
     /// How many clients are currently connected (useful for the GUI's
     /// connection status and for tests to wait for registration).
     pub fn client_count(&self) -> usize {
-        self.clients.lock().unwrap().len()
+        self.peers.lock().unwrap().len()
     }
 
     /// Run the server forever. `input` delivers local input events from
@@ -401,14 +383,10 @@ impl Server {
         let listener = self.listener.try_clone()?;
         let ctx = Arc::new(ClientCtx {
             session: self.session.clone(),
-            clients: self.clients.clone(),
+            peers: self.peers.clone(),
             active: self.active.clone(),
             engine: engine.clone(),
             clipboard,
-            addrs: self.udp_addrs.clone(),
-            seqs: self.udp_seqs.clone(),
-            last_heard: self.last_heard.clone(),
-            tcp_ips: self.tcp_ips.clone(),
             policy: self.policy.clone(), // shared: hot policy changes apply
             events: self.events.lock().unwrap().clone(),
             server_id: self.server_id.clone(),
@@ -501,7 +479,7 @@ impl Server {
                             &media::MediaRoute {
                                 prefs: &prefs,
                                 session: &self.session,
-                                clients: &self.clients,
+                                peers: &self.peers,
                                 engine,
                             },
                             command,
@@ -682,12 +660,10 @@ impl Server {
         let revoked: Vec<u8> = {
             let mut current = self.policy.lock().unwrap();
             *current = policy;
-            let clients = self.clients.lock().unwrap();
-            clients
-                .values()
-                .filter(|c| current.is_revoked(&c.machine_id))
-                .map(|c| c.id)
-                .collect()
+            self.peers
+                .lock()
+                .unwrap()
+                .ids_where(|c| current.is_revoked(&c.machine_id))
         };
         for id in revoked {
             self.disconnect_client(id, "its machine id was revoked");
@@ -722,8 +698,8 @@ impl Server {
 
     fn disconnect_client_inner(&self, id: u8, why: &str, remove_screen: bool) {
         let name = {
-            let clients = self.clients.lock().unwrap();
-            match clients.get(&id) {
+            let peers = self.peers.lock().unwrap();
+            match peers.get(id) {
                 Some(c) => c.name.clone(),
                 None => return, // already gone; nothing to clean up
             }
@@ -740,17 +716,17 @@ impl Server {
         // hooks — a full second of dead keyboard after every operator
         // disconnect. Either command may hit a dead socket — the writer
         // drops those.
-        client::enqueue(&self.clients, id, Message::Leave { screen_id: id });
+        client::enqueue(&self.peers, id, Message::Leave { screen_id: id });
         client::enqueue(
-            &self.clients,
+            &self.peers,
             id,
             Message::Control { command: kvmshare_protocol::id::control::DISCONNECT },
         );
-        self.clients.lock().unwrap().remove(&id);
-        self.udp_addrs.lock().unwrap().remove(&id);
-        self.udp_seqs.lock().unwrap().remove(&id);
-        self.last_heard.lock().unwrap().remove(&id);
-        self.tcp_ips.lock().unwrap().remove(&id);
+        // Unregistration is one store operation, not five map deletes
+        // that had to be kept in the same order from every call site.
+        // (Operator-initiated: no identity check is possible or needed
+        // — we just looked the client up by id.)
+        self.peers.lock().unwrap().remove(id);
 
         // Session first: it decides whether the cursor must come home.
         let action = if remove_screen {
@@ -769,7 +745,7 @@ impl Server {
             if let Some(engine) = engine {
                 if let Ok(mut engine) = engine.lock() {
                     let events = self.events.lock().unwrap().clone();
-                    let _ = apply_action(action, &self.active, &self.clients, &self.last_heard, &mut engine, events.as_ref());
+                    let _ = apply_action(action, &self.active, &self.peers, &mut engine, events.as_ref());
                 }
             }
         }
@@ -787,21 +763,16 @@ impl Server {
     /// dropped those screens in `swap_layout`, so the disconnect keeps
     /// whatever screen state the session decided.
     fn drop_stale_clients(&self) {
-        let gone: Vec<u8> = {
-            let session = self.session.lock().unwrap();
-            let clients = self.clients.lock().unwrap();
-            clients
+        let gone: Vec<u8> = self.peers.lock().unwrap().ids_where(|c| {
+            !self
+                .session
+                .lock()
+                .unwrap()
+                .layout()
+                .screens
                 .iter()
-                .filter(|(_, c)| {
-                    !session
-                        .layout()
-                        .screens
-                        .iter()
-                        .any(|s| s.id == c.id && s.name == c.name)
-                })
-                .map(|(id, _)| *id)
-                .collect()
-        };
+                .any(|s| s.id == c.id && s.name == c.name)
+        });
         for id in gone {
             self.disconnect_client_keep_screen(id, "its screen left the layout");
         }
@@ -816,8 +787,8 @@ impl Server {
     /// connected until the socket happened to die.
     fn apply_client_command(&self, name: &str, command: u8) {
         let id = {
-            let clients = self.clients.lock().unwrap();
-            match clients.values().find(|c| c.name == name) {
+            let peers = self.peers.lock().unwrap();
+            match peers.all().iter().find(|c| c.name == name) {
                 Some(c) => c.id,
                 None => {
                     log_warn!("client command: no connected client named {name:?}");
@@ -835,12 +806,12 @@ impl Server {
             // layout-named screen and every reconnect bounced off the
             // allowlist — the GUI stuck at "connecting…" with the
             // refusal only visible in a log the user had turned off.
-            kvmshare_protocol::id::control::DISCONNECT => {
+            kvmshare_protocol::id::control::            DISCONNECT => {
                 self.disconnect_client_keep_screen(id, "the operator asked it to disconnect")
             }
             _ => {
                 log_info!("client command to {name}: control code {command}");
-                client::enqueue(&self.clients, id, Message::Control { command });
+                client::enqueue(&self.peers, id, Message::Control { command });
             }
         }
     }
@@ -848,13 +819,8 @@ impl Server {
     /// Send a message to every connected client (e.g. layout or
     /// clipboard broadcasts from the app layer).
     pub fn broadcast(&self, msg: &Message) -> io::Result<()> {
-        let clients = self.clients.lock().unwrap();
-        for c in clients.values() {
-            let item = client::route(msg.clone());
-            // try_send: a wedged client's full queue must not block the
-            // broadcast (or the main loop) — one dropped frame beats a
-            // stalled input path.
-            let _ = c.out.try_send(item);
+        for c in self.peers.lock().unwrap().all() {
+            client::enqueue_client(&c, msg.clone());
         }
         Ok(())
     }
@@ -862,6 +828,6 @@ impl Server {
     /// Apply a session [`Action`] to the world.
     fn execute(&self, action: Action, engine: &mut MutexGuard<'_, Box<dyn Engine>>) -> io::Result<()> {
         let events = self.events.lock().unwrap().clone();
-        apply_action(action, &self.active, &self.clients, &self.last_heard, engine, events.as_ref())
+        apply_action(action, &self.active, &self.peers, engine, events.as_ref())
     }
 }

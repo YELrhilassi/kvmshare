@@ -1,7 +1,6 @@
 //! One connected client: its outbound queue, its shared context, and
 //! the accept → handshake → service → teardown lifecycle.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -15,6 +14,7 @@ use kvmshare_protocol::message::{Layout, Message, ScreenInfo};
 
 use crate::server::actions::apply_action;
 use crate::server::engine::{Engine, ServerClipboard};
+use crate::server::peers::Peers;
 use crate::server::{Policy, ServerEvent};
 use crate::session::{Action, Session};
 use crate::transport::{RecvResult, Transport};
@@ -82,11 +82,11 @@ pub fn route(msg: Message) -> Outbound {
     }
 }
 
-/// Push a message onto a client's outbound queue (never blocks — the
-/// queue is bounded and full queues drop; see [`OUT_QUEUE_CAP`]).
-/// Unknown client = gone.
-pub fn enqueue(clients: &Arc<Mutex<HashMap<u8, Arc<Client>>>>, id: u8, msg: Message) {
-    let Some(client) = clients.lock().unwrap().get(&id).cloned() else { return };
+/// Push a message onto one client's outbound queue directly (never
+/// blocks — see [`OUT_QUEUE_CAP`]). Callers that already hold the
+/// [`Client`] handle use this; everything else goes through
+/// [`enqueue`], which looks the client up in the [`Peers`] store.
+pub fn enqueue_client(client: &Arc<Client>, msg: Message) {
     match route(msg) {
         Outbound::Udp(m) => {
             // Motion is loss-tolerant by design: a full queue drops the
@@ -99,32 +99,33 @@ pub fn enqueue(clients: &Arc<Mutex<HashMap<u8, Arc<Client>>>>, id: u8, msg: Mess
                 // far behind. Dropping keeps the input path live — it
                 // must never block on a stuck client — and the silence
                 // timeouts end the session shortly after.
-                log_warn!("client {id}: outbound queue full — dropping a control frame");
+                log_warn!("client {}: outbound queue full — dropping a control frame", client.id);
             }
         }
     }
 }
 
+/// Push a message onto one connected client's outbound queue (never
+/// blocks — the queue is bounded and full queues drop; see
+/// [`OUT_QUEUE_CAP`]). Unknown client = gone; the store is the one
+/// place that can answer that.
+pub fn enqueue(peers: &Arc<Mutex<Peers>>, id: u8, msg: Message) {
+    let Some(client) = peers.lock().unwrap().get(id) else { return };
+    enqueue_client(&client, msg);
+}
+
 /// Shared state one connected client's threads need. Bundled once at
 /// accept time so neither the handshake nor the service loop carries a
 /// nine-parameter signature, and so adding per-client state is a one-
-/// place change.
+/// place change. The per-client transport records (handshake IP, UDP
+/// stream address, sequence, last-heard) live in the [`Peers`] store —
+/// the one place that answers "is this id still this client?".
 pub struct ClientCtx {
     pub session: Arc<Mutex<Session>>,
-    pub clients: Arc<Mutex<HashMap<u8, Arc<Client>>>>,
+    pub peers: Arc<Mutex<Peers>>,
     pub active: Arc<Mutex<Option<u8>>>,
     pub engine: Arc<Mutex<Box<dyn Engine>>>,
     pub clipboard: ServerClipboard,
-    /// UDP routing state: per-client datagram addresses and the
-    /// anti-replay sequence counters. Owned jointly by the writer
-    /// (address) and the UDP receiver (address + sequence).
-    pub addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
-    pub seqs: Arc<Mutex<HashMap<u8, u32>>>,
-    /// When each client's cursor stream was last heard (monotonic ms).
-    /// The active client beacons every few ms; a stream gone silent is
-    /// the signature of a wedged client — see the beacon watchdog in
-    /// [`crate::server::udp::udp_receiver`].
-    pub last_heard: Arc<Mutex<HashMap<u8, u64>>>,
     /// Connection policy (allowlist / local-only / trusted + revoked
     /// ids). Shared with the `Server` so a hot policy change applies to
     /// the next handshake without a restart.
@@ -133,16 +134,6 @@ pub struct ClientCtx {
     pub events: Option<Sender<ServerEvent>>,
     /// This machine's stable id, sent to clients in `Welcome`.
     pub server_id: String,
-    /// The **authenticated** transport peers: client id → the IP its TCP
-    /// handshake came from, recorded at handshake time. The UDP cursor
-    /// stream is accepted only from these: the id inside a UDP datagram
-    /// is client-supplied (anyone on the network can put a connected
-    /// client's id in a packet and forge beacons that drive edge
-    /// crossings), but the source *IP* of a datagram cannot be chosen by
-    /// the sender — so binding datagrams to the handshake's IP turns the
-    /// id from a claim into a verified identity. Cleaned up wherever the
-    /// client itself is (teardown, operator disconnect).
-    pub tcp_ips: Arc<Mutex<HashMap<u8, IpAddr>>>,
     /// Audio sharing setup, when `[audio]` asked for it. `None` = off; the
     /// whole feature then costs nothing. See [`crate::server::audio`].
     pub audio: Option<Arc<crate::server::audio::ServerAudio>>,
@@ -168,26 +159,20 @@ impl ClientCtx {
     /// Dropping the last `Sender` of the outbound queue ends the writer
     /// thread, and the socket with it.
     ///
-    /// Identity-safe: only the client that is *still registered* under
-    /// its id is torn down. A newer connection that took over the same
-    /// id (same name — the machine reconnected before the old socket's
-    /// death was noticed, or a second instance bypassed the role lock)
-    /// must never be unregistered by the old connection's reader. The
-    /// old reader simply finishes and drops its Arc; the fresh
-    /// registration is untouched.
+    /// Identity-safe by construction: [`Peers::unregister`] is the one
+    /// place that answers "is this id still this client?", so a newer
+    /// connection that took over the same id (same name — the machine
+    /// reconnected before the old socket's death was noticed, or a
+    /// second instance bypassed the role lock) can never be unregistered
+    /// by the old connection's reader. The old reader simply finishes
+    /// and drops its Arc; the fresh registration is untouched.
     pub fn teardown(&self, client: &Arc<Client>) {
         let id = client.id;
-        let registered = {
-            let clients = self.clients.lock().unwrap();
-            match clients.get(&id) {
-                Some(c) if Arc::ptr_eq(c, client) => true,
-                _ => false,
-            }
-        };
+        let registered = self.peers.lock().unwrap().unregister(id, client);
         if !registered {
             // Superseded by a newer connection with the same id — this
             // reader is the stale one. Its outbound sender is no longer
-            // in the map, so dropping this Arc ends the old writer and
+            // in the store, so dropping this Arc ends the old writer and
             // socket; nothing else must be touched.
             log_debug!("client {}: stale connection superseded — skipping teardown", client.name);
             return;
@@ -217,31 +202,9 @@ impl ClientCtx {
         let _ = client.out.try_send(route(Message::Control {
             command: kvmshare_protocol::id::control::RECONNECT,
         }));
-        // Unregister atomically: the identity check and the removals must
-        // share one `clients` lock acquisition. The removals used to be
-        // separate by-id deletes after a dropped-lock identity check — a
-        // replacement connection that registered in that window was
-        // wiped out by the stale connection's teardown (its fresh
-        // `tcp_ips` entry included), leaving a "connected" client the
-        // cursor stream could never reach.
-        {
-            let mut clients = self.clients.lock().unwrap();
-            match clients.get(&id) {
-                Some(c) if Arc::ptr_eq(c, client) => {
-                    clients.remove(&id);
-                    self.tcp_ips.lock().unwrap().remove(&id);
-                    self.addrs.lock().unwrap().remove(&id);
-                    self.seqs.lock().unwrap().remove(&id);
-                    self.last_heard.lock().unwrap().remove(&id);
-                }
-                _ => {
-                    // Superseded while the farewell messages were being
-                    // queued — the fresh registration owns the id now.
-                    log_debug!("client {}: superseded during teardown — fresh registration wins", client.name);
-                    return;
-                }
-            }
-        }
+        // (The unregister above was atomic: identity check and removal
+        // shared one lock and one store, so the supersede race the old
+        // four-map version had to defend against cannot occur.)
         if let Some(tx) = &self.events {
             let _ = tx.send(ServerEvent::ClientDisconnected { name: client.name.clone() });
         }
@@ -258,8 +221,7 @@ impl ClientCtx {
                 let _ = apply_action(
                     action,
                     &self.active,
-                    &self.clients,
-                    &self.last_heard,
+                    &self.peers,
                     &mut engine,
                     self.events.as_ref(),
                 );
@@ -298,7 +260,7 @@ impl Client {
         })?;
         let reader = transport.reader()?;
         let (out_tx, out_rx) = mpsc::sync_channel::<Outbound>(OUT_QUEUE_CAP);
-        spawn_writer(id, transport, udp, ctx.addrs.clone(), out_rx);
+        spawn_writer(id, transport, udp, ctx.peers.clone(), out_rx);
 
         let client = Arc::new(Client {
             id,
@@ -312,26 +274,16 @@ impl Client {
         // machine reconnected before the old socket's death was noticed,
         // or a second instance started with a different state dir
         // bypassed the role lock. The fresh connection is authoritative
-        // — replace the map entry and end the stale one cleanly. Its
+        // — replace the store entry and end the stale one cleanly. Its
         // reader will finish on the old socket's EOF and its teardown is
         // identity-checked (see [`ClientCtx::teardown`]), so it can
         // never unregister this new client. The Leave/Control pair tells
         // the old peer to end its session; if the old socket is already
-        // dead, the writer drops it on the next send.
-        {
-            let mut clients = ctx.clients.lock().unwrap();
-            // Registration and the UDP-identity mapping land together:
-            // a teardown that runs before this sees no registered client
-            // under this id (its by-id cleanup is harmless), and one that
-            // runs after sees a different Arc and touches nothing.
-            ctx.tcp_ips.lock().unwrap().insert(id, tcp_peer.ip());
-            if let Some(old) = clients.insert(id, client.clone()) {
-                log_info!("client {}: replacing stale connection with the same id", old.name);
-                let _ = old.out.try_send(route(Message::Leave { screen_id: id }));
-                let _ = old.out.try_send(route(Message::Control {
-                    command: kvmshare_protocol::id::control::DISCONNECT,
-                }));
-            }
+        // dead, the writer drops it on the next send. Registration and
+        // the transport record land in one store operation.
+        if let Some(old) = ctx.peers.lock().unwrap().register(id, client.clone(), tcp_peer.ip()) {
+            log_info!("client {}: replacing stale connection with the same id", old.name);
+            Peers::farewell_superseded(&old);
         }
         // The client is now fully registered: crossings may enter its
         // screen. Marking it here — after the map insert — guarantees a
@@ -353,14 +305,14 @@ impl Client {
         // Audio: settle the link now that the client set has changed. A
         // no-op unless `[audio]` asks for something.
         {
-            let others: Vec<Arc<Client>> = {
-                let clients = ctx.clients.lock().unwrap();
-                clients
-                    .values()
-                    .filter(|c| c.id != id)
-                    .cloned()
-                    .collect()
-            };
+            let others: Vec<Arc<Client>> = ctx
+                .peers
+                .lock()
+                .unwrap()
+                .all()
+                .into_iter()
+                .filter(|c| c.id != id)
+                .collect();
             crate::server::audio::reconcile(&ctx, &client, tcp_peer.ip(), &others);
         }
 
@@ -373,11 +325,11 @@ impl Client {
                 client.name
             );
             let layout = ctx.layout_snapshot();
-            for c in ctx.clients.lock().unwrap().values() {
+            for c in ctx.peers.lock().unwrap().all() {
                 // try_send: a full queue must never block a handshake —
                 // a dropped Layout is refreshed by the next reload or
                 // ScreenInfo exchange.
-                let _ = c.out.try_send(route(Message::Layout { layout: layout.clone() }));
+                enqueue_client(&c, Message::Layout { layout: layout.clone() });
             }
         }
         service_client(client, reader, ctx);
@@ -563,7 +515,7 @@ fn handle_client_message(client: &Client, msg: Message, ctx: &ClientCtx) {
                 let mut s = ctx.session.lock().unwrap();
                 s.update_screen_info(client.id, info);
             }
-            enqueue(&ctx.clients, client.id, Message::Layout { layout: ctx.layout_snapshot() });
+            enqueue(&ctx.peers, client.id, Message::Layout { layout: ctx.layout_snapshot() });
         }
         Message::Clipboard { mime, data } => {
             // Content copied on the client reaches the
@@ -592,12 +544,14 @@ fn handle_client_message(client: &Client, msg: Message, ctx: &ClientCtx) {
 /// socket, this client's datagram address). Reliable frames go over TCP;
 /// cursor motion goes over UDP stamped with a per-client sequence number.
 /// The thread never takes a session lock, so it can block on a wedged
-/// peer without ever stalling the input path.
+/// peer without ever stalling the input path. It reads the client's UDP
+/// address from the [`Peers`] store per frame — one point lookup under
+/// the same lock every other per-client read uses.
 fn spawn_writer(
     id: u8,
     mut tcp: Transport,
     udp: Arc<UdpSocket>,
-    addrs: Arc<Mutex<HashMap<u8, SocketAddr>>>,
+    peers: Arc<Mutex<Peers>>,
     rx: Receiver<Outbound>,
 ) {
     thread::Builder::new()
@@ -611,7 +565,12 @@ fn spawn_writer(
                 let res = match item {
                     Outbound::Tcp(msg) => tcp.send(&msg),
                     Outbound::Udp(msg) => {
-                        let addr = addrs.lock().unwrap().get(&id).copied();
+                        // One point read of this client's record; the
+                        // address is `None` until the client's first
+                        // datagram registers it, and only a race can
+                        // deliver motion before that — motion is
+                        // loss-tolerant.
+                        let addr = peers.lock().unwrap().addr_of(id);
                         match addr {
                             Some(addr) => {
                                 let bytes = udp::pack(id, seq, &msg);
@@ -619,10 +578,6 @@ fn spawn_writer(
                                 udp.send_to(&bytes, addr).map(|_| ())
                             }
                             None => {
-                                // The client registers its address with its
-                                // first datagram right after the handshake;
-                                // only a race can deliver motion before
-                                // that, and motion is loss-tolerant.
                                 if !unregistered {
                                     log_debug!("client {id}: no UDP address yet, dropping cursor frame");
                                     unregistered = true;
