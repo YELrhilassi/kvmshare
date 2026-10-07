@@ -125,15 +125,23 @@ impl MediaCommand {
     /// consumer-page usages the platform key tables define, so it costs
     /// a jump table lookup on the hot path.
     ///
-    /// Two usages are worth explaining:
+    /// Two usages worth explaining:
     ///
     /// * `0xcd` is the consumer page's *Play/Pause* toggle — the key
     ///   actually printed on most keyboards. `0xb0`/`0xb1` are the
     ///   discrete Play and Pause some QMK boards send instead.
-    /// * `0xe8` is Mute. The consumer page also defines `0xe2` as Mute;
-    ///   the shared key tables map `0xe8`, and both are accepted here so
-    ///   a keyboard using either convention is classified rather than
-    ///   silently forwarded as a normal key.
+    /// * Mute is recognised from `0xe8` only. The consumer page does
+    ///   define `0xe2` as Mute — but `0xe2` is **Left Alt** on the
+    ///   keyboard page, which is the page this codebase's key tables
+    ///   speak (`crate::keys`, the chord engine's `ALT_L`): every Alt
+    ///   keystroke on every platform canonicalises to it. Accepting it
+    ///   here classified Alt+Tab as Mute and silently swallowed Alt on
+    ///   any machine with media routing on — the default — so the
+    ///   lenient form was removed. A device that emits consumer-page
+    ///   reports directly is not produced by any capture backend this
+    ///   protocol serves: capture canonicalises keyboard-page events,
+    ///   and the mute key itself arrives as `0xe8` on every supported
+    ///   platform.
     pub fn from_hid(hid: u32) -> Option<Self> {
         Some(match hid {
             0xcd => MediaCommand::PlayPause,
@@ -146,7 +154,9 @@ impl MediaCommand {
             0xb4 => MediaCommand::SeekBackward,
             0xe9 => MediaCommand::VolumeUp,
             0xea => MediaCommand::VolumeDown,
-            0xe2 | 0xe8 => MediaCommand::Mute,
+            // 0xe8 only — see the doc comment for why 0xe2 (the consumer
+            // page's other Mute) must never be accepted here.
+            0xe8 => MediaCommand::Mute,
             _ => return None,
         })
     }
@@ -227,9 +237,6 @@ mod tests {
             let hid = cmd.to_hid();
             let back = MediaCommand::from_hid(hid);
             assert!(back.is_some(), "{cmd:?} (hid {hid:#x}) is not classified");
-            // The only legitimate difference is Mute, which the consumer
-            // page defines twice — injection picks 0xe8, and 0xe2 is
-            // accepted as the same command.
             if let Some(back) = back {
                 assert_eq!(back, cmd, "{cmd:?} (hid {hid:#x}) classified as {back:?}");
             }
@@ -237,10 +244,13 @@ mod tests {
     }
 
     /// Ordinary keys are not media keys. A classifier that matched too
-    /// much would swallow typing.
+    /// much would swallow typing. `0xe2` is pinned explicitly: it is
+    /// Left Alt on the keyboard page this codebase speaks, and accepting
+    /// it as consumer-page Mute once ate every Alt keystroke on machines
+    /// with media routing on — the default.
     #[test]
     fn ordinary_keys_are_not_classified() {
-        for hid in [0x04u32, 0x1e, 0x2c, 0x39, 0xe0, 0xe1, 0x4c, 0x28] {
+        for hid in [0x04u32, 0x1e, 0x2c, 0x39, 0xe0, 0xe1, 0xe2, 0xe6, 0x4c, 0x28] {
             assert_eq!(MediaCommand::from_hid(hid), None, "hid {hid:#x}");
         }
     }
