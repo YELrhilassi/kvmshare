@@ -26,7 +26,7 @@ func TestStaleManifestSelfHeals(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The GUI's own check, exercised through the App method.
-	a := &App{}
+	a := testApp(&App{})
 	if err := a.verifyBinary(filepath.Join(dir, "kvmshare-server")); err != nil {
 		t.Fatalf("consistent binaries behind a stale manifest must self-heal, got: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestMixedBuildStillRefused(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "kvmshare-gui"), []byte(b1), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	a := &App{}
+	a := testApp(&App{})
 	if err := a.verifyBinary(filepath.Join(dir, "kvmshare-server")); err == nil {
 		t.Fatal("a mixed build set must still be refused")
 	}

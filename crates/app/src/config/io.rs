@@ -128,17 +128,100 @@ pub fn client_config_path() -> PathBuf {
 /// var wins (the operator owns it), then the per-user `.config/kvmshare`
 /// directory when the file is actually there, then a file beside the
 /// working directory as the portable-install fallback.
+///
+/// The per-user directory is resolved from `HOME` **then `USERPROFILE`**,
+/// the same pair (and the same reason) as [`crate::state_dir`]: a
+/// GUI-launched or scheduled-task child on Windows usually has no `HOME`,
+/// only `USERPROFILE`. Checking `HOME` alone sent the client looking for
+/// `kvmshare-client.toml` in its working directory, so the GUI's writes
+/// to `%USERPROFILE%\.config\kvmshare\` were never found — `[audio]`
+/// silently fell back to its default (off) and audio could not be enabled
+/// from the page at all.
 fn role_config_path(env_var: &str, file_name: &str) -> PathBuf {
-    if let Ok(p) = std::env::var(env_var) {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
+    let explicit = std::env::var_os(env_var).filter(|p| !p.is_empty());
+    let homes: Vec<std::ffi::OsString> = ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(|v| std::env::var_os(v))
+        .filter(|h| !h.is_empty())
+        .collect();
+    resolve_role_config(explicit, &homes, file_name)
+}
+
+/// The resolution above with its inputs passed in, so the rule (not the
+/// process environment) is what a test pins.
+fn resolve_role_config(
+    explicit: Option<std::ffi::OsString>,
+    homes: &[std::ffi::OsString],
+    file_name: &str,
+) -> PathBuf {
+    if let Some(p) = explicit {
+        return PathBuf::from(p);
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    for home in homes {
         let p = PathBuf::from(home).join(".config/kvmshare").join(file_name);
         if p.exists() {
             return p;
         }
     }
     PathBuf::from(file_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    /// Write a config file into `home`'s per-user directory and return
+    /// that home path.
+    fn home_with(file_name: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "kvmshare-io-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir = home.join(".config/kvmshare");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file_name), "").unwrap();
+        home
+    }
+
+    #[test]
+    fn explicit_env_var_wins() {
+        let path = resolve_role_config(
+            Some(OsString::from("/explicit/config.toml")),
+            &[OsString::from("/home/x")],
+            "kvmshare-client.toml",
+        );
+        assert_eq!(path, PathBuf::from("/explicit/config.toml"));
+    }
+
+    /// The Windows regression: with no `HOME` (GUI-launched/scheduled-task
+    /// children) but a `USERPROFILE`, the per-user config must still be
+    /// found — otherwise the client silently ran with audio off.
+    #[test]
+    fn falls_back_to_userprofile_when_home_is_absent() {
+        let home = home_with("kvmshare-client.toml");
+        let path = resolve_role_config(
+            None,
+            &[OsString::from(home.clone())],
+            "kvmshare-client.toml",
+        );
+        assert_eq!(path, home.join(".config/kvmshare/kvmshare-client.toml"));
+    }
+
+    /// A missing per-user file still falls back to the working-directory
+    /// name, the portable-install case.
+    #[test]
+    fn a_missing_per_user_file_falls_back_to_the_cwd_name() {
+        let home = home_with("some-other.toml");
+        let path = resolve_role_config(
+            None,
+            &[OsString::from(home)],
+            "kvmshare-client.toml",
+        );
+        assert_eq!(path, PathBuf::from("kvmshare-client.toml"));
+    }
 }

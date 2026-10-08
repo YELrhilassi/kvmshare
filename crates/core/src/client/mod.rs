@@ -149,6 +149,9 @@ pub struct Client {
 pub struct AudioSetup {
     pub options: crate::audio::runtime::AudioOptions,
     pub backend: Arc<dyn crate::audio::runtime::AudioBackend>,
+    /// Where status transitions go (the app layer persists them for the
+    /// GUI). `None` means the GUI cannot see live audio state.
+    pub status: Option<Arc<dyn crate::audio::runtime::AudioStatusSink>>,
 }
 
 // Hand-written: the backend is a trait object, and the interesting part of
@@ -313,12 +316,8 @@ impl Client {
         let (audio_tx, audio_rx) = mpsc::channel::<Message>();
         let mut audio = match (audio, transport.peer_addr()) {
             (Some(setup), Ok(peer)) if setup.options.is_active() => {
-                match audio::ClientAudio::start(
-                    setup.options,
-                    setup.backend,
-                    peer.ip(),
-                    audio_tx,
-                ) {
+                let AudioSetup { options, backend, status } = setup;
+                match audio::ClientAudio::start(options, backend, peer.ip(), audio_tx, status) {
                     Ok(mut engine) => {
                         // Announce now; the first idle tick puts the offer
                         // on the wire. The server cannot be told earlier

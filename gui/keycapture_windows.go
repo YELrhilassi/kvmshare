@@ -352,7 +352,7 @@ type msgLayout struct {
 // the returned session is armed the moment this call returns, so the
 // page can subscribe and receive events as soon as the hook exists.
 // Bound for the frontend.
-func (a *App) StartKeyCapture(token string) (string, error) {
+func (a *inputService) StartKeyCapture(token string) (string, error) {
 	a.mu.Lock()
 	em := a.events
 	a.mu.Unlock()
@@ -365,7 +365,7 @@ func (a *App) StartKeyCapture(token string) (string, error) {
 
 // StopKeyCapture ends the session with this token (a stale token is a
 // no-op, not an error). Bound for the frontend.
-func (a *App) StopKeyCapture(token string) error {
+func (a *inputService) StopKeyCapture(token string) error {
 	keyCapture.disarm(token)
 	return nil
 }
@@ -373,7 +373,7 @@ func (a *App) StopKeyCapture(token string) error {
 // RenewKeyCapture extends the session (the recorder renews on every
 // received key, so a long thoughtful pause then a key still works).
 // Bound for the frontend.
-func (a *App) RenewKeyCapture(token string) error {
+func (a *inputService) RenewKeyCapture(token string) error {
 	keyCapture.renew(token)
 	return nil
 }

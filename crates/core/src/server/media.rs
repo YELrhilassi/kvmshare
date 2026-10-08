@@ -181,8 +181,7 @@ mod tests {
     fn a_pinned_target_resolves_locally_when_disconnected() {
         let prefs = MediaPrefs {
             route_media_keys: true,
-            transport: MediaTarget::Machine("not-connected".into()),
-            volume: MediaTarget::Local,
+            target: MediaTarget::Machine("not-connected".into()),
             fallback_local: true,
         };
         let screen_of = |machine_id: &str| -> Option<u8> {

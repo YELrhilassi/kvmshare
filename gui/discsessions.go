@@ -74,7 +74,7 @@ func (a *App) discoverySessionSync() {
 // sessions ended without hearing anyone, and how long the current
 // session has left. The UI renders this verbatim — "discovery stops
 // when it fails" is something the user can see.
-func (a *App) DiscoveryStatus() discovery.Status {
+func (a *discoveryService) DiscoveryStatus() discovery.Status {
 	if a.disc == nil {
 		return discovery.Status{State: discovery.SessionIdle.String()}
 	}

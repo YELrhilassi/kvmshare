@@ -35,7 +35,7 @@ type ConnectedClient struct {
 // same lie the client's stale state file used to tell, reconciled the
 // same way: a live server role lock is the gate for trusting the file).
 // Always returns a non-nil slice so the frontend can safely iterate it.
-func (a *App) ListClients() []ConnectedClient {
+func (a *clientsService) ListClients() []ConnectedClient {
 	if !a.roleActive(roleServer) {
 		return []ConnectedClient{} // no server running: the file is a leftover
 	}
@@ -59,7 +59,7 @@ func (a *App) ListClients() []ConnectedClient {
 //     again)
 //   - reconnect   — ends its session and reconnects immediately
 //   - restart     — same as reconnect (a fresh session)
-func (a *App) ClientCommand(name, action string) error {
+func (a *clientsService) ClientCommand(name, action string) error {
 	switch action {
 	case "disconnect", "reconnect", "restart":
 	default:

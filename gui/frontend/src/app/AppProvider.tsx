@@ -1,5 +1,21 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, onState, type ClientState, type ConnectedClient, type Mode, type Peer } from "@/lib/bridge";
+import { api, onState, type AudioState, type ClientState, type ConnectedClient, type Mode, type Peer } from "@/lib/bridge";
+
+/** The resting audio state, used before the first snapshot arrives. */
+export const INACTIVE_AUDIO: AudioState = {
+  send: false,
+  receive: false,
+  sending: false,
+  receiving: false,
+  peer: "",
+  capturePlaying: false,
+  captureLevelDb: null,
+  receivePlaying: false,
+  receiveLevelDb: null,
+  captureNote: "",
+  error: "",
+  active: false,
+};
 
 export interface RunningStatus {
   server: boolean;
@@ -29,6 +45,8 @@ interface AppContextValue {
    *  this — a merely connected client with control at home does not
    *  set it. */
   controlAway: boolean;
+  /** The live audio link state (see the Media & audio page). */
+  audio: AudioState;
   /** One-shot re-read after a user action (a response to a click, not polling). */
   refresh: () => Promise<void>;
 }
@@ -49,6 +67,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [trusted, setTrusted] = useState<string[]>([]);
   const [revoked, setRevoked] = useState<string[]>([]);
   const [controlAway, setControlAway] = useState(false);
+  const [audio, setAudio] = useState<AudioState>(INACTIVE_AUDIO);
 
   const refresh = useCallback(async () => {
     try {
@@ -84,6 +103,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setTrusted(s.trusted ?? []);
       setRevoked(s.revoked ?? []);
       setControlAway(s.controlAway ?? false);
+      setAudio(s.audio ?? INACTIVE_AUDIO);
     });
     void refresh(); // seed before the first event arrives
     return () => {
@@ -106,8 +126,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ mode, clientName, setMode, running, clientState, clients, peers, trusted, revoked, controlAway, refresh }),
-    [mode, clientName, setMode, running, clientState, clients, peers, trusted, revoked, controlAway, refresh],
+    () => ({ mode, clientName, setMode, running, clientState, clients, peers, trusted, revoked, controlAway, audio, refresh }),
+    [mode, clientName, setMode, running, clientState, clients, peers, trusted, revoked, controlAway, audio, refresh],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

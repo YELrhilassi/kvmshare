@@ -25,13 +25,22 @@ pub struct MediaConfig {
     /// Master switch. `false` = media keys are never intercepted.
     #[serde(default = "default_true")]
     pub route_media_keys: bool,
-    /// Where play/pause/next/previous/stop/seek go.
-    #[serde(default = "default_media_target")]
-    pub transport: String,
-    /// Where volume/mute go — the *output* the user is listening to,
-    /// which can be a different machine from the media source.
-    #[serde(default = "default_media_target")]
-    pub volume: String,
+    /// Where every media key goes — playback and volume alike.
+    ///
+    /// `None` when the key is absent, which is also how a config written
+    /// before the two-category split was collapsed is recognised (see
+    /// [`Self::transport`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// **Legacy.** Where playback keys went, before the target was made
+    /// one value. Read only, so an upgrade keeps the routing the user had;
+    /// never written. When a file has both old keys, `transport` wins
+    /// (the keys a user notices most).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// **Legacy.** Where volume keys went. Read only, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
     /// Hand an unresolvable target to the local machine instead of
     /// swallowing the key.
     #[serde(default = "default_true")]
@@ -42,10 +51,26 @@ impl Default for MediaConfig {
     fn default() -> Self {
         Self {
             route_media_keys: true,
-            transport: default_media_target(),
-            volume: default_media_target(),
+            target: None,
+            transport: None,
+            volume: None,
             fallback_local: true,
         }
+    }
+}
+
+impl MediaConfig {
+    /// The one routing target, resolving the legacy per-category keys when
+    /// the new one is absent. An empty new value counts as absent, so a
+    /// hand-written `target = ""` still falls back rather than erroring.
+    fn resolved_target(&self) -> &str {
+        self.target
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .or_else(|| self.transport.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+            .or_else(|| self.volume.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+            .unwrap_or(DEFAULT_MEDIA_TARGET)
     }
 }
 
@@ -57,19 +82,20 @@ impl MediaConfig {
     pub fn to_prefs(&self) -> Result<kvmshare_core::media::MediaPrefs, String> {
         Ok(kvmshare_core::media::MediaPrefs {
             route_media_keys: self.route_media_keys,
-            transport: parse_target("transport", &self.transport)?,
-            volume: parse_target("volume", &self.volume)?,
+            target: parse_target("target", self.resolved_target())?,
             fallback_local: self.fallback_local,
         })
     }
 
     /// Write a policy back in config form (GUI edits round-trip through
-    /// the file, so what is shown is what will be loaded).
+    /// the file, so what is shown is what will be loaded). The legacy keys
+    /// are dropped, which is how a config migrates to the single target.
     pub fn from_prefs(prefs: &kvmshare_core::media::MediaPrefs) -> Self {
         Self {
             route_media_keys: prefs.route_media_keys,
-            transport: prefs.transport.as_str(),
-            volume: prefs.volume.as_str(),
+            target: Some(prefs.target.as_str()),
+            transport: None,
+            volume: None,
             fallback_local: prefs.fallback_local,
         }
     }
@@ -179,9 +205,9 @@ const fn default_activity_floor() -> f32 {
     -50.0
 }
 
-fn default_media_target() -> String {
-    kvmshare_core::media::MediaTarget::default().as_str()
-}
+/// The routing target a config with no explicit `target` gets: the
+/// behaviour-preserving default (keys follow the cursor).
+const DEFAULT_MEDIA_TARGET: &str = "follow_focus";
 
 #[cfg(test)]
 mod tests {
@@ -203,19 +229,43 @@ mod tests {
         let cfg = load_str("inert", "port = 24800\n[[screens]]\nname = \"pc\"\n").unwrap();
         let prefs = cfg.media.to_prefs().unwrap();
         assert!(prefs.route_media_keys, "routing is on but conservative");
-        assert_eq!(prefs.transport, kvmshare_core::media::MediaTarget::FollowFocus);
-        assert_eq!(prefs.volume, kvmshare_core::media::MediaTarget::FollowFocus);
+        assert_eq!(prefs.target, kvmshare_core::media::MediaTarget::FollowFocus);
         assert!(prefs.fallback_local, "a media key is never swallowed by default");
         assert!(!cfg.audio.send, "audio capture is off until asked for");
         assert!(!cfg.audio.receive);
     }
 
     /// The headline configuration: keep the media keys on one machine
-    /// while working on another, over a pinned machine id.
+    /// while working on another, over a pinned machine id. One target now
+    /// covers playback and volume alike.
     #[test]
-    fn media_section_routes_categories_independently() {
+    fn media_section_routes_every_key_through_one_target() {
         let cfg = load_str(
             "media",
+            r#"
+            port = 24800
+            [[screens]]
+            name = "pc"
+            [media]
+            target = "machine:98980a4d9afac273a9aac53ec1c57c35"
+        "#,
+        )
+        .unwrap();
+        let prefs = cfg.media.to_prefs().unwrap();
+        assert_eq!(
+            prefs.target,
+            kvmshare_core::media::MediaTarget::Machine(
+                "98980a4d9afac273a9aac53ec1c57c35".to_string()
+            )
+        );
+    }
+
+    /// A config written before the two categories were collapsed keeps its
+    /// routing: the legacy keys are read for migration, `transport` first.
+    #[test]
+    fn legacy_per_category_targets_are_still_honoured() {
+        let cfg = load_str(
+            "legacy-media",
             r#"
             port = 24800
             [[screens]]
@@ -226,14 +276,12 @@ mod tests {
         "#,
         )
         .unwrap();
-        let prefs = cfg.media.to_prefs().unwrap();
         assert_eq!(
-            prefs.transport,
+            cfg.media.to_prefs().unwrap().target,
             kvmshare_core::media::MediaTarget::Machine(
                 "98980a4d9afac273a9aac53ec1c57c35".to_string()
             )
         );
-        assert_eq!(prefs.volume, kvmshare_core::media::MediaTarget::Local);
     }
 
     /// A typo in a routing target refuses to load. Silently routing keys
@@ -242,24 +290,26 @@ mod tests {
     fn an_unknown_media_target_fails_validation() {
         let err = load_str(
             "badtarget",
-            "port = 24800\n[[screens]]\nname = \"pc\"\n[media]\ntransport = \"remote\"\n",
+            "port = 24800\n[[screens]]\nname = \"pc\"\n[media]\ntarget = \"remote\"\n",
         )
         .unwrap_err();
-        assert!(err.contains("[media] transport"), "got: {err}");
+        assert!(err.contains("[media] target"), "got: {err}");
         assert!(err.contains("unknown media target"), "got: {err}");
     }
 
     /// The policy survives a round trip out to config form and back, so
-    /// the GUI can write what it shows.
+    /// the GUI can write what it shows — and the legacy keys do not come
+    /// back, which is how the file migrates.
     #[test]
     fn media_prefs_round_trip_through_config() {
         let prefs = kvmshare_core::media::MediaPrefs {
             route_media_keys: false,
-            transport: kvmshare_core::media::MediaTarget::LastActiveSource,
-            volume: kvmshare_core::media::MediaTarget::FocusOrLastActive,
+            target: kvmshare_core::media::MediaTarget::LastActiveSource,
             fallback_local: false,
         };
-        assert_eq!(MediaConfig::from_prefs(&prefs).to_prefs().unwrap(), prefs);
+        let written = MediaConfig::from_prefs(&prefs);
+        assert!(written.transport.is_none() && written.volume.is_none());
+        assert_eq!(written.to_prefs().unwrap(), prefs);
     }
 
     /// An impossible activity floor is rejected: the value is compared

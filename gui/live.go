@@ -61,6 +61,10 @@ type LiveSnapshot struct {
 	// client with control at home does NOT set this — recording works
 	// normally then.
 	ControlAway bool `json:"controlAway"`
+	// Audio is the live audio link state (see audio.go): whether a role is
+	// configured to send/receive and whether a direction is flowing right
+	// now. Empty/inactive when audio is off or no role is running.
+	Audio AudioState `json:"audio"`
 }
 
 // snapshot assembles the current picture. Locking is deliberately
@@ -83,6 +87,7 @@ func (a *App) snapshot() LiveSnapshot {
 		Peers:       a.DiscoverPeers(),
 		Clients:     a.ListClients(),
 		ControlAway: controlAway(a.stateDir, server || client),
+		Audio:       a.AudioStatus(server || client),
 	}
 	// The ids this machine trusts, matching the peer map by prefix: the
 	// server trusts what is in its config, the client what is in its

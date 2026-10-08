@@ -111,12 +111,23 @@ impl Peers {
     /// as a prefix in either direction — the same forgiveness the trust
     /// policy applies to machine ids (users paste what they copied).
     /// This is the media router's pinned-target lookup.
+    ///
+    /// The client's display `name` matches too, exactly. The media page
+    /// names machines by the name the user recognises ("hp"), and an
+    /// earlier build of that page pinned those names into the config as
+    /// `machine:hp`. Reading such a pin as a machine *id* would silently
+    /// resolve to `Local` — the keys would stop at this machine and the
+    /// setting would look broken. Accepting the name keeps both the old
+    /// pins and any hand-written ones working, and a name never collides
+    /// with an id prefix in practice.
     pub fn solve_machine_id(&self, machine_id: &str) -> Option<u8> {
+        let wanted = machine_id.trim();
+        let by_name = |c: &Arc<Client>| c.name.eq_ignore_ascii_case(wanted);
         self.by_id
             .values()
             .find(|c| {
                 let id = c.machine_id.as_str();
-                id == machine_id || id.starts_with(machine_id) || machine_id.starts_with(id)
+                id == wanted || id.starts_with(wanted) || wanted.starts_with(id) || by_name(c)
             })
             .map(|c| c.id)
     }
@@ -352,6 +363,28 @@ mod tests {
         assert_eq!(peers.solve_machine_id("98980a4d"), Some(5));
         assert_eq!(peers.solve_machine_id("98980a4d9afac273"), Some(5));
         assert_eq!(peers.solve_machine_id("nope"), None);
+    }
+
+    /// The display name resolves too, so a pin written by the media page
+    /// (which offers names, not ids) still lands on the machine the user
+    /// pointed at.
+    #[test]
+    fn a_display_name_resolves_like_a_machine_id() {
+        let (tx, _rx) = sync_channel(16);
+        let client = Arc::new(Client {
+            id: 7,
+            name: "hp".into(),
+            machine_id: "70b97d38631dda4b8f6ef627d753022d".into(),
+            since_ms: 0,
+            out: tx,
+            audio: Mutex::new(None),
+        });
+        let mut peers = Peers::default();
+        peers.register(7, client, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(peers.solve_machine_id("hp"), Some(7));
+        assert_eq!(peers.solve_machine_id("HP"), Some(7), "a name matches case-insensitively");
+        assert_eq!(peers.solve_machine_id("70b97d38"), Some(7), "an id still wins by prefix");
+        assert_eq!(peers.solve_machine_id("other"), None);
     }
 
     /// The watchdog clock is armed on activation, present or not in the

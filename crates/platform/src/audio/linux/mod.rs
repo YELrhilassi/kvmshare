@@ -31,6 +31,11 @@ use kvmshare_protocol::message::AudioFormat;
 
 use super::{is_monitor, monitor_of, parse_pactl_names};
 
+/// The exclusive-output routing that makes a sending machine silent locally
+/// while its sound goes to the peer.
+mod route;
+pub use route::{capture_source, recover as recover_route, takeover, Route};
+
 /// Latency requested from the audio server, in milliseconds. This is the
 /// *server-side* buffer, which dominates end-to-end delay far more than
 /// the network does: 40 ms is comfortably below noticing for music, and
@@ -41,6 +46,24 @@ const LATENCY_MS: u32 = 40;
 /// The PulseAudio/PipeWire tools this backend drives.
 const PAREC: &str = "parec";
 const PACAT: &str = "pacat";
+
+/// PulseAudio's own specifier for "whatever the default output is right
+/// now".
+///
+/// It is not `default`: that is a *name*, and on a stock setup no sink has
+/// it, so `pacat --device=default` fails with "No such entity" and the user
+/// hears nothing while every switch on the page says the link is up. The
+/// specifier is what makes "system default" mean what the label promises —
+/// including following the user when they switch outputs mid-session.
+const DEFAULT_SINK: &str = "@DEFAULT_SINK@";
+
+/// Is this the "system default" choice, in any of the spellings a config or
+/// a caller may use? One definition, so playback and capture cannot
+/// disagree about what "default" means.
+fn is_default_device(device: &str) -> bool {
+    let trimmed = device.trim();
+    trimmed.is_empty() || trimmed == "default"
+}
 const PACTL: &str = "pactl";
 
 /// Run a PulseAudio tool and return its stdout, or an error naming the
@@ -75,6 +98,121 @@ fn default_sink() -> Result<String, String> {
         .into_iter()
         .next()
         .ok_or_else(|| "no audio output devices found".to_string())
+}
+
+/// The sink, and its monitor source, that capture from `device` will read.
+///
+/// One function for the capture process and for the capture note, so the
+/// warning is always about the source the stream is really using. A
+/// configured device that is a plain sink name is still meant as its
+/// monitor — capture is always loopback, so the user does not have to know
+/// the `.monitor` convention.
+fn resolve_capture(device: &str) -> Result<(String, String), String> {
+    let sink = if is_default_device(device) {
+        default_sink()?
+    } else if let Some(sink) = device.strip_suffix(".monitor") {
+        // The user named a monitor directly; its sink is the name without
+        // the suffix, and that sink's own mute silences the monitor too.
+        sink.to_string()
+    } else {
+        device.to_string()
+    };
+    Ok((sink.clone(), monitor_of(&sink)))
+}
+
+/// Is `name` muted, according to the `pactl` getter named?
+///
+/// Any failure reads as *not* muted: this is a hint, and a hint invented by
+/// a failed query would send a user chasing a setting that is already fine.
+fn muted(getter: &str, name: &str) -> bool {
+    run(PACTL, &[getter, name])
+        .map(|out| out.to_ascii_lowercase().contains("yes"))
+        .unwrap_or(false)
+}
+
+/// The largest channel gain in a `pactl get-source-volume` reply, as a
+/// percentage. `100` when nothing parses, for the same reason.
+fn max_gain_percent(volume: &str) -> u32 {
+    volume
+        .split_whitespace()
+        .filter_map(|token| token.strip_suffix('%'))
+        .filter_map(|raw| raw.parse::<u32>().ok())
+        .max()
+        .unwrap_or(100)
+}
+
+/// The warning a monitor's recording gain warrants, if any.
+///
+/// Pure, so the wording and the threshold are pinned by a test instead of
+/// depending on the machine's current mixer settings. The percentage is the
+/// one the user will see in their own mixer, which is the point: it is
+/// what they have to change.
+fn gain_note(source: &str, percent: u32) -> Option<String> {
+    if percent >= 100 {
+        return None;
+    }
+    Some(format!(
+        "the loopback source {source} is at {percent}% volume, so everything captured here \
+         arrives quieter than it is played — set that monitor to 100% in your sound settings"
+    ))
+}
+
+/// A warning about this machine's capture path, or `None` when it can be
+/// captured exactly as configured.
+///
+/// Three settings can make loopback capture silent while every switch on the
+/// page says the link is up, and none of them is visible from the stream
+/// itself:
+///
+///   * the output is **muted** — the monitor tap is *after* the sink's
+///     volume, so a muted output feeds its monitor digital silence;
+///   * the monitor source is muted;
+///   * the monitor's **recording gain** was left low, attenuating every frame
+///     (a monitor at 21% is about −41 dB — quiet enough that the activity
+///     detector never sees the machine as "playing");
+///
+/// All three are a few seconds to fix once someone says where to look, which
+/// is the entire job of this function.
+pub fn capture_note(device: &str) -> Option<String> {
+    let Ok((sink, source)) = resolve_capture(device) else {
+        return None;
+    };
+    // A muted sink silences the monitor whatever else says, and it is the
+    // one users hit most; the other two queries are not worth running.
+    if muted("get-sink-mute", &sink) {
+        return capture_note_from(&sink, &source, true, false, 100);
+    }
+    let source_muted = muted("get-source-mute", &source);
+    let percent = if source_muted {
+        100
+    } else {
+        run(PACTL, &["get-source-volume", &source])
+            .map(|out| max_gain_percent(&out))
+            .unwrap_or(100)
+    };
+    capture_note_from(&sink, &source, false, source_muted, percent)
+}
+
+/// The note for one set of readings. Pure, so every combination is testable
+/// without touching the machine's mixer — and so the three cases stay three
+/// sentences, because "your output is muted" and "your monitor gain is low"
+/// are fixed in different places.
+fn capture_note_from(
+    sink: &str,
+    source: &str,
+    sink_muted: bool,
+    source_muted: bool,
+    percent: u32,
+) -> Option<String> {
+    if sink_muted {
+        return Some(format!(
+            "{sink} is muted, so nothing it plays can be captured — unmute it in your sound settings"
+        ));
+    }
+    if source_muted {
+        return Some(format!("the loopback source {source} is muted, so nothing can be captured"));
+    }
+    gain_note(source, percent)
 }
 
 /// Argument list for the capture process.
@@ -166,18 +304,7 @@ impl PulseCapture {
     /// sink's monitor" — the common case, and the one that follows the
     /// user's audio when they switch outputs.
     pub fn new(device: &str, format: AudioFormat) -> Result<Self, String> {
-        let device = if device.is_empty() || device == "default" {
-            monitor_of(&default_sink()?)
-        } else {
-            // A configured device that is a plain sink name is still
-            // meant as its monitor: capture is always loopback, so the
-            // user does not have to know the `.monitor` convention.
-            if is_monitor(device) {
-                device.to_string()
-            } else {
-                monitor_of(device)
-            }
-        };
+        let device = resolve_capture(device)?.1;
         let args = capture_args(&device, format);
         log_debug!("audio capture: {PAREC} {}", args.join(" "));
         let child = Command::new(PAREC)
@@ -241,6 +368,7 @@ impl Drop for PulseCapture {
 pub struct PulsePlayback {
     /// Configured output device; empty or `default` = the system default
     /// (always valid, and what follows the user when they switch outputs).
+    /// Any configured name has already been resolved by [`Self::new`].
     device: String,
     /// `None` until [`AudioPlayback::start`]. Playback is started by the
     /// audio runtime once a format is negotiated, so an instance exists
@@ -251,8 +379,8 @@ pub struct PulsePlayback {
 
 impl PulsePlayback {
     pub fn new(device: &str) -> Self {
-        let device = if device.trim().is_empty() {
-            "default".to_string()
+        let device = if is_default_device(device) {
+            DEFAULT_SINK.to_string()
         } else {
             device.to_string()
         };
@@ -363,5 +491,67 @@ mod tests {
     fn both_processes_are_identifiable_in_the_mixer() {
         assert!(capture_args("s.monitor", fmt()).contains(&"--client-name=kvmshare".to_string()));
         assert!(playback_args("default", fmt()).contains(&"--client-name=kvmshare".to_string()));
+    }
+
+    /// The default output must be spelled the way PulseAudio understands.
+    ///
+    /// The literal name `default` is not a sink on a stock setup, and
+    /// `pacat --device=default` answers "No such entity" — so a Linux
+    /// machine set to *play the other machine's sound* produced no sound at
+    /// all while the page reported a healthy stream. The specifier is the
+    /// fix, and this test is what keeps it from regressing.
+    #[test]
+    fn the_default_output_is_pulseaudios_own_specifier() {
+        for spelling in ["", "   ", "default"] {
+            assert_eq!(
+                PulsePlayback::new(spelling).device,
+                DEFAULT_SINK,
+                "{spelling:?} must resolve to the default sink"
+            );
+        }
+        assert!(playback_args(&PulsePlayback::new("").device, fmt())
+            .contains(&format!("--device={DEFAULT_SINK}")));
+    }
+
+    /// A monitor's recording gain is parsed from the reply the user's own
+    /// tools print, and a reply that cannot be parsed must never invent a
+    /// warning.
+    #[test]
+    fn a_source_gain_is_read_from_pactls_reply() {
+        let muted_at_21 = "Volume: front-left: 13767 /  21% / -40.66 dB,   \
+             front-right: 13767 /  21% / -40.66 dB\n        balance 0.00";
+        assert_eq!(max_gain_percent(muted_at_21), 21);
+        assert_eq!(max_gain_percent("Volume: front-left: 65536 / 100% / 0.00 dB"), 100);
+        // One channel turned down is still a turn-down; nothing parsable is
+        // "fine", not "broken".
+        assert_eq!(max_gain_percent("Volume: fl: 0 / 0% / -inf dB, fr: 65536 / 100% / 0.00 dB"), 100);
+        assert_eq!(max_gain_percent("unexpected reply"), 100);
+    }
+
+    /// The three ways loopback capture goes silent while the link looks
+    /// healthy, and the message each one earns.
+    #[test]
+    fn the_capture_warnings_name_what_to_change() {
+        assert!(gain_note("sink.monitor", 100).is_none(), "unity gain is not a warning");
+        let quiet = gain_note("sink.monitor", 21).expect("a low monitor gain is a warning");
+        assert!(quiet.contains("sink.monitor") && quiet.contains("21%"), "{quiet}");
+        // A muted sink and a muted monitor are different fixes and must not
+        // be described by the same sentence.
+        let source = capture_note_from("sink", "sink.monitor", true, false, 100).unwrap();
+        assert!(source.contains("sink is muted"), "{source}");
+        let monitor = capture_note_from("sink", "sink.monitor", false, true, 100).unwrap();
+        assert!(monitor.contains("sink.monitor is muted"), "{monitor}");
+        assert!(capture_note_from("sink", "sink.monitor", false, false, 100).is_none());
+    }
+
+    /// A configured device is passed through untouched: the picker's names
+    /// are real sinks, and rewriting them would break the user's choice.
+    #[test]
+    fn a_configured_output_is_used_as_named() {
+        let playback = PulsePlayback::new("alsa_output.pci-0000_00_1f.3.analog-stereo");
+        assert_eq!(playback.device, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+        assert!(!is_default_device("alsa_output.pci-0000_00_1f.3.analog-stereo"));
+        assert!(is_default_device(""));
+        assert!(is_default_device(" default "));
     }
 }

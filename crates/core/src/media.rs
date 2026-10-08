@@ -9,16 +9,15 @@
 //! [`MediaCommand`]) and then **routed by policy**, independently of
 //! where the cursor is.
 //!
-//! # Two categories, because they are two different questions
+//! # One target for every media key
 //!
-//! * **Transport** (`PlayPause`, `Next`, `Stop`, ...) acts on the *media
-//!   source* — the machine running the player.
-//! * **Volume** (`VolumeUp`, `Mute`, ...) acts on the *output you are
-//!   listening to* — which, when both machines are audible at once, may
-//!   be a different machine entirely.
-//!
-//! So [`MediaPrefs`] carries one target per category, and each resolves
-//! on its own.
+//! Playback (`PlayPause`, `Next`, `Stop`, ...) and volume (`VolumeUp`,
+//! `Mute`, ...) were once configured separately, because they can in
+//! principle act on different machines — the player on one, the output on
+//! another. In practice that split asked the user to answer the same
+//! question twice and get one of the two answers wrong, so [`MediaPrefs`]
+//! now carries a single target, and every [`MediaCommand`] resolves through
+//! it.
 //!
 //! # The rule that matters most
 //!
@@ -30,7 +29,7 @@
 
 use kvmshare_protocol::message::MediaCommand;
 
-/// Where a category's media keys should go.
+/// Where this machine's media keys should go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaTarget {
     /// This machine. The key is **not intercepted**: the local OS
@@ -100,16 +99,22 @@ impl MediaTarget {
 }
 
 /// The `[media]` section: how media keys are routed on this machine.
+///
+/// One target covers every media key — playback *and* volume. They used to
+/// be configured separately, on the theory that the media source and the
+/// output you are listening to can be different machines. In practice a
+/// user who wants one machine's media keys wants all of them, and two
+/// controls that must usually be set to the same value are just a way to
+/// get one of them wrong. Whatever the target is, it applies to play/pause,
+/// next, volume, mute — every [`MediaCommand`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPrefs {
     /// Master switch. With this off, capture does not classify at all and
     /// media keys behave exactly as they would without kvmshare
     /// installed — which is what makes the feature safe to ship enabled.
     pub route_media_keys: bool,
-    /// Target for playback/transport commands.
-    pub transport: MediaTarget,
-    /// Target for volume/mute commands.
-    pub volume: MediaTarget,
+    /// Where every media key goes.
+    pub target: MediaTarget,
     /// When a target cannot be resolved, send the command to the local
     /// machine instead of dropping it. Off means "swallow the key",
     /// which is rarely what anyone wants; it is configurable because
@@ -121,8 +126,7 @@ impl Default for MediaPrefs {
     fn default() -> Self {
         Self {
             route_media_keys: true,
-            transport: MediaTarget::default(),
-            volume: MediaTarget::default(),
+            target: MediaTarget::default(),
             fallback_local: true,
         }
     }
@@ -177,36 +181,36 @@ impl<'a> MediaContext<'a> {
 /// whether to consume a key at all ([`ResolvedTarget::Local`] means *let
 /// it through untouched*), and the server uses the `Remote` case to
 /// address the outbound message.
+///
+/// The command is taken for the caller's convenience (it is what travels)
+/// but does not affect the decision: one target covers every media key.
+/// See [`MediaPrefs`].
 pub fn resolve(
     prefs: &MediaPrefs,
-    command: MediaCommand,
+    _command: MediaCommand,
     ctx: &MediaContext<'_>,
 ) -> ResolvedTarget {
     // The master switch short-circuits everything: with routing off, no
-    // key is ever intercepted, whatever the per-category policy says.
-    // (An override while routing is off therefore does nothing — routing
-    // off means "kvmshare is not here", which is the switch's whole point.)
+    // key is ever intercepted, whatever the policy says. (An override
+    // while routing is off therefore does nothing — routing off means
+    // "kvmshare is not here", which is the switch's whole point.)
     if !prefs.route_media_keys {
         return ResolvedTarget::Local;
     }
 
-    // The user's explicit override outranks every category, including the
-    // volume/output split: they said where media lives *now*, and both
-    // categories follow until the shortcut is pressed again. An override
-    // naming a departed machine is cleared by the session, so it can only
-    // name a connected screen here — which makes the fallback unreachable
-    // in this branch by construction.
+    // The user's explicit override outranks the configured policy: they
+    // said where media lives *now*, and every command follows until the
+    // shortcut is pressed again. An override naming a departed machine is
+    // cleared by the session, so it can only name a connected screen here
+    // — which makes the fallback unreachable in this branch by
+    // construction.
     if let Some(id) = ctx.override_target {
         return ResolvedTarget::Remote(id);
     }
 
-    let target = if command.is_volume() {
-        &prefs.volume
-    } else {
-        &prefs.transport
-    };
-
-    let resolved = match target {
+    // One target for every command: playback and volume are routed the
+    // same way (see [`MediaPrefs`]).
+    let resolved = match &prefs.target {
         MediaTarget::Local => Some(ResolvedTarget::Local),
         MediaTarget::FollowFocus => ctx.focus.map(ResolvedTarget::Remote),
         MediaTarget::Machine(id) => (ctx.screen_of)(id).map(ResolvedTarget::Remote),
@@ -254,8 +258,7 @@ mod tests {
     fn routing_off_never_intercepts_anything() {
         let prefs = MediaPrefs {
             route_media_keys: false,
-            transport: MediaTarget::Machine("hp-machine-id".into()),
-            volume: MediaTarget::Machine("hp-machine-id".into()),
+            target: MediaTarget::Machine("hp-machine-id".into()),
             fallback_local: false,
         };
         let ctx = focused_on_hp(Some(1));
@@ -288,38 +291,19 @@ mod tests {
     }
 
     /// The headline case: working on one machine, controlling the other.
+    /// One pinned target covers playback *and* volume — the same pin.
     #[test]
-    fn transport_can_be_pinned_while_working_elsewhere() {
+    fn a_machine_can_be_pinned_while_working_elsewhere() {
         let prefs = MediaPrefs {
             route_media_keys: true,
-            transport: MediaTarget::Machine("hp-machine-id".into()),
-            volume: MediaTarget::Local,
+            target: MediaTarget::Machine("hp-machine-id".into()),
             fallback_local: true,
         };
-        // Cursor is home, but transport still reaches hp...
+        // Cursor is home, but the pin still reaches hp — for every command.
         let ctx = MediaContext { focus: None, last_active: None, override_target: None, screen_of: &screen_of };
-        assert_eq!(
-            resolve(&prefs, MediaCommand::Next, &ctx),
-            ResolvedTarget::Remote(1)
-        );
-        // ...while volume stays with the output on this machine.
-        assert_eq!(resolve(&prefs, MediaCommand::VolumeUp, &ctx), ResolvedTarget::Local);
-        assert_eq!(resolve(&prefs, MediaCommand::Mute, &ctx), ResolvedTarget::Local);
-    }
-
-    /// Volume and transport resolve independently, in the same instant.
-    #[test]
-    fn the_two_categories_are_independent() {
-        let prefs = MediaPrefs {
-            route_media_keys: true,
-            transport: MediaTarget::LastActiveSource,
-            volume: MediaTarget::FollowFocus,
-            fallback_local: true,
-        };
-        // Focused on screen 2, but sound came from screen 3.
-        let ctx = MediaContext { focus: Some(2), last_active: Some(3), override_target: None, screen_of: &|_| None };
-        assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Remote(3));
-        assert_eq!(resolve(&prefs, MediaCommand::VolumeDown, &ctx), ResolvedTarget::Remote(2));
+        assert_eq!(resolve(&prefs, MediaCommand::Next, &ctx), ResolvedTarget::Remote(1));
+        assert_eq!(resolve(&prefs, MediaCommand::VolumeUp, &ctx), ResolvedTarget::Remote(1));
+        assert_eq!(resolve(&prefs, MediaCommand::Mute, &ctx), ResolvedTarget::Remote(1));
     }
 
     /// The nice default for real use: follow the cursor, but keep
@@ -328,8 +312,7 @@ mod tests {
     fn focus_or_last_active_prefers_focus_then_falls_back() {
         let prefs = MediaPrefs {
             route_media_keys: true,
-            transport: MediaTarget::FocusOrLastActive,
-            volume: MediaTarget::FocusOrLastActive,
+            target: MediaTarget::FocusOrLastActive,
             fallback_local: true,
         };
         let ctx = MediaContext { focus: Some(2), last_active: Some(3), override_target: None, screen_of: &|_| None };
@@ -347,8 +330,7 @@ mod tests {
     fn last_active_source_falls_back_to_local_when_silent() {
         let prefs = MediaPrefs {
             route_media_keys: true,
-            transport: MediaTarget::LastActiveSource,
-            volume: MediaTarget::LastActiveSource,
+            target: MediaTarget::LastActiveSource,
             fallback_local: true,
         };
         let ctx = MediaContext { focus: Some(1), last_active: None, override_target: None, screen_of: &|_| None };
@@ -361,8 +343,7 @@ mod tests {
     fn pinned_machine_disconnected_falls_back_to_local() {
         let prefs = MediaPrefs {
             route_media_keys: true,
-            transport: MediaTarget::Machine("some-other-laptop".into()),
-            volume: MediaTarget::default(),
+            target: MediaTarget::Machine("some-other-laptop".into()),
             fallback_local: true,
         };
         let ctx = MediaContext { focus: Some(1), last_active: Some(1), override_target: None, screen_of: &|_| None };
@@ -374,15 +355,19 @@ mod tests {
     fn fallback_off_drops_rather_than_redirecting() {
         let prefs = MediaPrefs {
             route_media_keys: true,
-            transport: MediaTarget::Machine("disconnected".into()),
-            volume: MediaTarget::default(),
+            target: MediaTarget::Machine("disconnected".into()),
             fallback_local: false,
         };
         let ctx = MediaContext { focus: Some(1), last_active: None, override_target: None, screen_of: &|_| None };
         assert_eq!(resolve(&prefs, MediaCommand::PlayPause, &ctx), ResolvedTarget::Drop);
         // An explicit `local` target is still local — the fallback only
         // governs *unresolved* targets.
-        assert_eq!(resolve(&prefs, MediaCommand::VolumeUp, &ctx), ResolvedTarget::Remote(1));
+        let local = MediaPrefs {
+            route_media_keys: true,
+            target: MediaTarget::Local,
+            fallback_local: false,
+        };
+        assert_eq!(resolve(&local, MediaCommand::VolumeUp, &ctx), ResolvedTarget::Local);
     }
 
     /// Alone on the network: every command is local, whatever the policy.
@@ -399,8 +384,7 @@ mod tests {
         for p in policies {
             let prefs = MediaPrefs {
                 route_media_keys: true,
-                transport: p.clone(),
-                volume: p.clone(),
+                target: p.clone(),
                 fallback_local: true,
             };
             for cmd in MediaCommand::ALL {
@@ -413,9 +397,9 @@ mod tests {
         }
     }
 
-    /// The user's explicit override outranks every configured policy —
-    /// transport, volume, whatever they said — because it is the answer to
-    /// "the router picked wrong".
+    /// The user's explicit override outranks the configured policy —
+    /// whatever it says — because it is the answer to "the router picked
+    /// wrong".
     #[test]
     fn the_override_outranks_every_policy() {
         let policies = [
@@ -428,8 +412,7 @@ mod tests {
         for p in policies {
             let prefs = MediaPrefs {
                 route_media_keys: true,
-                transport: p.clone(),
-                volume: p,
+                target: p.clone(),
                 fallback_local: true,
             };
             // Cursor on 2, sound from 3, policy saying whatever it says:

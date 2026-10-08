@@ -176,7 +176,7 @@ func (a *App) loadConfigCached() (Config, error) {
 	return cfg, nil
 }
 
-func (a *App) LoadConfig() (Config, error) {
+func (a *layoutService) LoadConfig() (Config, error) {
 	raw, err := os.ReadFile(a.configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -256,7 +256,7 @@ func nonNilStrings(s []string) []string {
 // SaveConfig writes the layout and validates it. The first screen is
 // always the server's own screen. If the server is running it notices the
 // change on disk and adopts it live — no restart needed.
-func (a *App) SaveConfig(cfg Config) error {
+func (a *layoutService) SaveConfig(cfg Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 

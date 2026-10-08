@@ -30,7 +30,7 @@ import (
 //
 // Deliberately does NOT hold a.mu while saving: SaveConfig takes the lock
 // itself, and holding it here would deadlock.
-func (a *App) TrustClient(id string, trusted bool) error {
+func (a *trustService) TrustClient(id string, trusted bool) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
 		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
@@ -49,7 +49,7 @@ func (a *App) TrustClient(id string, trusted bool) error {
 // immediately if it is connected right now. Idempotent; `false`
 // un-revokes. Accepts the short or full id. Like TrustClient it avoids
 // holding a.mu across SaveConfig (which locks it itself).
-func (a *App) RevokeClient(id string, revoked bool) error {
+func (a *trustService) RevokeClient(id string, revoked bool) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
 		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
@@ -90,7 +90,7 @@ func setID(list []string, id string, on bool) []string {
 // client is currently connected to that server, the session is stopped:
 // revocation takes effect now, not at the next restart. Idempotent;
 // `false` un-revokes. Accepts short or full ids.
-func (a *App) RevokeServer(id string, revoked bool) error {
+func (a *trustService) RevokeServer(id string, revoked bool) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
 		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")
@@ -118,7 +118,7 @@ func (a *App) RevokeServer(id string, revoked bool) error {
 // revocation, like TrustClient: trusting does not clear a revoke, so the
 // two can coexist and revoke still wins. Idempotent; `false` removes the
 // entry. Accepts short or full ids.
-func (a *App) TrustServer(id string, trusted bool) error {
+func (a *trustService) TrustServer(id string, trusted bool) error {
 	id = strings.TrimSpace(id)
 	if len(id) < 4 {
 		return fmt.Errorf("machine id looks too short to be real (use the short id shown in the GUI)")

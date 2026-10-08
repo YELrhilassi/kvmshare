@@ -4,20 +4,32 @@
 //! # Which client does the server share audio with?
 //!
 //! A server may have several clients, but an audio link is inherently
-//! pairwise, so the choice must be **explicit rather than guessed**. Two
-//! rules, in order:
+//! pairwise, so the choice must be **explicit rather than guessed**. In
+//! order:
 //!
 //! 1. If `[audio] peer` names a machine id, that machine is the peer — and
 //!    no other ever is.
-//! 2. Otherwise, audio runs only while exactly one client is connected.
-//!    The moment a second machine joins, the link is dropped and the GUI
-//!    says why.
+//! 2. Otherwise, with exactly one client connected there is nothing to
+//!    choose, so that client is the peer.
+//! 3. Otherwise (several connected, none pinned) the two directions are
+//!    answered differently, because they are not the same kind of question:
 //!
-//! Rule 2 is the part worth being careful about: "send this machine's
-//! output to the peer" has no defensible answer when there are two peers,
-//! and silently picking one (first connected, lowest id, ...) would stream
-//! a user's audio to a machine they never chose. Refusing is the honest
-//! behaviour, and setting `peer` is the fix.
+//!    * **sending** — "send this machine's output to a machine the user
+//!      chose" has no defensible answer when there are three machines, and
+//!      silently picking one (first connected, lowest id, ...) would stream
+//!      a user's audio somewhere they never chose. The link stops, and the
+//!      Media page offers the connected machines to pick from, which writes
+//!      `peer` and settles it.
+//!    * **receiving** — which machine the user wants to *listen to* is not
+//!      guessed either, but neither is it unknowable: each client says
+//!      whether it has something playing (the same `AudioState` answer the
+//!      media router follows). A machine whose sound is playing is a fact
+//!      observed from the wire, not an inference, so the link follows it —
+//!      see [`on_peer_activity`]. Pinning still outranks it, and a machine
+//!      that stops playing hands the link back.
+//!
+//! Rule 3's sending half is the part worth being careful about: refusing is
+//! the honest behaviour, and setting `peer` is the fix.
 
 use std::sync::Arc;
 
@@ -25,7 +37,7 @@ use kvmshare_log::log_info;
 use kvmshare_protocol::message::Message;
 
 use crate::audio::runtime::{
-    AudioBackend, AudioEvents, AudioOptions, AudioRuntime,
+    AudioBackend, AudioEvents, AudioOptions, AudioRuntime, AudioStatusSink,
 };
 use crate::server::client::{route, Client, ClientCtx, Outbound};
 
@@ -36,6 +48,9 @@ pub struct ServerAudio {
     /// The machine intended as the audio peer. `None` means "the only
     /// connected client" (see the module docs).
     pub peer_machine_id: Option<String>,
+    /// Where status transitions go (the app layer persists them for the
+    /// GUI). `None` means the GUI cannot see live audio state.
+    pub status: Option<Arc<dyn AudioStatusSink>>,
 }
 
 /// Hand-written: the backend is a trait object (see the same reasoning on
@@ -147,13 +162,93 @@ pub fn reconcile(
 
     if configured.is_none() {
         // No peer was named and the machine is no longer alone, so the link
-        // has become ambiguous. Stop it rather than streaming to a machine
-        // the user never chose.
-        for other in others {
-            detach(other, "a second machine connected; set [audio] peer to choose one");
+        // has become ambiguous. What that costs depends on the direction
+        // (see the module docs): the server's own sound must never be sent
+        // to a machine the user did not choose, while *incoming* sound is
+        // re-decided per machine by [`on_peer_activity`] and is left alone
+        // here.
+        if let Some(reason) = ambiguity_reason(setup.options.send) {
+            for other in others {
+                detach(other, reason);
+            }
         }
     }
     false
+}
+
+/// Why an unpinned link stops when the client set grows — or `None` when
+/// growing is not what breaks it.
+///
+/// Pure, so the rule that "sending is refused when it is ambiguous, and
+/// receiving is not" is pinned by a test rather than by prose: a server
+/// whose own sound was quietly streamed to a machine the user never chose
+/// is the failure this exists to prevent.
+pub fn ambiguity_reason(send: bool) -> Option<&'static str> {
+    if send {
+        Some("a second machine connected; choose which one shares audio")
+    } else {
+        None
+    }
+}
+
+/// Re-decide the link when a client answers "do you have audio playing?".
+///
+/// Only the *receiving* direction is decided this way, and only while no
+/// machine is pinned: the answer comes from the wire, so it is evidence
+/// rather than a guess (see the module docs). The rules are deliberately
+/// sticky, because a link that follows activity naively flaps between
+/// machines whenever two of them are playing:
+///
+/// * a machine that starts playing takes the link **only when no other
+///   machine holds it** — an established link is not interrupted;
+/// * a machine that stops playing releases it **only if it holds it**, and
+///   nothing takes its place until some machine says it is playing.
+///
+/// Both halves are driven by the same event, so there is one place to look
+/// when the link is on a machine the user did not expect.
+pub fn on_peer_activity(ctx: &ClientCtx, client: &Client, playing: bool) {
+    let Some(setup) = ctx.audio.as_ref() else {
+        return;
+    };
+    if !setup.options.is_active() {
+        return;
+    }
+    // A pinned machine is the user's decision: activity never overrules it.
+    if setup.configured_peer().is_some() {
+        return;
+    }
+    // Choosing where to *send* this machine's sound is never inferred.
+    if !setup.options.receive {
+        return;
+    }
+
+    if !playing {
+        if client.audio.lock().unwrap().is_some() {
+            detach(client, "the machine that was playing went quiet");
+        }
+        return;
+    }
+    if client.audio.lock().unwrap().is_some() {
+        return;
+    }
+    // Somebody else already holds the link, and it is not this machine's
+    // turn to take it away: only a release hands it on.
+    let held_by_another = ctx
+        .peers
+        .lock()
+        .unwrap()
+        .all()
+        .iter()
+        .any(|c| c.id != client.id && c.audio.lock().unwrap().is_some());
+    if held_by_another {
+        return;
+    }
+    // The address the handshake came from, which is the only one trusted —
+    // the same rule the connect path applies.
+    let Some(ip) = ctx.peers.lock().unwrap().tcp_ip_of(client.id) else {
+        return;
+    };
+    attach(ctx, client, ip);
 }
 
 /// Attach an audio runtime to `client` when the rules say it is the peer.
@@ -188,6 +283,12 @@ fn attach(ctx: &ClientCtx, client: &Client, peer_ip: std::net::IpAddr) -> bool {
     // Trust only the address the handshake came from — the same rule the
     // cursor stream follows.
     runtime.allow_peer(peer_ip);
+    if let Some(sink) = &setup.status {
+        runtime.set_status_sink(Arc::clone(sink));
+    }
+    // Name the peer so the GUI (and the log) says *who* the sound is going
+    // to or coming from, not merely that a link exists.
+    runtime.set_peer_label(&client.name);
     runtime.announce();
     log_info!(
         "audio: linked with client {} (send {}, receive {})",
@@ -263,6 +364,7 @@ mod tests {
             backend: Arc::new(NoBackend),
             options: AudioOptions::default(),
             peer_machine_id: Some(peer.to_string()),
+            status: None,
         }
     }
 
@@ -322,5 +424,22 @@ mod tests {
         assert!(setup("").should_host("anything", 0));
         assert!(setup("   ").should_host("anything", 0));
         assert!(!setup("   ").should_host("anything", 1));
+    }
+
+    /// With several machines connected and nothing pinned, only the sending
+    /// direction is refused. Receiving is re-decided from each machine's own
+    /// "I am playing something" answer (see [`super::on_peer_activity`]), so
+    /// it must not be torn down the moment a third machine appears.
+    #[test]
+    fn several_machines_only_stop_an_unpinned_link_that_sends() {
+        assert!(
+            ambiguity_reason(true).is_some(),
+            "this machine's sound must never be sent to a machine nobody chose"
+        );
+        assert_eq!(
+            ambiguity_reason(false),
+            None,
+            "receiving follows the machine that is actually playing"
+        );
     }
 }

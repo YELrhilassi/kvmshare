@@ -6,6 +6,7 @@ package main
 // no other defence against writing a file the Rust side refuses to load.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,36 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 )
+
+// A config written before playback and volume were collapsed into one
+// target keeps its routing: the legacy keys are read (transport first) and
+// a save rewrites them as the single target, dropping the old keys.
+func TestLegacyPerCategoryTargetsMigrateToTheSingleTarget(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "kvmshare-server.toml")
+	legacy := "[media]\nroute_media_keys = true\ntransport = \"machine:98980a4d\"\nvolume = \"local\"\n"
+	if err := os.WriteFile(cfg, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := testApp(&App{configPath: cfg, stateDir: dir})
+	ma, err := a.LoadMediaAudio()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ma.Media.Target != "machine:98980a4d" {
+		t.Fatalf("legacy transport not honoured: %+v", ma.Media)
+	}
+	if err := a.SaveMediaAudio(ma.Media, ma.Audio); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(cfg)
+	if strings.Contains(string(raw), "transport") || strings.Contains(string(raw), "volume") {
+		t.Fatalf("a save must collapse the legacy keys onto target: %s", raw)
+	}
+	if !strings.Contains(string(raw), "target = 'machine:98980a4d'") {
+		t.Fatalf("the single target was not written: %s", raw)
+	}
+}
 
 func TestValidMediaTarget(t *testing.T) {
 	valid := []string{
@@ -34,6 +65,36 @@ func TestValidMediaTarget(t *testing.T) {
 	}
 }
 
+// The Wails bridge marshals a bound method's multiple *non-error* return
+// values as a JSON **array** (see BoundMethod.Call), not an object. So
+// LoadMediaAudio must return exactly one value whose JSON is an object
+// with `media`/`audio`. When it returned `(MediaSection, AudioSection,
+// error)` the frontend received `[media, audio]`, every `m.media` /
+// `m.audio` read was `undefined`, and the Media & audio page crashed on
+// the first `.send`.
+func TestLoadMediaAudioMarshalsAsAnObject(t *testing.T) {
+	a := NewApp()
+	a.configPath = filepath.Join(t.TempDir(), "kvmshare-server.toml")
+
+	ma, err := a.LoadMediaAudio()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(ma)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(b, &obj); err != nil {
+		t.Fatalf("LoadMediaAudio must marshal as a JSON object, got %s (%v)", b, err)
+	}
+	for _, key := range []string{"media", "audio"} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("LoadMediaAudio JSON is missing %q: %s", key, b)
+		}
+	}
+}
+
 // A media section the GUI refuses must match what the Rust parser
 // refuses — checked against the same examples its own tests use.
 func TestValidateMediaMatchesTheRustRules(t *testing.T) {
@@ -42,7 +103,7 @@ func TestValidateMediaMatchesTheRustRules(t *testing.T) {
 		t.Fatalf("default media section rejected: %v", err)
 	}
 	bad := defaultMedia()
-	bad.Transport = "typo"
+	bad.Target = "typo"
 	if err := validateMedia(bad); err == nil {
 		t.Fatal("a typo'd target must be rejected, not saved")
 	}
@@ -93,7 +154,7 @@ swap_scroll = false
 		t.Fatal(err)
 	}
 
-	a := &App{configPath: cfg, stateDir: dir}
+	a := testApp(&App{configPath: cfg, stateDir: dir})
 	if err := a.SaveMediaAudio(defaultMedia(), defaultAudio()); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -123,7 +184,7 @@ swap_scroll = false
 // media settings are editable before the server ever ran.
 func TestSaveMediaAudioCreatesMissingConfig(t *testing.T) {
 	dir := t.TempDir()
-	a := &App{configPath: filepath.Join(dir, "missing.toml"), stateDir: dir}
+	a := testApp(&App{configPath: filepath.Join(dir, "missing.toml"), stateDir: dir})
 	if err := a.SaveMediaAudio(defaultMedia(), defaultAudio()); err != nil {
 		t.Fatalf("save to a missing config: %v", err)
 	}
@@ -141,9 +202,9 @@ func TestSaveMediaAudioRejectsInvalidWithoutWriting(t *testing.T) {
 	if err := os.WriteFile(cfg, before, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a := &App{configPath: cfg, stateDir: dir}
+	a := testApp(&App{configPath: cfg, stateDir: dir})
 	bad := defaultMedia()
-	bad.Transport = "nope"
+	bad.Target = "nope"
 	if err := a.SaveMediaAudio(bad, defaultAudio()); err == nil {
 		t.Fatal("invalid media section accepted")
 	}
@@ -160,7 +221,7 @@ func TestClientAudioRoundTripDropsPeer(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("KVMSHARE_CLIENT_CONFIG", filepath.Join(dir, "kvmshare-client.toml"))
 
-	a := &App{stateDir: dir}
+	a := testApp(&App{stateDir: dir})
 	got, err := a.LoadClientAudio()
 	if err != nil {
 		t.Fatalf("load with no file: %v", err)
@@ -196,7 +257,7 @@ func TestSaveClientAudioPreservesOtherContent(t *testing.T) {
 	if err := os.WriteFile(path, []byte("port = 24800\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a := &App{stateDir: dir}
+	a := testApp(&App{stateDir: dir})
 	if err := a.SaveClientAudio(defaultAudio()); err != nil {
 		t.Fatalf("save: %v", err)
 	}

@@ -145,7 +145,7 @@ func (a *App) saveSettingsLocked() {
 }
 
 // GetSettings returns the persisted GUI state.
-func (a *App) GetSettings() Settings {
+func (a *settingsService) GetSettings() Settings {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.settings
@@ -155,7 +155,7 @@ func (a *App) GetSettings() Settings {
 // Used by discovery pairing: a trusted server asked this machine to
 // connect. Idempotent when a client is already running — an active
 // session is never disturbed, and its saved address is left alone.
-func (a *App) ConnectToServer(addr string) error {
+func (a *trustService) ConnectToServer(addr string) error {
 	// Refuse a revoked target up front. This covers the paths the
 	// auto-connect filter never sees — a typed address, a server asking
 	// this machine to connect — so a revoked server cannot even briefly
@@ -177,7 +177,7 @@ func (a *App) ConnectToServer(addr string) error {
 
 // SetSettings stores the GUI state. The client address may stay empty
 // until the client is actually started (start validates it).
-func (a *App) SetSettings(s Settings) error {
+func (a *settingsService) SetSettings(s Settings) error {
 	a.mu.Lock()
 	if s.Mode != ModeServer && s.Mode != ModeClient {
 		a.mu.Unlock()
@@ -279,7 +279,7 @@ func (a *App) StartHiddenToTray(autostart bool) bool {
 
 // GetLogSettings returns the operator's logging configuration plus the
 // role it applies to (the active role — one instance per machine).
-func (a *App) GetLogSettings() LogSettings {
+func (a *logsService) GetLogSettings() LogSettings {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return LogSettings{
@@ -294,7 +294,7 @@ func (a *App) GetLogSettings() LogSettings {
 // the change up within a poll interval — no restart. The inactive role's
 // control file is written too, so the setting holds whichever role
 // starts next (a machine is one role at a time).
-func (a *App) SetLogSettings(s LogSettings) error {
+func (a *logsService) SetLogSettings(s LogSettings) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if !validLogLevel(s.Level) {
@@ -339,7 +339,7 @@ func boolInt(b bool) int {
 // ClearLog empties the given role's log file ("server" or "client"). The
 // role process keeps appending from the new offset — appends are atomic,
 // so a running process cannot resurrect cleared lines.
-func (a *App) ClearLog(role string) error {
+func (a *logsService) ClearLog(role string) error {
 	a.mu.Lock()
 	var path string
 	switch role {

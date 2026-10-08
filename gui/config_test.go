@@ -255,8 +255,7 @@ func TestSaveConfigPreservesMediaAndAudioSections(t *testing.T) {
 	// The media page set a non-default policy so the loss would be visible.
 	if err := a.SaveMediaAudio(MediaSection{
 		RouteMediaKeys: true,
-		Transport:      "machine:98980a4d",
-		Volume:         "local",
+		Target:         "machine:98980a4d",
 		FallbackLocal:  true,
 	}, defaultAudio()); err != nil {
 		t.Fatal(err)
@@ -274,11 +273,12 @@ func TestSaveConfigPreservesMediaAndAudioSections(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m, au, err := a.LoadMediaAudio()
+	ma, err := a.LoadMediaAudio()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Transport != "machine:98980a4d" || m.Volume != "local" {
+	m, au := ma.Media, ma.Audio
+	if m.Target != "machine:98980a4d" {
 		t.Fatalf("a layout save wiped the media policy: %+v", m)
 	}
 	if !m.RouteMediaKeys || !m.FallbackLocal {
@@ -299,12 +299,12 @@ func TestSaveConfigPreservesMediaAndAudioSections(t *testing.T) {
 	if err := a.SaveConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
-	m, _, err = a.LoadMediaAudio()
+	ma, err = a.LoadMediaAudio()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Transport != "machine:98980a4d" {
-		t.Fatalf("full load/save cycle lost the media policy: %+v", m)
+	if ma.Media.Target != "machine:98980a4d" {
+		t.Fatalf("full load/save cycle lost the media policy: %+v", ma.Media)
 	}
 }
 

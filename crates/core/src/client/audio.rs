@@ -19,7 +19,9 @@ use std::sync::Arc;
 use kvmshare_log::log_warn;
 use kvmshare_protocol::message::Message;
 
-use crate::audio::runtime::{AudioBackend, AudioEvents, AudioOptions, AudioRuntime};
+use crate::audio::runtime::{
+    AudioBackend, AudioEvents, AudioOptions, AudioRuntime, AudioStatusSink,
+};
 
 /// Carries the runtime's control messages to the client's TCP loop.
 ///
@@ -58,10 +60,14 @@ impl ClientAudio {
         backend: Arc<dyn AudioBackend>,
         server_ip: std::net::IpAddr,
         outbox: Sender<Message>,
+        status: Option<Arc<dyn AudioStatusSink>>,
     ) -> Result<Self, String> {
         let events = Arc::new(ClientAudioEvents { outbox });
-        let runtime = AudioRuntime::start(options, backend, events)?;
+        let mut runtime = AudioRuntime::start(options, backend, events)?;
         runtime.allow_peer(server_ip);
+        if let Some(sink) = status {
+            runtime.set_status_sink(sink);
+        }
         Ok(Self { runtime })
     }
 
@@ -101,7 +107,7 @@ impl ClientAudio {
     }
 
     /// Report why audio is not running, when it should be.
-    pub fn last_error(&self) -> Option<&str> {
+    pub fn last_error(&self) -> Option<String> {
         self.runtime.last_error()
     }
 

@@ -53,6 +53,10 @@ GO_ENV    := CGO_CFLAGS="$(GO_CFLAGS)"
 
 SERVER_BIN := target/release/kvmshare-server
 CLIENT_BIN := target/release/kvmshare-client
+# The virtual-wheel sidecar. The Linux client spawns it as a sibling of
+# its own executable (`wheel_server.rs`), so it must be installed next to
+# the client or injected scrolling silently falls back to XTest.
+WHEEL_BIN  := target/release/kvmshare-wheel-daemon
 GUI_BIN    := gui/kvmshare-gui
 
 # Windows cross-compile target for the Rust binaries. Linking the Rust
@@ -76,9 +80,15 @@ install: build
 	install -m755 $(SERVER_BIN) $(BINDIR)/kvmshare-server
 	install -m755 $(CLIENT_BIN) $(BINDIR)/kvmshare-client
 	install -m755 $(GUI_BIN) $(BINDIR)/kvmshare-gui
+	@# Linux-only sidecar; present in the release build, so only install
+	@# it when it was actually built (a platform without it still works).
+	@if [ -f $(WHEEL_BIN) ]; then install -m755 $(WHEEL_BIN) $(BINDIR)/kvmshare-wheel-daemon; fi
 	@# Manifest: sha256 of the installed set, checked by the GUI before
 	@# every spawn (a mixed-version install must never run silently).
-	@cd $(BINDIR) && sha256sum kvmshare-server kvmshare-client kvmshare-gui > binaries.sha256
+	@# The wheel daemon is optional in the GUI's check, so it is listed
+	@# only when present — the manifest must never vouch for a file that
+	@# is not there.
+	@cd $(BINDIR) && { for f in kvmshare-server kvmshare-client kvmshare-gui kvmshare-wheel-daemon; do [ -f "$$f" ] && sha256sum "$$f"; done; } > binaries.sha256
 	@# Launcher icon: hicolor theme lookup (Icon=kvmshare in the
 	@# .desktop entry) — the launcher shows the real icon, not a blank
 	@# default.
@@ -99,6 +109,7 @@ install: build
 	@echo "  $(BINDIR)/kvmshare-server"
 	@echo "  $(BINDIR)/kvmshare-client"
 	@echo "  $(BINDIR)/kvmshare-gui"
+	@[ -f $(BINDIR)/kvmshare-wheel-daemon ] && echo "  $(BINDIR)/kvmshare-wheel-daemon" || true
 
 ## Grant input-device access when it is missing — no action needed when it
 ## already works. Runs the installer's own root step (one privilege prompt
@@ -134,10 +145,14 @@ input-access:
 dev:
 	./scripts/dev.sh
 
-## Run the Rust and Go test suites.
+## Run the Rust, Go and frontend test suites.
 test:
 	$(CARGO) test --workspace
 	cd gui && $(GO_ENV) $(GO) test ./...
+	@# Frontend unit/component tests (vitest + jsdom). The deps are the
+	@# same ones `build` installs; installing here keeps a bare `make test`
+	@# working on a fresh checkout.
+	cd gui/frontend && npm install --no-audit --no-fund >/dev/null && npm test
 
 ## Build the portable release archives (Linux tarball + Windows zip, the
 ## standalone installers, and SHA256SUMS) into dist/.
@@ -227,11 +242,16 @@ winres:
 	@echo "  regenerated all .syso files at $(VERSION)"
 
 ## Remove build artifacts.
+##
+## The `rsrc_windows_amd64.syso` files are deliberately NOT removed: they
+## are committed sources (see `winres`), and a normal Windows build embeds
+## them. Deleting them here made `make clean` dirty the working tree and
+## silently ship resource-less Windows binaries (no icon, no version in
+## Explorer's Properties) until someone re-ran `make winres`.
 clean:
 	$(CARGO) clean
 	rm -f $(GUI_BIN) gui/kvmshare-gui.exe gui/kvmshare-install gui/kvmshare-install.exe
 	rm -rf dist
-	find gui -name 'rsrc_windows_amd64.syso' -delete
 
 ## Remove installed files (keeps $(CONFIG_DIR)).
 uninstall:

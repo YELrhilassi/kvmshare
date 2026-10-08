@@ -14,12 +14,12 @@ import "errors"
 // no capture session to arm (the page records through DOM events).
 var errNoHookCapture = errors.New("key capture hook unavailable on this platform")
 
-func (a *App) StartKeyCapture(token string) (string, error) {
+func (a *inputService) StartKeyCapture(token string) (string, error) {
 	return "", errNoHookCapture
 }
 
-func (a *App) StopKeyCapture(token string) error  { return nil }
-func (a *App) RenewKeyCapture(token string) error { return nil }
+func (a *inputService) StopKeyCapture(token string) error  { return nil }
+func (a *inputService) RenewKeyCapture(token string) error { return nil }
 
 // exitHookThread is a no-op without the Windows hook thread.
 func exitHookThread() {}

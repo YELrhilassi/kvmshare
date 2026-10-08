@@ -88,6 +88,16 @@ impl ActivityDetector {
     /// Feed one window of captured audio; returns the current answer.
     pub fn feed(&mut self, samples: &[u8]) -> bool {
         let level = Self::rms_dbfs(samples);
+        self.feed_level(level)
+    }
+
+    /// Feed one window whose level has already been measured.
+    ///
+    /// Split out from [`feed`](Self::feed) for the callers that need the
+    /// level as well as the answer — the capture loop publishes a live
+    /// meter (see [`crate::audio::runtime`]) and must not measure the same
+    /// window twice.
+    pub fn feed_level(&mut self, level: f32) -> bool {
         if level >= self.start_db {
             self.loud_run += 1;
             self.quiet_run = 0;
@@ -106,6 +116,14 @@ impl ActivityDetector {
             self.quiet_run = 0;
         }
         self.playing
+    }
+
+    /// The highest level this detector treats as silence, in dBFS.
+    ///
+    /// The meter below the floor is display noise: the GUI shows "silent"
+    /// rather than a number when the reading is at or under this.
+    pub fn floor_db(&self) -> f32 {
+        self.start_db
     }
 
     /// The current answer without feeding new audio.
@@ -193,6 +211,26 @@ mod tests {
     #[test]
     fn a_fresh_detector_is_not_playing() {
         assert!(!ActivityDetector::new(-50.0).is_playing());
+    }
+
+    /// Measuring a window once and feeding the level gives the same answer
+    /// as feeding the window, so the metering path cannot disagree with the
+    /// activity the media router is told about.
+    #[test]
+    fn feeding_a_measured_level_matches_feeding_the_window() {
+        let mut by_window = ActivityDetector::new(-50.0);
+        let mut by_level = ActivityDetector::new(-50.0);
+        for _ in 0..20 {
+            by_window.feed(&loud_packet(480));
+            by_level.feed_level(ActivityDetector::rms_dbfs(&loud_packet(480)));
+        }
+        assert!(by_window.is_playing() && by_level.is_playing());
+        assert_eq!(by_window.floor_db(), -50.0);
+        for _ in 0..20 {
+            by_window.feed(&silent_packet(480));
+            by_level.feed_level(ActivityDetector::rms_dbfs(&silent_packet(480)));
+        }
+        assert!(!by_window.is_playing() && !by_level.is_playing());
     }
 
     /// A quieter floor makes a quieter signal count as playing, which is

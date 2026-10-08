@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { AppProvider, useApp } from "@/app/AppProvider";
-import { NAV, pagesFor, type Page } from "@/app/nav";
+import { NAV, navLabel, pagesFor, type Page } from "@/app/nav";
 import HomePage from "@/features/home/HomePage";
 import ServerPage from "@/features/server/ServerPage";
 import ClientPage from "@/features/client/ClientPage";
@@ -50,7 +50,7 @@ function Shell() {
           </div>
 
           <nav className="flex h-full items-center gap-1">
-            {NAV.filter(({ id }) => visible.includes(id)).map(({ id, label }) => (
+            {NAV.filter(({ id }) => visible.includes(id)).map(({ id }) => (
               <button
                 key={id}
                 onClick={() => setPage(id)}
@@ -61,7 +61,7 @@ function Shell() {
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                {label}
+                {navLabel(id, mode)}
                 {effectivePage === id && (
                   <span className="absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-primary" />
                 )}

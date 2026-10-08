@@ -68,7 +68,7 @@ func (c *connectingClock) mark(connecting bool) time.Time {
 
 // ClientStatus reads the client's live state file. Missing or unreadable
 // means "not connected" (no client has written anything yet).
-func (a *App) ClientStatus() ClientState {
+func (a *rolesService) ClientStatus() ClientState {
 	path := filepath.Join(a.stateDir, "client.state")
 	raw, err := os.ReadFile(path)
 	if err != nil {

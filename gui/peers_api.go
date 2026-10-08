@@ -16,7 +16,7 @@ import (
 
 // DiscoverPeers exposes the live peer list to the frontend. Always
 // returns a non-nil slice so the frontend can safely iterate it.
-func (a *App) DiscoverPeers() []discovery.Peer {
+func (a *discoveryService) DiscoverPeers() []discovery.Peer {
 	if a.disc == nil {
 		return []discovery.Peer{}
 	}
@@ -30,7 +30,7 @@ func (a *App) DiscoverPeers() []discovery.Peer {
 // the UI shows it instead of a silent no-op (the old refresh skipped
 // its probe silently when the listener socket was down, which is
 // exactly when a user presses it).
-func (a *App) RefreshDiscovery() ([]discovery.Peer, error) {
+func (a *discoveryService) RefreshDiscovery() ([]discovery.Peer, error) {
 	if a.disc == nil {
 		return nil, fmt.Errorf("discovery not started")
 	}
@@ -45,7 +45,7 @@ func (a *App) RefreshDiscovery() ([]discovery.Peer, error) {
 // of last resort: it works whenever IP reachability works — no
 // broadcast, no multicast, no cached state. Returns the peer as
 // announced, or an error naming the address and why it did not answer.
-func (a *App) ProbeHost(addr string) (discovery.Peer, error) {
+func (a *discoveryService) ProbeHost(addr string) (discovery.Peer, error) {
 	if a.disc == nil {
 		return discovery.Peer{}, fmt.Errorf("discovery not started")
 	}
@@ -70,7 +70,7 @@ func (a *App) ProbeHost(addr string) (discovery.Peer, error) {
 // Connect button used to produce. The button only exists to invite a
 // peer to *this* server, so refusing it here turns a silent deadlock
 // into an error the operator can act on.
-func (a *App) SendConnectRequest(peerID string) error {
+func (a *discoveryService) SendConnectRequest(peerID string) error {
 	if a.disc == nil {
 		return fmt.Errorf("discovery not started")
 	}

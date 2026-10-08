@@ -21,7 +21,7 @@ import (
 // GetMachineId returns this machine's stable id, creating it on first
 // use. The write is atomic (tmp + rename); a lost race just reads the
 // winner's file.
-func (a *App) GetMachineId() string {
+func (a *settingsService) GetMachineId() string {
 	path := filepath.Join(a.stateDir, "machine.id")
 	if raw, err := os.ReadFile(path); err == nil {
 		id := strings.TrimSpace(string(raw))

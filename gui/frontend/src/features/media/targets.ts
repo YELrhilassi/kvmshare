@@ -41,3 +41,27 @@ export function targetLabel(value: string | undefined): string | undefined {
   }
   return TARGETS.find((t) => t.value === value)?.label ?? value;
 }
+
+/**
+ * The machine id a `machine:<id>` target pins, or `""` for any other
+ * policy. The id is what the Rust router matches; the page only ever
+ * renders the connected client it belongs to.
+ */
+export function pinnedMachine(value: string | undefined): string {
+  if (!value) return "";
+  const id = value.startsWith("machine:") ? value.slice("machine:".length) : "";
+  return id.trim();
+}
+
+/**
+ * Do a pinned machine and a connected client refer to the same machine?
+ * The Rust side matches a machine id by prefix in either direction (users
+ * paste what they copied), and accepts a display name too; the card that
+ * looks selected must agree with what the router will actually do.
+ */
+export function sameMachine(pinned: string, id: string): boolean {
+  const p = pinned.trim();
+  const v = id.trim();
+  if (p === "" || v === "") return false;
+  return v === p || v.startsWith(p) || p.startsWith(v);
+}

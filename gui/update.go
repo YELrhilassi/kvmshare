@@ -40,7 +40,7 @@ type UpdateResult struct {
 }
 
 // GetVersion reports this build's version (injected at link time).
-func (a *App) GetVersion() string {
+func (a *updateService) GetVersion() string {
 	return selfupdate.Version
 }
 
@@ -50,7 +50,7 @@ func (a *App) GetVersion() string {
 // (unreleased, e.g. the default v0.0.0-dev) are simply reported as
 // having no update: they have no upstream to compare against, and a
 // confusing failure would be worse than no claim.
-func (a *App) CheckForUpdate() UpdateInfo {
+func (a *updateService) CheckForUpdate() UpdateInfo {
 	info := UpdateInfo{Current: selfupdate.Version}
 	if !selfupdate.IsRelease(selfupdate.Version) {
 		return info
@@ -72,7 +72,7 @@ func (a *App) CheckForUpdate() UpdateInfo {
 // ApplyUpdate downloads and installs the newest release in place, then
 // hands off to the new GUI. Returns before the restart (the frontend
 // shows a \"restarting\" state; this process exits shortly after).
-func (a *App) ApplyUpdate() UpdateResult {
+func (a *updateService) ApplyUpdate() UpdateResult {
 	// Dev builds never apply an update: there is no released archive for
 	// them, and replacing a hand-built binary with a release is not what
 	// self-update is for.

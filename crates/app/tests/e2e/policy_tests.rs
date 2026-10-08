@@ -36,8 +36,7 @@ fn a_media_key_is_routed_to_a_pinned_machine_and_performed_there() {
     // startup arm happens with it — no control-channel race.
     let h = start_server_with_media(kvmshare_core::media::MediaPrefs {
         route_media_keys: true,
-        transport: kvmshare_core::media::MediaTarget::Machine("machine-hp".into()),
-        volume: kvmshare_core::media::MediaTarget::Local,
+        target: kvmshare_core::media::MediaTarget::Machine("machine-hp".into()),
         fallback_local: true,
     });
     // The startup arm is itself the sync point: once the engine has it,
@@ -63,15 +62,15 @@ fn a_media_key_is_routed_to_a_pinned_machine_and_performed_there() {
         "a routed media key must not also arrive as a keystroke, got {cc:?}"
     );
 
-    // Volume is pinned to local: it must reach the *engine*, not the
-    // client (the local machine is the output the policy named).
+    // One target covers every media key, so volume follows playback to the
+    // same pinned machine: it must reach the *client*, not the engine.
     h.input_tx.send(Message::Key { kind: KeyKind::Down, key: 0xe9 }).unwrap();
     h.input_tx.send(Message::Key { kind: KeyKind::Up, key: 0xe9 }).unwrap();
-    wait_for_engine_call(&h.engine_calls, "media VolumeUp");
-    let cc = calls(&client_calls);
+    wait_for_media_tap(&client_calls, "media VolumeUp");
+    let cc = calls(&h.engine_calls);
     assert!(
         !cc.iter().any(|c| c == "media VolumeUp"),
-        "a local volume command must not reach the client, got {cc:?}"
+        "a pinned volume key must not also act locally, got {cc:?}"
     );
 }
 /// Routing enabled arms the media-key grab exactly once per transition —

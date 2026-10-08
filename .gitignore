@@ -13,6 +13,9 @@ gui/kvmshare-install.exe
 gui/kvmshare-installer
 gui/kvmshare-installer.exe
 gui/kvmshare-server.log
+# A bare `go build` in gui/ drops a binary named after the directory here
+# (the dir name collides with the default output name).
+gui/gui
 
 # Release artifacts (make release)
 /dist
@@ -21,4 +24,4 @@ gui/kvmshare-server.log
 .vscode/
 .idea/
 *.swp
-.DS_Storegui/gui
+.DS_Store

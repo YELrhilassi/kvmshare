@@ -41,7 +41,7 @@ func (a *App) healAutostartEntry() {
 }
 
 // EnableLaunchAtStartup makes the GUI start when the user logs in.
-func (a *App) EnableLaunchAtStartup() error {
+func (a *settingsService) EnableLaunchAtStartup() error {
 	exe, err := selfExe()
 	if err != nil {
 		return fmt.Errorf("locate self: %w", err)
@@ -57,7 +57,7 @@ func (a *App) EnableLaunchAtStartup() error {
 }
 
 // DisableLaunchAtStartup removes the startup entry.
-func (a *App) DisableLaunchAtStartup() error {
+func (a *settingsService) DisableLaunchAtStartup() error {
 	err := disableAutostart()
 	a.mu.Lock()
 	a.settings.LaunchAtStartup = false
@@ -69,7 +69,7 @@ func (a *App) DisableLaunchAtStartup() error {
 // LaunchAtStartupEnabled reports whether a startup entry currently
 // exists for this GUI (the file/registry is the truth — the settings
 // flag mirrors it, never overrides it).
-func (a *App) LaunchAtStartupEnabled() bool {
+func (a *settingsService) LaunchAtStartupEnabled() bool {
 	if !autostartPresent() {
 		return false
 	}

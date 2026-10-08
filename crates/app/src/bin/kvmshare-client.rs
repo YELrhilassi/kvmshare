@@ -54,6 +54,8 @@ fn client_audio_setup() -> Option<kvmshare_core::client::AudioSetup> {
     Some(kvmshare_core::client::AudioSetup {
         options: cfg.audio.to_options(),
         backend: kvmshare_platform::audio::backend(),
+        // Live status for the GUI (the audio.state file).
+        status: Some(kvmshare_app::audio_status_sink(state_dir())),
     })
 }
 
@@ -66,6 +68,16 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_client_args()?;
+    // The Media page's Test button plays a tone through *this* machine's
+    // configured output, and the audio backend is the platform layer the Go
+    // GUI cannot link — so the client binary answers it, the same way it
+    // would answer a device listing. Before the role lock and before any
+    // socket: a machine that is not running a client must still be able to
+    // hear whether its output works.
+    if let Some(test) = &args.audio_test_tone {
+        println!("{}", kvmshare_app::audio_test_tone_json(&test.device, test.seconds));
+        return Ok(());
+    }
     if let Some(f) = &args.log_file {
         kvmshare_log::set_log_file(f.clone());
     }
@@ -83,6 +95,11 @@ fn run() -> Result<(), String> {
     // a server is running here, and hold our own lock for the process
     // lifetime (flock dies with us — no orphans).
     let _guard: RoleGuard = guard::acquire(guard::ROLE_CLIENT)?;
+
+    // Repair an output route a previous process left behind (see the
+    // server's equivalent). Once per role process, never at backend
+    // construction — the test-tone helper builds a backend too.
+    kvmshare_platform::audio::recover_exclusive_output();
 
     let addr = with_default_port(&args.server_addr, DEFAULT_PORT);
     if args.server_addr.is_empty() {
@@ -113,6 +130,9 @@ fn run() -> Result<(), String> {
     // — see `kvmshare_app::trust`.
     let revoked = revoked_policy(&state_dir);
     write_client_state(&state_dir, "disconnected", &addr);
+    // A stale audio status from a previous run is not this run's: clear it
+    // so the GUI never shows a link that no longer exists.
+    kvmshare_app::clear_audio_state(&state_dir);
     loop {
         // The UAC secure desktop (Windows): while a consent prompt is
         // up, no injected input can land anywhere, so connecting (or

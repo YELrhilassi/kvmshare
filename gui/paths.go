@@ -71,7 +71,7 @@ func NewAppPaths() (stateDir, configPath, serverPath, clientPath, installPath st
 }
 
 // GetPaths reports the resolved file locations.
-func (a *App) GetPaths() Paths {
+func (a *settingsService) GetPaths() Paths {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return Paths{

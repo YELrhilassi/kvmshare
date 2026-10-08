@@ -187,6 +187,15 @@ fn start_server() -> Harness {
 /// policy at startup, and a `SetMediaPrefs` sent afterwards races that
 /// startup arm on the control channel.
 fn start_server_with_media(media: kvmshare_core::media::MediaPrefs) -> Harness {
+    start_server_with_audio(media, None)
+}
+
+/// The same harness, but with an audio setup installed on the server — the
+/// audio counterpart of a server whose `[audio]` section is live.
+fn start_server_with_audio(
+    media: kvmshare_core::media::MediaPrefs,
+    audio: Option<Arc<kvmshare_core::server::audio::ServerAudio>>,
+) -> Harness {
     let session = Session::new(two_screen_layout(), 0);
     let (control_tx, control_rx) = mpsc::channel::<Control>();
     let (events_tx, events_rx) = mpsc::channel::<ServerEvent>();
@@ -202,7 +211,7 @@ fn start_server_with_media(media: kvmshare_core::media::MediaPrefs) -> Harness {
                 policy: Policy { allowlist: false, ..Policy::default() },
                 events: Some(events_tx),
                 server_id: "server-pc".into(),
-                audio: None,
+                audio,
             },
         )
         .unwrap(),
@@ -270,5 +279,6 @@ fn calls(c: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 }
 
 mod admission_tests;
+mod audio_tests;
 mod policy_tests;
 mod session_tests;

@@ -63,9 +63,12 @@ export interface InputSection {
 /** [media] config section — schema owned by kvmshare_core::media. */
 export interface MediaSection {
   routeMediaKeys: boolean;
-  /** local | follow_focus | last_active_source | focus_or_last_active | machine:<id> */
-  transport: string;
-  volume: string;
+  /**
+   * One target for every media key (playback and volume alike):
+   * local | follow_focus | last_active_source | focus_or_last_active |
+   * machine:<id>.
+   */
+  target: string;
   fallbackLocal: boolean;
 }
 
@@ -178,6 +181,75 @@ export interface RoleElevation {
   detail?: string;
 }
 
+/**
+ * One machine's audio devices, for the Media page's pickers. `capture`
+ * lists outputs whose loopback can be captured (never microphones);
+ * `playback` lists outputs audio can be played to. An empty list means
+ * "system default only".
+ */
+export interface AudioDevices {
+  capture: string[];
+  playback: string[];
+}
+
+/**
+ * The live audio link, as the role process reports it in `audio.state`.
+ * `active` is derived by the backend (a role is running and audio is
+ * configured); the page shows the status line only when it is set.
+ *
+ * `sending`/`receiving` say a stream is running; `capture*`/`receive*` say
+ * what is actually in it. The two are different facts on purpose — a live
+ * link on a quiet machine is normal, and a link that is up while its meter
+ * never moves is a fault.
+ */
+export interface AudioState {
+  send: boolean;
+  receive: boolean;
+  sending: boolean;
+  receiving: boolean;
+  /** The machine at the other end, as its owner names it ("hp"). Empty
+   *  until a link is settled, or when the owner knows no name. */
+  peer: string;
+  /** The sound being captured is above the silence floor. */
+  capturePlaying: boolean;
+  /** The most recent captured level, in dBFS. Null = nothing is being
+   *  captured (which is not the same as silence). */
+  captureLevelDb: number | null;
+  /** The same two facts for what is being played — a level above the floor
+   *  is proof the peer's audio is arriving, not merely announced. */
+  receivePlaying: boolean;
+  receiveLevelDb: number | null;
+  /** A non-fatal warning about the capture path ("this output is muted",
+   *  "that monitor's recording gain is at 21%"), empty when there is
+   *  nothing to say. Not an error: the link works and carries silence. */
+  captureNote: string;
+  /** The last failure, empty when none — this is what makes a broken
+   *  stream visible instead of silent. */
+  error: string;
+  active: boolean;
+}
+
+/**
+ * The answer to "does audio actually work on this machine?" — two facts,
+ * because the failures are different and want different fixes: the tone
+ * being `played` means this machine's output works, and `captureHeard`
+ * means the loopback the link streams saw it.
+ */
+export interface AudioTestResult {
+  played: boolean;
+  /** The output the tone went to ("" = system default). */
+  device: string;
+  /** Why no tone played; empty when it did. */
+  error: string;
+  /** A direction was streaming while the test ran. */
+  sending: boolean;
+  receiving: boolean;
+  captureHeard: boolean;
+  /** The loudest captured level seen; meaningless unless `hasPeak`. */
+  peakDb: number;
+  hasPeak: boolean;
+}
+
 export interface ClientState {
   status: "connected" | "connecting" | "disconnected" | "refused";
   server: string;
@@ -205,6 +277,8 @@ export interface LiveSnapshot {
    *  every crossing; the resting state (control at home) is a missing
    *  file, so it reads false. */
   controlAway: boolean;
+  /** The live audio link state (off/inactive when audio is not set up). */
+  audio: AudioState;
 }
 
 /** The Wails event object delivered to `Events.On` callbacks. */
@@ -259,6 +333,11 @@ export interface GoApp {
   SaveMediaAudio(m: MediaSection, a: AudioSection): Promise<void>;
   LoadClientAudio(): Promise<AudioSection>;
   SaveClientAudio(a: AudioSection): Promise<void>;
+  /** This machine's audio devices for the pickers. */
+  ListAudioDevices(): Promise<AudioDevices>;
+  /** Play a short tone on this machine's output and report whether the
+   *  audio path (output and loopback capture) actually saw it. */
+  TestAudio(device: string): Promise<AudioTestResult>;
   ServerStart(): Promise<boolean>;
   ServerStop(): Promise<void>;
   ServerRunning(): Promise<boolean>;
@@ -379,6 +458,8 @@ export const api = (): GoApp => ({
   SaveMediaAudio: (m, a) => call<void>("SaveMediaAudio", m, a),
   LoadClientAudio: () => call<AudioSection>("LoadClientAudio"),
   SaveClientAudio: (a) => call<void>("SaveClientAudio", a),
+  ListAudioDevices: () => call<AudioDevices>("ListAudioDevices"),
+  TestAudio: (device) => call<AudioTestResult>("TestAudio", device),
   ServerStart: () => call<boolean>("ServerStart"),
   ServerStop: () => call<void>("ServerStop"),
   ServerRunning: () => call<boolean>("ServerRunning"),

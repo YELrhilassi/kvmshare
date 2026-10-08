@@ -34,7 +34,7 @@ type elevationStatus struct {
 
 // RoleElevation: roles always run with full input access here (the
 // one-time udev grant is what Linux needs, handled elsewhere).
-func (a *App) RoleElevation() elevationStatus {
+func (a *settingsService) RoleElevation() elevationStatus {
 	return elevationStatus{Elevated: true, CanElevate: true}
 }
 

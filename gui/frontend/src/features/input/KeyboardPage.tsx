@@ -4,7 +4,7 @@ import { useApp } from "@/app/AppProvider";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { PageSkeleton } from "@/components/PageSkeleton";
-import { useChordRecorder, keyName, modLabels, Kbd, type LiveMods } from "./ChordRecorder";
+import { useChordRecorder, keyName, modLabels, Kbd, type Chord, type LiveMods } from "./ChordRecorder";
 import { allActions, actionIdOf, bindingIsBindable, bareSafeKey, chordSig, titleOf, type ActionSpec } from "./shortcuts";
 import { cn } from "@/lib/utils";
 

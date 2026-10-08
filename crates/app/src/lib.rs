@@ -6,6 +6,9 @@
 pub mod guard;
 
 mod args;
+mod audio_devices;
+mod audio_state;
+mod audio_test;
 mod client_state;
 mod clipboard;
 mod config;
@@ -15,9 +18,12 @@ mod session;
 mod trust;
 
 pub use args::{
-    parse_client_args, parse_server_args, with_default_port, BUILD_ID, ClientArgs, PKG_VERSION,
-    ServerArgs,
+    parse_client_args, parse_server_args, with_default_port, AudioTestRequest, BUILD_ID, ClientArgs,
+    DEFAULT_TEST_SECONDS, PKG_VERSION, ServerArgs,
 };
+pub use audio_devices::audio_devices_json;
+pub use audio_state::{audio_status_sink, clear_audio_state};
+pub use audio_test::audio_test_tone_json;
 pub use client_state::{
     write_client_state, write_client_state_connected, write_client_state_refused,
     write_client_state_stopped,

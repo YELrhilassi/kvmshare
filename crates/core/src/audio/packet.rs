@@ -31,6 +31,16 @@ pub const MAGIC: [u8; 4] = *b"KVMA";
 /// recognize the version drops the datagram instead of misreading it.
 pub const VERSION: u8 = 1;
 
+/// The version on the **path-opening** datagram, which carries no audio at
+/// all (see [`crate::audio::runtime::AudioRuntime::punch`]).
+///
+/// It is deliberately a version this protocol will never assign — real
+/// versions start at 1 — so the peer's own [`decode`] rejects the datagram
+/// outright. That matters: a punch that decoded would be buffered as the
+/// first frame of a stream, and the receiver would then treat the real
+/// first packet as a duplicate of it.
+pub const PUNCH_VERSION: u8 = 0;
+
 /// `magic(4) + version(1) + seq(4) + timestamp(4)`.
 pub const HEADER_LEN: usize = 13;
 
@@ -285,6 +295,18 @@ mod tests {
         assert_eq!(buf.len(), HEADER_LEN + 16);
         let packet = decode(&buf).unwrap();
         assert_eq!(packet.payload, &[1u8; 16]);
+    }
+
+    /// The path-opening datagram is *not* audio: `decode` refuses it, which
+    /// is what keeps a hole-punch from being queued as the first frame of a
+    /// stream and swallowing the real one as its duplicate.
+    #[test]
+    fn the_path_opening_datagram_is_not_decodable() {
+        let mut buf = Vec::new();
+        encode(&mut buf, 0, 0, &[]);
+        buf[4] = PUNCH_VERSION;
+        assert_eq!(decode(&buf), None);
+        assert_ne!(PUNCH_VERSION, VERSION, "a punch must never be a valid version");
     }
 
     /// Anything that is not one of our datagrams is refused, so a foreign

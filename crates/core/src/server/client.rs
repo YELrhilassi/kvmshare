@@ -502,6 +502,11 @@ fn handle_client_message(client: &Client, msg: Message, ctx: &ClientCtx) {
         Message::AudioState { playing } => {
             crate::server::audio::handle_message(client, &msg);
             ctx.session.lock().unwrap().on_audio_state(client.id, *playing);
+            // A third consumer, and the one that makes multi-machine audio
+            // work: with several machines connected and none pinned, the
+            // audio link follows the one that is actually playing (see
+            // `server::audio`). A no-op in every other configuration.
+            crate::server::audio::on_peer_activity(ctx, client, *playing);
             return;
         }
         _ => {}

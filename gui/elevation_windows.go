@@ -85,7 +85,7 @@ type elevationStatus struct {
 
 // RoleElevation reports the role-elevation picture for this machine.
 // Bound for the frontend; a no-argument read, safe from any goroutine.
-func (a *App) RoleElevation() elevationStatus {
+func (a *settingsService) RoleElevation() elevationStatus {
 	if elevated() {
 		return elevationStatus{Elevated: true, CanElevate: true}
 	}

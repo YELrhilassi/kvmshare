@@ -18,13 +18,13 @@ import (
 // Status
 // ---------------------------------------------------------------------------
 
-func (a *App) ServerRunning() bool {
+func (a *rolesService) ServerRunning() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.serverProc.running() || a.roleActive(roleServer)
 }
 
-func (a *App) ClientRunning() bool {
+func (a *rolesService) ClientRunning() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.clientProc.running() || a.roleActive(roleClient)
@@ -101,13 +101,13 @@ func (a *App) stopRoleLocked(role string) error {
 	return nil
 }
 
-func (a *App) ServerStop() error {
+func (a *rolesService) ServerStop() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.stopRoleLocked(roleServer)
 }
 
-func (a *App) ClientStop() error {
+func (a *rolesService) ClientStop() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	// An operator stop is a decision, not a transient failure: hold
@@ -119,7 +119,7 @@ func (a *App) ClientStop() error {
 }
 
 // StopActive stops the process for the currently selected role.
-func (a *App) StopActive() error {
+func (a *rolesService) StopActive() error {
 	if a.currentMode() == ModeClient {
 		return a.ClientStop()
 	}
@@ -177,7 +177,7 @@ func conflictError(err error) bool {
 	return strings.Contains(s, "already running") || strings.Contains(s, "is locked")
 }
 
-func (a *App) ServerStart() (bool, error) {
+func (a *rolesService) ServerStart() (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -243,7 +243,7 @@ func (a *App) spawnServerLocked() (*proc, error) {
 // path can decide-and-start under a single hold of a.mu — otherwise a
 // check that passes can go stale before the start, and the start can
 // kill a server the operator began in the gap.
-func (a *App) ClientStart() (bool, error) {
+func (a *rolesService) ClientStart() (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	// An explicit start is the operator re-arming auto-connect: whatever
@@ -310,7 +310,7 @@ func (a *App) clientStartLocked() (bool, error) {
 }
 
 // StartActive starts the process for the currently selected role.
-func (a *App) StartActive() (bool, error) {
+func (a *rolesService) StartActive() (bool, error) {
 	if a.currentMode() == ModeClient {
 		return a.ClientStart()
 	}

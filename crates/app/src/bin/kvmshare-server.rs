@@ -36,6 +36,23 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = parse_server_args()?;
+    // The GUI's device pickers ask *this* binary for the platform's audio
+    // devices, so they use the same enumeration the runtime does — no
+    // second implementation of WASAPI or pactl. Answer before any
+    // logging, role lock, or socket is touched.
+    if args.audio_devices {
+        println!("{}", kvmshare_app::audio_devices_json());
+        return Ok(());
+    }
+    // The Media page's Test button plays a tone through this machine's
+    // configured output, for the same reason it asks for the device list:
+    // the audio backend is the platform layer, which Go cannot link. Answer
+    // before any logging, role lock, or socket is touched, so a machine that
+    // is not running a server can still be tested.
+    if let Some(test) = &args.audio_test_tone {
+        println!("{}", kvmshare_app::audio_test_tone_json(&test.device, test.seconds));
+        return Ok(());
+    }
     if let Some(f) = &args.log_file {
         kvmshare_log::set_log_file(f.clone());
     }
@@ -51,6 +68,14 @@ fn run() -> Result<(), String> {
     // a client is running here, and hold our own lock for the process
     // lifetime (flock dies with us — no orphans).
     let _guard: RoleGuard = guard::acquire(guard::ROLE_SERVER)?;
+
+    // If a previous server died mid-share, this machine's output is still
+    // routed through a virtual sink that makes no sound. Put the real
+    // output back before anything else touches audio. Done here, once per
+    // role process — never when a backend is built, because the
+    // short-lived test-tone helper builds one too and must not disturb the
+    // running role's route.
+    kvmshare_platform::audio::recover_exclusive_output();
 
     // Config → layout → session (the switching brain). When no --config
     // is given, fall back to the standard locations. A config that does
@@ -117,7 +142,7 @@ fn run() -> Result<(), String> {
                 policy,
                 events: Some(evt_tx),
                 server_id: machine_id(&state),
-                audio: server_audio(&cfg),
+                audio: server_audio(&cfg, state.clone()),
             },
         )
         .map_err(|e| format!("bind: {e}"))?,
@@ -132,7 +157,7 @@ fn run() -> Result<(), String> {
 
     // Config hot-reload: watch the file and adopt changes live, without
     // a restart (the GUI saves the config while the server keeps running).
-    spawn_config_watcher(config_path.clone(), ctl_tx.clone());
+    spawn_config_watcher(config_path.clone(), state.clone(), ctl_tx.clone());
 
     // The GUI's connected-client list: persist lifecycle events to
     // `clients.json` in the state dir (the GUI polls it), and
@@ -150,6 +175,9 @@ fn run() -> Result<(), String> {
     // *this* process. Clear it before the GUI can read it — the event
     // sink rewrites it truthfully on the first connect/disconnect.
     let _ = std::fs::remove_file(state.join("clients.json"));
+    // Same for a stale audio status: the previous run's link is not this
+    // run's, and a missing file reads as "no audio".
+    kvmshare_app::clear_audio_state(&state);
 
     // Run forever, forwarding local input. The supervisor inside watches
     // the input path's health and, on a wedge while the cursor is on a
@@ -165,13 +193,14 @@ fn run() -> Result<(), String> {
     // control-away marker: no server, no grabbed-away devices.
     let _ = std::fs::remove_file(state.join("clients.json"));
     let _ = std::fs::remove_file(state.join("control.state"));
+    kvmshare_app::clear_audio_state(&state);
 
     result.map_err(|e| format!("server: {e}"))
 }
 
 /// The audio setup for this server, or `None` when `[audio]` asks for
 /// nothing — in which case no socket is bound and the feature is inert.
-fn server_audio(cfg: &Config) -> Option<Arc<kvmshare_core::server::audio::ServerAudio>> {
+fn server_audio(cfg: &Config, state: PathBuf) -> Option<Arc<kvmshare_core::server::audio::ServerAudio>> {
     if !cfg.audio.is_active() {
         return None;
     }
@@ -180,6 +209,8 @@ fn server_audio(cfg: &Config) -> Option<Arc<kvmshare_core::server::audio::Server
         options: cfg.audio.to_options(),
         peer_machine_id: Some(cfg.audio.peer.clone())
             .filter(|p| !p.trim().is_empty()),
+        // Live status for the GUI (the audio.state file).
+        status: Some(kvmshare_app::audio_status_sink(state)),
     }))
 }
 
@@ -403,7 +434,7 @@ fn spawn_server_cmd_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
 /// Poll the config file and push a [`Control::Reload`] whenever its
 /// content changes, so layout edits apply live. A transient parse error
 /// (file mid-write) just defers the reload until the file is valid.
-fn spawn_config_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
+fn spawn_config_watcher(path: PathBuf, state: PathBuf, tx: mpsc::Sender<Control>) {
     thread::spawn(move || {
         // Prime the watcher with the file as it is now, so startup does
         // not log a spurious "layout reloaded" — only real changes do.
@@ -450,7 +481,7 @@ fn spawn_config_watcher(path: PathBuf, tx: mpsc::Sender<Control>) {
                             ))
                             .is_err()
                         || tx
-                            .send(Control::SetAudioOptions(server_audio(&cfg)))
+                            .send(Control::SetAudioOptions(server_audio(&cfg, state.clone())))
                             .is_err()
                     {
                         return; // server gone

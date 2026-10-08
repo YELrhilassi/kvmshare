@@ -16,7 +16,7 @@ type InterfaceInfo struct {
 }
 
 // ListInterfaces returns every network interface with its addresses.
-func (a *App) ListInterfaces() ([]InterfaceInfo, error) {
+func (a *discoveryService) ListInterfaces() ([]InterfaceInfo, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, fmt.Errorf("interfaces: %w", err)
@@ -44,7 +44,7 @@ func (a *App) ListInterfaces() ([]InterfaceInfo, error) {
 
 // TailLog returns the last `lines` lines of the given log file. The path
 // comes from GetPaths; it is validated to live under the state dir.
-func (a *App) TailLog(path string, lines int) (string, error) {
+func (a *logsService) TailLog(path string, lines int) (string, error) {
 	a.mu.Lock()
 	stateDir := filepath.Dir(a.serverLogPath)
 	a.mu.Unlock()

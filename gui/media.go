@@ -60,11 +60,13 @@ func validMediaTarget(t string) bool {
 	return false
 }
 
-// MediaSection is the `[media]` section as the frontend sees it.
+// MediaSection is the `[media]` section as the frontend sees it. One
+// target now covers playback and volume alike; the two per-category keys
+// are gone from the UI and are only read back for migration (see
+// resolvedTarget).
 type MediaSection struct {
 	RouteMediaKeys bool   `json:"routeMediaKeys"`
-	Transport      string `json:"transport"`
-	Volume         string `json:"volume"`
+	Target         string `json:"target"`
 	FallbackLocal  bool   `json:"fallbackLocal"`
 }
 
@@ -86,9 +88,25 @@ type AudioSection struct {
 // snake_case, as the Rust server's serde schema writes and reads them.
 type mediaFile struct {
 	RouteMediaKeys bool   `toml:"route_media_keys"`
-	Transport      string `toml:"transport"`
-	Volume         string `toml:"volume"`
-	FallbackLocal  bool   `toml:"fallback_local"`
+	Target         string `toml:"target,omitempty"`
+	// Legacy per-category targets: read for migration, never written, so a
+	// save collapses the file onto the single Target.
+	Transport     string `toml:"transport,omitempty"`
+	Volume        string `toml:"volume,omitempty"`
+	FallbackLocal bool   `toml:"fallback_local"`
+}
+
+// resolvedTarget is the one routing target, falling back to the legacy
+// per-category keys so a config written before they were collapsed keeps
+// its routing. `transport` wins when both legacy keys are present, matching
+// the Rust loader (crates/app/src/config/media.rs).
+func resolvedTarget(f mediaFile) string {
+	for _, t := range []string{f.Target, f.Transport, f.Volume} {
+		if strings.TrimSpace(t) != "" {
+			return t
+		}
+	}
+	return string(mediaTargetFollowFocus)
 }
 
 type audioFile struct {
@@ -103,8 +121,7 @@ type audioFile struct {
 func (s MediaSection) file() mediaFile {
 	return mediaFile{
 		RouteMediaKeys: s.RouteMediaKeys,
-		Transport:      s.Transport,
-		Volume:         s.Volume,
+		Target:         s.Target,
 		FallbackLocal:  s.FallbackLocal,
 	}
 }
@@ -123,8 +140,7 @@ func (s AudioSection) file() audioFile {
 func (f mediaFile) json() MediaSection {
 	return MediaSection{
 		RouteMediaKeys: f.RouteMediaKeys,
-		Transport:      f.Transport,
-		Volume:         f.Volume,
+		Target:         resolvedTarget(f),
 		FallbackLocal:  f.FallbackLocal,
 	}
 }
@@ -145,8 +161,7 @@ func (f audioFile) json() AudioSection {
 func defaultMedia() MediaSection {
 	return MediaSection{
 		RouteMediaKeys: true,
-		Transport:      string(mediaTargetFollowFocus),
-		Volume:         string(mediaTargetFollowFocus),
+		Target:         string(mediaTargetFollowFocus),
 		FallbackLocal:  true,
 	}
 }
@@ -158,11 +173,8 @@ func defaultAudio() AudioSection {
 // validateMedia rejects a routing section the Rust parser would refuse,
 // naming the field, so the error points at the control that is wrong.
 func validateMedia(m MediaSection) error {
-	if !validMediaTarget(m.Transport) {
-		return fmt.Errorf("[media] transport: unknown target %q", m.Transport)
-	}
-	if !validMediaTarget(m.Volume) {
-		return fmt.Errorf("[media] volume: unknown target %q", m.Volume)
+	if !validMediaTarget(m.Target) {
+		return fmt.Errorf("[media] target: unknown target %q", m.Target)
 	}
 	return nil
 }
@@ -243,12 +255,28 @@ func editConfigFile(what string, path string, edit func(sections map[string]any)
 	return nil
 }
 
+// MediaAudio is the server-role answer as one value: the media routing
+// section and the audio sharing section.
+//
+// It exists because of a Wails marshalling rule: a bound method's
+// multiple *non-error* return values are marshalled as a JSON **array**,
+// not an object (`BoundMethod.Call` documents this). A method returning
+// `(MediaSection, AudioSection, error)` therefore reached the frontend as
+// `[media, audio]`, and every `m.media` / `m.audio` read was `undefined`
+// — the Media & audio page could never show the server's real settings.
+// One struct keeps the JSON shape the frontend's `MediaAudio` type
+// declares.
+type MediaAudio struct {
+	Media MediaSection `json:"media"`
+	Audio AudioSection `json:"audio"`
+}
+
 // LoadMediaAudio returns the server-role media routing and audio sharing
 // settings from the server's config file.
-func (a *App) LoadMediaAudio() (MediaSection, AudioSection, error) {
+func (a *mediaService) LoadMediaAudio() (MediaAudio, error) {
 	mf, af, err := readMediaAudioSections(a.configPath)
 	if err != nil {
-		return MediaSection{}, AudioSection{}, err
+		return MediaAudio{}, err
 	}
 	m, au := defaultMedia(), defaultAudio()
 	if mf != nil {
@@ -257,13 +285,13 @@ func (a *App) LoadMediaAudio() (MediaSection, AudioSection, error) {
 	if af != nil {
 		au = af.json()
 	}
-	return m, au, nil
+	return MediaAudio{Media: m, Audio: au}, nil
 }
 
 // SaveMediaAudio writes the server-role `[media]` and `[audio]` sections
 // into the server's config file, preserving every other section. The
 // running server hot-reloads the file; nothing here touches the process.
-func (a *App) SaveMediaAudio(m MediaSection, au AudioSection) error {
+func (a *mediaService) SaveMediaAudio(m MediaSection, au AudioSection) error {
 	if err := validateMedia(m); err != nil {
 		return err
 	}
@@ -301,7 +329,7 @@ func (a *App) clientConfigPath() string {
 // client role reads, whatever server it connects to. A missing file is
 // the inert default (no audio), which is what every machine that never
 // opened this page wants.
-func (a *App) LoadClientAudio() (AudioSection, error) {
+func (a *mediaService) LoadClientAudio() (AudioSection, error) {
 	raw, err := os.ReadFile(a.clientConfigPath())
 	if os.IsNotExist(err) {
 		return defaultAudio(), nil
@@ -325,7 +353,7 @@ func (a *App) LoadClientAudio() (AudioSection, error) {
 // re-reads the file on every (re)connect, so a save applies at the next
 // connection without touching the process — the same contract the
 // server's hot reload honours.
-func (a *App) SaveClientAudio(au AudioSection) error {
+func (a *mediaService) SaveClientAudio(au AudioSection) error {
 	if err := validateAudio(au); err != nil {
 		return err
 	}

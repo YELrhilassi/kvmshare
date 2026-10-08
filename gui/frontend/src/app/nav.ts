@@ -29,6 +29,14 @@ export const NAV: { id: Page; label: string }[] = [
   { id: "settings", label: "Settings" },
 ];
 
+// The label a page shows in the sidebar for a given role. Only media
+// differs: a client has no media routing to configure (that is a server
+// concern), so its page is only its own sound sharing.
+export function navLabel(id: Page, mode: Mode): string {
+  if (id === "media" && mode === "client") return "Audio";
+  return NAV.find((n) => n.id === id)?.label ?? id;
+}
+
 export function pagesFor(mode: Mode): Page[] {
   // Settings is role-independent: it configures the machine, not a role.
   // Media & audio exists in both roles — where media keys go is a server

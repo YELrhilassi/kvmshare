@@ -127,9 +127,10 @@ pub fn audio_capture(
 /// Start playing the peer's audio stream into this machine's output.
 ///
 /// Playback goes to the ordinary output device, so the OS's own mixer
-/// combines it with local sound — which is why both machines can be
-/// audible at once without any custom mixing (see
-/// `docs/11-media-and-audio.md`).
+/// combines the incoming stream with this machine's local sound — no
+/// custom mixer. The *sending* machine stays quiet while it shares (see
+/// [`audio::PlatformAudio::begin_exclusive_send`] and
+/// `docs/11-media-and-audio.md`, *Exclusive output*).
 pub fn audio_playback(device: &str) -> Box<dyn kvmshare_core::audio::AudioPlayback> {
     #[cfg(target_os = "linux")]
     {
@@ -143,6 +144,29 @@ pub fn audio_playback(device: &str) -> Box<dyn kvmshare_core::audio::AudioPlayba
     {
         let _ = device;
         Box::new(audio::UnsupportedPlayback)
+    }
+}
+
+/// A warning about the capture path that is worth showing the user, or
+/// `None` when it can be captured exactly as configured.
+///
+/// This exists for the failures that are silent rather than loud: an output
+/// muted at 0% feeds its loopback nothing (the tap is post-volume), and a
+/// monitor whose recording gain was left low attenuates every frame. Both
+/// look identical from inside the stream — silence — so neither can be
+/// diagnosed from the audio itself, and both are a few seconds to fix once
+/// someone says where to look.
+pub fn audio_capture_note(device: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        audio::capture_note(device)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // WASAPI reports device state through COM rather than a query, and
+        // an endpoint that exists takes a stream; nothing to add here yet.
+        let _ = device;
+        None
     }
 }
 

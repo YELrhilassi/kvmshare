@@ -19,6 +19,24 @@ fn print_version(bin: &str) -> ! {
     std::process::exit(0);
 }
 
+/// A `--audio-test-tone` request: play a short tone on this machine's
+/// output, report the outcome as JSON, and exit.
+///
+/// Both binaries accept it, because the machine that wants to be tested may
+/// be the server or the client — the GUI asks whichever role binary belongs
+/// to the machine it is running on (see `crates/app/src/audio_test.rs`).
+pub struct AudioTestRequest {
+    /// The output device; empty means the system default, the same
+    /// convention the runtime uses.
+    pub device: String,
+    pub seconds: f32,
+}
+
+/// How long the test tone plays when `--seconds` does not say. Long enough
+/// to be heard and to be seen by a capture meter, short enough that nobody
+/// waits for it.
+pub const DEFAULT_TEST_SECONDS: f32 = 1.5;
+
 /// Arguments for `kvmshare-server`.
 pub struct ServerArgs {
     pub config: Option<PathBuf>,
@@ -29,6 +47,13 @@ pub struct ServerArgs {
     /// Log-file path (GUI sets it when stderr would go nowhere: the
     /// elevated scheduled-task spawn on Windows).
     pub log_file: Option<PathBuf>,
+    /// Print this machine's audio devices as JSON and exit, without
+    /// starting a server. The GUI's device pickers ask the *platform
+    /// layer* this way instead of re-implementing `pactl`/WASAPI in Go.
+    pub audio_devices: bool,
+    /// Play a test tone on this machine's output and exit. The Media page's
+    /// "does this actually work" button asks for it.
+    pub audio_test_tone: Option<AudioTestRequest>,
 }
 
 /// Parse `kvmshare-server [--config PATH] [--port N] [--log-level LEVEL] [--logctl PATH] [--log-file PATH]`.
@@ -38,6 +63,10 @@ pub fn parse_server_args() -> Result<ServerArgs, String> {
     let mut log_level: Option<String> = None;
     let mut log_ctl: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
+    let mut audio_devices = false;
+    let mut test_tone = false;
+    let mut test_device: Option<String> = None;
+    let mut test_seconds: Option<f32> = None;
     let mut args = merged_argv()?.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -49,17 +78,42 @@ pub fn parse_server_args() -> Result<ServerArgs, String> {
             "--log-level" | "-l" => log_level = Some(args.next().ok_or("--log-level needs a value")?),
             "--logctl" => log_ctl = Some(PathBuf::from(args.next().ok_or("--logctl needs a path")?)),
             "--log-file" => log_file = Some(PathBuf::from(args.next().ok_or("--log-file needs a path")?)),
+            "--audio-devices" => audio_devices = true,
+            "--audio-test-tone" => test_tone = true,
+            "--device" => test_device = Some(args.next().ok_or("--device needs a device name")?),
+            "--seconds" => {
+                let raw = args.next().ok_or("--seconds needs a number")?;
+                test_seconds = Some(raw.parse().map_err(|_| format!("bad seconds {raw:?}"))?);
+            }
             "--version" | "-V" => print_version("kvmshare-server"),
             "--help" | "-h" => {
                 println!(
-                    "usage: kvmshare-server [--config PATH] [--port N] [--log-level error|warn|info|debug|trace] [--logctl PATH] [--log-file PATH]\n       kvmshare-server --version"
+                    "usage: kvmshare-server [--config PATH] [--port N] [--log-level error|warn|info|debug|trace] [--logctl PATH] [--log-file PATH]\n       kvmshare-server --audio-devices   (JSON: this machine's capture/playback devices, then exit)\n       kvmshare-server --audio-test-tone [--device NAME] [--seconds N]   (JSON: a short tone, then exit)\n       kvmshare-server --version"
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(ServerArgs { config, port: port.unwrap_or(0), log_level, log_ctl, log_file })
+    Ok(ServerArgs {
+        config,
+        port: port.unwrap_or(0),
+        log_level,
+        log_ctl,
+        log_file,
+        audio_devices,
+        audio_test_tone: test_request(test_tone, test_device, test_seconds),
+    })
+}
+
+/// Assemble a test request, or `None` when `--audio-test-tone` was not
+/// asked for (in which case a stray `--device` is ignored rather than
+/// silently playing a tone nobody requested).
+fn test_request(enabled: bool, device: Option<String>, seconds: Option<f32>) -> Option<AudioTestRequest> {
+    enabled.then(|| AudioTestRequest {
+        device: device.unwrap_or_default(),
+        seconds: seconds.unwrap_or(DEFAULT_TEST_SECONDS),
+    })
 }
 
 /// Arguments for `kvmshare-client`.
@@ -75,6 +129,10 @@ pub struct ClientArgs {
     /// Log-file path (GUI sets it when stderr would go nowhere: the
     /// elevated scheduled-task spawn on Windows).
     pub log_file: Option<PathBuf>,
+    /// Play a test tone on this machine's output and exit (see
+    /// [`ServerArgs::audio_test_tone`]; the client accepts it too, because
+    /// the machine asking to be tested may be either role).
+    pub audio_test_tone: Option<AudioTestRequest>,
 }
 
 /// Parse `kvmshare-client SERVER[:PORT] [--name NAME] [--log-level LEVEL] [--logctl PATH] [--log-file PATH]`.
@@ -84,6 +142,9 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
     let mut log_level: Option<String> = None;
     let mut log_ctl: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
+    let mut test_tone = false;
+    let mut test_device: Option<String> = None;
+    let mut test_seconds: Option<f32> = None;
     let mut args = merged_argv()?.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -91,10 +152,16 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
             "--log-level" | "-l" => log_level = Some(args.next().ok_or("--log-level needs a value")?),
             "--logctl" => log_ctl = Some(PathBuf::from(args.next().ok_or("--logctl needs a path")?)),
             "--log-file" => log_file = Some(PathBuf::from(args.next().ok_or("--log-file needs a path")?)),
+            "--audio-test-tone" => test_tone = true,
+            "--device" => test_device = Some(args.next().ok_or("--device needs a device name")?),
+            "--seconds" => {
+                let raw = args.next().ok_or("--seconds needs a number")?;
+                test_seconds = Some(raw.parse().map_err(|_| format!("bad seconds {raw:?}"))?);
+            }
             "--version" | "-V" => print_version("kvmshare-client"),
             "--help" | "-h" => {
                 println!(
-                    "usage: kvmshare-client SERVER[:PORT] [--name NAME] [--log-level error|warn|info|debug|trace] [--logctl PATH] [--log-file PATH]\n       kvmshare-client --version"
+                    "usage: kvmshare-client SERVER[:PORT] [--name NAME] [--log-level error|warn|info|debug|trace] [--logctl PATH] [--log-file PATH]\n       kvmshare-client --audio-test-tone [--device NAME] [--seconds N]   (JSON: a short tone, then exit)\n       kvmshare-client --version"
                 );
                 std::process::exit(0);
             }
@@ -124,6 +191,7 @@ pub fn parse_client_args() -> Result<ClientArgs, String> {
         log_level,
         log_ctl,
         log_file,
+        audio_test_tone: test_request(test_tone, test_device, test_seconds),
     })
 }
 
@@ -216,6 +284,20 @@ mod tests {
         assert_eq!(with_default_port("pc", 24800), "pc:24800");
         assert_eq!(with_default_port("pc:1234", 24800), "pc:1234");
         assert_eq!(with_default_port("192.168.1.69", 24800), "192.168.1.69:24800");
+    }
+
+    /// A stray `--device` without `--audio-test-tone` is ignored rather
+    /// than playing a tone nobody asked for, and the duration falls back to
+    /// the default when only the flag is present.
+    #[test]
+    fn the_test_tone_request_needs_the_flag() {
+        assert!(test_request(false, Some("hw:0".into()), Some(2.0)).is_none());
+        let request = test_request(true, None, None).unwrap();
+        assert_eq!(request.device, "", "empty is the system default");
+        assert_eq!(request.seconds, DEFAULT_TEST_SECONDS);
+        let request = test_request(true, Some("hw:0".into()), Some(2.0)).unwrap();
+        assert_eq!(request.device, "hw:0");
+        assert_eq!(request.seconds, 2.0);
     }
 
     #[test]
